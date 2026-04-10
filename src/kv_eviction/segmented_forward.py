@@ -1,50 +1,66 @@
-"""Segmented forward pass with KV prefix drop between segments, NO detach.
+"""Segmented forward pass with KV prefix drop between segments.
 
 This is the training-side mirror of vLLM's scheduler-integrated KV cache
-compaction. For each compaction boundary the inference engine reported, we
-run one forward-pass segment, then drop the oldest stride_blocks*block_size
-generation KV entries (and trim the boundary token), exactly as the
-inference engine did. Gradients flow backward through the retained KV
-entries — this is the "no detach" variant that gives the M4 / MKV-Full
-distal gradient term (BPTT through the chain of retained-KV updates).
+compaction. For each compaction boundary the inference engine reported,
+we run one forward-pass segment, then drop the oldest
+stride_blocks*block_size generation KV entries (and trim the boundary
+token), exactly as the inference engine did.
 
-Differences from mkv-rl's segmented_forward_detached (the reference):
-1. NO .detach() on retained KV between segments — the single load-bearing
-   change this module exists for.
-2. Drop boundary is prompt_aligned_len, not prompt_len, matching the
-   block-level eviction semantics in vLLM's CompactingKVCacheManager.
-   Callers must pass prompt_aligned_len directly; we don't compute it
-   here because that would require block_size as another parameter.
-3. External dispatch: the empty-events case (no compactions) is not handled
-   here. Callers should branch to a standard forward() instead of calling
-   segmented_forward with an empty list.
+Two operating modes:
 
-Why this gives zero train-inference KL mismatch:
-- Each segment's forward uses flash_attention_2 (the same kernel vLLM uses
-  for decode), so per-segment logits are numerically identical up to
-  float precision.
+1. **Per-segment backward mode (`loss_fn` provided).** The production
+   path. Between segments we `.detach()` the retained KV, turning each
+   segment into an independent backward-pass unit. The caller supplies
+   a `loss_fn` closure that computes the policy loss for just that
+   segment's owned token range; after each segment's forward we call
+   that closure, run `loss.backward()`, then let autograd tear down
+   the graph and free the segment's activations before moving on to
+   the next segment. Memory is bounded to O(1 segment) regardless of
+   how many compaction events fire. This is the M3 semantic (no cross-
+   chunk BPTT, no G_distal term) and it's compatible with FSDP2 and
+   prime-rl's per-block activation checkpointing.
+
+2. **Legacy / single-GPU mode (`loss_fn=None`).** Returns the full
+   concatenated logits tensor for one final backward at the caller.
+   Retained KV is NOT detached between segments, so in principle
+   gradients flow backward through the cat chain (BPTT). In practice
+   this mode only works under two configurations:
+     - Single GPU with `activation_checkpointing=True` (wraps each
+       segment's model call in torch.utils.checkpoint externally).
+       Useful for offline KL debugging; see smoke #1.
+     - Single GPU with no AC at all, on sequences small enough that
+       all segment activations fit in memory.
+   Under FSDP2 + prime-rl's per-block checkpoint_wrapper, this mode
+   deadlocks/errors because torch.utils.checkpoint's non-reentrant
+   mode does NOT trigger FSDP2's pre-forward hooks on backward
+   re-entry (see plans/phase3_training_integration.md §"Key findings").
+   The trainer in production MUST use the per-segment backward mode.
+
+Why the segmentation gives zero train-inference KL mismatch:
+- Each segment's forward uses flash_attention_2 (the same kernel vLLM
+  uses for decode), so per-segment logits are numerically identical up
+  to float precision.
 - The KV drop between segments replicates vLLM's eviction exactly
-  (same offsets, same trim, same retained identities) so attention over
-  retained KV produces the same output as inference.
-- Boundary token overlap: the last token of segment k is re-run in segment
-  k+1 so its logit (which predicts the first token of the new segment) is
-  computed under the post-eviction context, matching what inference did
-  when it sampled that token.
+  (same offsets, same trim, same retained identities) so attention
+  over retained KV produces the same output as inference.
+- Boundary token overlap: the last token of segment k is re-run in
+  segment k+1 so its logit (which predicts the first token of the new
+  segment) is computed under the post-eviction context, matching what
+  inference did when it sampled that token.
 
-Gradient flow (when you call .backward() on downstream loss):
-  loss -> logits of segment N
-       -> attention(Q_N, K_retained_{N-1} ++ K_N_new)
-       -> K_retained_{N-1} (NOT detached)
-       -> ...cat/trim ops...
-       -> full cache from segment N-1's forward pass
-       -> attention(Q_{N-1}, K_retained_{N-2} ++ K_{N-1}_new)
-       -> all the way back to segment 0's parameters.
+Drop boundary is `prompt_aligned_len`, not `prompt_len`, matching the
+block-level eviction semantics in vLLM's CompactingKVCacheManager.
+Callers pass `prompt_aligned_len` directly; we don't derive it here
+because that would require `block_size` as another parameter.
 
-This is BPTT through the retained-KV chain. O(window) memory per segment
-(not O(S^2) for a dense mask) and the same flash_attn kernel as inference.
+Future work: M4 (BPTT through retained KV, with G_distal gradient term)
+requires a cache-snapshot mechanism so torch.utils.checkpoint's
+backward re-runs can recover the original pre-mutation cache state.
+Not attempted here; we ship M3 first.
 """
 
 import logging
+from typing import Callable
 
 import torch
 import torch.utils.checkpoint
@@ -52,6 +68,21 @@ from torch import Tensor
 from transformers import DynamicCache
 
 logger = logging.getLogger(__name__)
+
+
+# Type alias for the per-segment loss callback. Given the segment's
+# temperature-scaled and boundary-trimmed logits, along with the global
+# sequence positions they occupy in the concatenated full-sequence logit
+# tensor, returns a scalar loss that will be backward'd immediately
+# (gradients accumulate into .grad before we move to the next segment).
+#
+# full_logit_start and full_logit_end are the inclusive / exclusive range
+# in the FULL-SEQUENCE coordinate system. The segment's logit at local
+# index i corresponds to full-sequence position (full_logit_start + i),
+# which predicts input_ids[full_logit_start + i + 1]. For RL losses the
+# callback typically slices advantages / old_logprobs / loss_mask at
+# positions [full_logit_start + 1, full_logit_end + 1).
+SegmentLossFn = Callable[[Tensor, int, int], Tensor]
 
 
 def compute_num_segments(
@@ -230,7 +261,9 @@ def segmented_forward(
     stride: int,  # tokens to drop per eviction (= stride_blocks * block_size)
     temperature: Tensor,  # [1, seq_len] per-token temperatures
     max_forward_passes: int | None = None,  # FSDP synchronization padding
-    activation_checkpointing: bool = False,  # per-segment re-materialization
+    activation_checkpointing: bool = False,  # per-segment re-materialization (legacy)
+    loss_fn: SegmentLossFn | None = None,  # per-segment backward callback
+    bptt_segments: int | None = 1,  # truncation depth for TBPTT
 ) -> dict[str, Tensor]:
     """Run segmented forward with KV prefix drop between segments, no detach.
 
@@ -266,18 +299,55 @@ def segmented_forward(
             the difference is padded with dummy forward passes that
             contribute to the autograd graph but carry zero gradient weight.
             Must be >= len(segment_boundaries) + 1 when set.
-        activation_checkpointing: When True, each segment's model() call is
-            wrapped in torch.utils.checkpoint.checkpoint(use_reentrant=False).
-            This re-materializes segment activations during backward instead
-            of holding them in memory across the full retained-KV chain,
-            making full-length (16k+ token, 20+ segment) training feasible
-            on a single 80GB GPU. Must NOT be combined with HF's
-            model.gradient_checkpointing_enable() — that call disables
-            use_cache at the top-level forward and strips past_key_values.
+        activation_checkpointing: (Legacy, single-GPU only.) When True,
+            each segment's model() call is wrapped in
+            torch.utils.checkpoint.checkpoint(use_reentrant=False). This
+            re-materializes segment activations during backward instead
+            of holding them in memory across the full retained-KV chain.
+            Must NOT be combined with HF's
+            model.gradient_checkpointing_enable() (disables use_cache).
+            Must NOT be used under FSDP2 — non-reentrant checkpoint's
+            backward re-entry does not trigger FSDP2's pre-forward
+            hooks, producing Tensor/DTensor mismatches in RMSNorm.
+            Incompatible with loss_fn (only one checkpointing strategy
+            at a time).
+        loss_fn: (Production path for compaction training.) Per-segment
+            loss callback. When provided, the function runs in
+            per-segment backward mode: after every `bptt_segments`
+            segments' forwards we call backward on the accumulated
+            segment losses, detach the retained KV, and move to the
+            next BPTT window. Activations from completed segments are
+            freed by autograd as each window's backward finishes,
+            bounding memory to O(bptt_segments segments). Compatible
+            with FSDP2 + prime-rl's per-block AC. Cannot be combined
+            with activation_checkpointing=True.
+        bptt_segments: Truncation depth (in segments) for truncated
+            backpropagation through time. Only meaningful when loss_fn
+            is provided. Each BPTT "window" is this many consecutive
+            segments; gradients flow through retained KV within a
+            window, and the KV is .detach()'d between windows.
+                1 (default) = M3 semantics — no cross-chunk BPTT, one
+                    backward per segment, O(1 segment) memory.
+                K > 1 = TBPTT with depth K segments, O(K segments)
+                    memory, gradients span K segments via retained KV.
+                None = "full trajectory" — forward every segment in a
+                    single window, one backward at the end. Equivalent
+                    to M4 gradient semantics (G_distal term intact)
+                    but requires O(all segments) memory.
+            The final window may be shorter than bptt_segments if the
+            total segment count isn't a multiple of bptt_segments.
 
     Returns:
-        {"logits": [1, seq_len, vocab]} with per-token temperature scaling
-        applied. Shape matches input_ids exactly.
+        - Legacy mode (loss_fn=None):
+            {"logits": [1, seq_len, vocab]} — temperature-scaled full
+            sequence logits. Caller is responsible for the final
+            backward. Shape matches input_ids exactly.
+        - Per-segment backward mode (loss_fn provided):
+            {"loss": <scalar tensor, detached>, "n_segments": int}
+            The scalar is the sum of all per-segment losses (already
+            backward'd; gradients have already accumulated into
+            model.parameters().grad). Loss is detached so the caller
+            can log/reduce it without re-entering the graph.
     """
     assert input_ids.shape[0] == 1, "segmented_forward requires batch_size=1"
     assert len(segment_boundaries) > 0, (
@@ -289,6 +359,19 @@ def segmented_forward(
         f"({prompt_len})"
     )
     assert stride > 0, f"stride must be positive, got {stride}"
+    assert not (activation_checkpointing and loss_fn is not None), (
+        "activation_checkpointing=True and loss_fn are mutually exclusive: "
+        "the per-segment backward mode (loss_fn) already frees segment "
+        "activations by running .backward() between segments, so the "
+        "outer torch.utils.checkpoint wrapping would be redundant and "
+        "would also conflict with the per-segment backward cadence."
+    )
+    per_segment_backward = loss_fn is not None
+    if per_segment_backward:
+        if bptt_segments is not None:
+            assert bptt_segments >= 1, (
+                f"bptt_segments must be None or >= 1, got {bptt_segments}"
+            )
 
     device = input_ids.device
     seq_len = input_ids.shape[1]
@@ -365,11 +448,29 @@ def segmented_forward(
         else None
     )
 
+    # Legacy (loss_fn=None) path collects per-segment logit slices for
+    # one final backward at the caller. Per-segment-backward path uses
+    # accumulated_loss (a Python float) and window_loss (a live graph
+    # tensor that accumulates per-segment losses within the current
+    # BPTT window), leaving all_logits_pieces empty.
     all_logits_pieces: list[Tensor] = []
+    accumulated_loss: float = 0.0
+    window_loss: Tensor | None = None
+    # Count of real segments processed within the current BPTT window.
+    # Resets to 0 at every window boundary.
+    segments_in_window: int = 0
     # Non-checkpointed path: DynamicCache passed through segments directly.
+    # In per-segment backward mode we build a FRESH DynamicCache from
+    # prev_keys/prev_values at the top of each loop iteration (so the
+    # cache object itself never crosses segments). Whether those
+    # prev_keys still carry autograd edges depends on whether we're
+    # inside a BPTT window (edges intact) or just crossed a boundary
+    # (detached).
     past_key_values: DynamicCache | None = None
     # Checkpointed path: plain tensor lists (shape [seq, heads, dim]) that
     # serve as positional tensor inputs to the next segment's checkpoint.
+    # Per-segment backward path: same shape; detached only at BPTT
+    # window boundaries (see the eviction block below).
     prev_keys: list[Tensor] | None = None
     prev_values: list[Tensor] | None = None
 
@@ -381,6 +482,21 @@ def segmented_forward(
             seg_ids = input_ids[:, seg_start:seg_end]
             seg_positions = position_ids[:, seg_start:seg_end]
             seg_temps = temperature[:, seg_start:seg_end]
+
+            # Per-segment backward mode: rebuild a fresh DynamicCache
+            # from the detached prev_keys / prev_values before each
+            # forward. This guarantees the cache object we pass into
+            # model() has never been touched by any prior segment's
+            # graph, so the torn-down activations from earlier segments
+            # can't be pulled back in via shared state.
+            if per_segment_backward and prev_keys is not None:
+                fresh_cache = DynamicCache()
+                for l, (k_seq, v_seq) in enumerate(zip(prev_keys, prev_values)):
+                    # prev_keys[l] is [seq, heads, dim] and already detached
+                    k_4d = k_seq.permute(1, 0, 2).unsqueeze(0).contiguous()
+                    v_4d = v_seq.permute(1, 0, 2).unsqueeze(0).contiguous()
+                    fresh_cache.update(k_4d, v_4d, l)
+                past_key_values = fresh_cache
 
             if activation_checkpointing:
                 seg_logits, new_keys, new_values = _run_segment_checkpointed(
@@ -406,15 +522,67 @@ def segmented_forward(
 
             is_last_segment = seg_idx == len(seg_ranges) - 1
 
+            # Determine the segment's "owned" range of global logit
+            # positions: the positions in the concatenated full-logits
+            # tensor that this segment is responsible for computing.
+            #
+            # Non-final segments drop the last logit (it's re-run by the
+            # next segment under the post-eviction context). Final
+            # segment keeps all logits.
             if is_last_segment:
-                all_logits_pieces.append(scaled_seg_logits)
+                seg_logits_used = scaled_seg_logits
+                owned_start = seg_start
+                owned_end = seg_end
             else:
-                # Drop the last logit — it predicts the boundary token,
-                # which will be recomputed by the next segment (fed via
-                # boundary overlap) under the post-eviction context.
-                all_logits_pieces.append(scaled_seg_logits[:, :-1, :])
+                seg_logits_used = scaled_seg_logits[:, :-1, :]
+                owned_start = seg_start
+                owned_end = seg_end - 1
 
-            # Between-segment KV eviction + cache rebuild (no detach).
+            if per_segment_backward:
+                # Compute this segment's loss via the caller's callback
+                # and accumulate into the current BPTT window's loss
+                # tensor. The window's combined loss will be backward'd
+                # at the end of the window (see eviction block below).
+                seg_loss = loss_fn(seg_logits_used, owned_start, owned_end)
+                window_loss = seg_loss if window_loss is None else window_loss + seg_loss
+                segments_in_window += 1
+                # Release our references to the segment's forward-pass
+                # tensors we no longer need. The retained KV that feeds
+                # the next segment is extracted separately below.
+                del seg_loss, seg_logits_used, scaled_seg_logits, seg_logits
+                if not activation_checkpointing:
+                    del out, raw_logits
+            else:
+                all_logits_pieces.append(seg_logits_used)
+
+            # Determine whether this segment ends a BPTT window. If it
+            # does, we'll need to backward the accumulated window_loss
+            # and detach the retained KV that flows into the next
+            # window. Windows close at three events:
+            #   1. segments_in_window reaches bptt_segments, OR
+            #   2. bptt_segments is None and this is the last segment
+            #      (full trajectory as one big window), OR
+            #   3. it's the last segment regardless (final flush).
+            at_window_end = False
+            if per_segment_backward:
+                if bptt_segments is None:
+                    at_window_end = is_last_segment
+                else:
+                    at_window_end = (
+                        segments_in_window >= bptt_segments or is_last_segment
+                    )
+
+            # Between-segment KV eviction + cache rebuild.
+            #
+            # Legacy mode: retained KV keeps its autograd edges so the
+            # final backward can flow through the cat chain (BPTT
+            # attempt — only works in specific single-GPU modes).
+            #
+            # Per-segment backward mode: KV keeps autograd edges WITHIN
+            # a BPTT window (so gradients can flow back through the
+            # cat chain for up to `bptt_segments` steps). At window
+            # boundaries we detach after computing the eviction, so
+            # the next window starts with fresh leaves.
             if not is_last_segment:
                 if activation_checkpointing:
                     keys = new_keys
@@ -442,7 +610,20 @@ def segmented_forward(
                 # would appear twice in the KV cache.
                 trim = 1
 
-                evicted_cache = DynamicCache() if not activation_checkpointing else None
+                # Output containers:
+                #   - evicted_cache: DynamicCache consumed by the next
+                #     segment's model() call in LEGACY mode
+                #     (activation_checkpointing=False, loss_fn=None).
+                #   - evicted_keys / evicted_values: list-of-tensor form
+                #     consumed by:
+                #       * the checkpointed-segment helper
+                #         (activation_checkpointing=True), AND
+                #       * the per-segment backward path
+                #         (loss_fn provided), which rebuilds a fresh
+                #         DynamicCache from these lists at the top of
+                #         the next iteration.
+                use_lists = activation_checkpointing or per_segment_backward
+                evicted_cache = DynamicCache() if not use_lists else None
                 evicted_keys: list[Tensor] = []
                 evicted_values: list[Tensor] = []
                 for l in range(num_layers):
@@ -467,15 +648,18 @@ def segmented_forward(
                         new_K = keys[l][:-trim]
                         new_V = values[l][:-trim]
 
-                    # NO .detach() — gradients flow through the retained KV.
-                    if activation_checkpointing:
-                        # Keep [seq, heads, dim] for the helper's input
-                        # format. The helper permutes back to
-                        # [1, heads, seq, dim] internally.
+                    if use_lists:
+                        # Keep [seq, heads, dim] for the list-based
+                        # inputs. In per-segment-backward mode the source
+                        # `keys[l]`/`values[l]` are already detached
+                        # above, so new_K/new_V are also detached leaves.
                         evicted_keys.append(new_K)
                         evicted_values.append(new_V)
                     else:
-                        # Permute back to [1, heads, seq, dim] for DynamicCache.
+                        # Legacy BPTT path: permute back to
+                        # [1, heads, seq, dim] for DynamicCache and
+                        # keep autograd edges intact so the final
+                        # backward can flow through the cat chain.
                         new_K = new_K.permute(1, 0, 2).unsqueeze(0)
                         new_V = new_V.permute(1, 0, 2).unsqueeze(0)
                         evicted_cache.update(new_K, new_V, l)
@@ -500,13 +684,59 @@ def segmented_forward(
                     kept_asst,
                 )
 
-                if activation_checkpointing:
+                if use_lists:
+                    # Drop local refs to the captured K/V. The cache
+                    # object (captured via hook in the
+                    # non-activation_checkpointing branch) is released
+                    # here too since nothing else holds it.
                     del keys, values
-                    prev_keys = evicted_keys
-                    prev_values = evicted_values
+                    if not activation_checkpointing:
+                        del kv_cache
+                    if per_segment_backward and at_window_end:
+                        # End of BPTT window: backward the accumulated
+                        # loss, then detach the evicted KV so the next
+                        # window starts from fresh leaves. The
+                        # backward call tears down the current
+                        # window's forward graph and frees its
+                        # activations. We grab detached copies BEFORE
+                        # backward so the next-segment inputs don't
+                        # depend on freed graph state.
+                        prev_keys = [k.detach() for k in evicted_keys]
+                        prev_values = [v.detach() for v in evicted_values]
+                        assert window_loss is not None, (
+                            "at_window_end reached with no accumulated "
+                            "window_loss; per-segment backward state is "
+                            "inconsistent"
+                        )
+                        window_loss.backward()
+                        accumulated_loss += float(window_loss.detach().item())
+                        window_loss = None
+                        segments_in_window = 0
+                        del evicted_keys, evicted_values
+                    else:
+                        # Mid-window (or activation_checkpointing path):
+                        # retain autograd edges by passing the
+                        # un-detached cat outputs straight through.
+                        prev_keys = evicted_keys
+                        prev_values = evicted_values
+                    past_key_values = None
                 else:
                     del keys, values, kv_cache
                     past_key_values = evicted_cache
+
+            # Final-segment flush for per-segment backward mode: the
+            # eviction block above only runs on non-final segments,
+            # but the last segment also needs its window backward'd.
+            # (For multi-window runs with the final segment landing
+            # inside a partial window, this is the only place the
+            # window_loss gets consumed; for a run where the final
+            # window ended on a non-last segment, window_loss will
+            # already have been reset to None by the eviction block.)
+            if per_segment_backward and is_last_segment and window_loss is not None:
+                window_loss.backward()
+                accumulated_loss += float(window_loss.detach().item())
+                window_loss = None
+                segments_in_window = 0
 
     finally:
         if hook_handle is not None:
@@ -521,11 +751,32 @@ def segmented_forward(
     # activation-offloading pipelines. The inter-segment `del keys, values,
     # kv_cache` inside the loop releases the old cache promptly; relying on
     # the allocator is the same pattern the rest of the trainer uses.
+    actual_passes = len(seg_ranges)
+    target_passes = max_forward_passes or actual_passes
+
+    if per_segment_backward:
+        # In per-segment backward mode we've already called backward on
+        # each real segment. For FSDP2 synchronization across ranks, any
+        # remaining dummy passes still need to run a forward + dummy
+        # backward so every rank issues the same collective sequence.
+        # Each dummy backward contributes exactly zero to .grad because
+        # the dummy output is multiplied by 0.
+        if target_passes > actual_passes:
+            _run_dummy_passes_with_backward(
+                model,
+                input_ids,
+                position_ids,
+                target_passes - actual_passes,
+            )
+        return {
+            "loss": torch.tensor(accumulated_loss, device=device),
+            "n_segments": actual_passes,
+        }
+
+    # Legacy path: concatenate per-segment logits and return them.
     full_logits = torch.cat(all_logits_pieces, dim=1)
     del all_logits_pieces
 
-    actual_passes = len(seg_ranges)
-    target_passes = max_forward_passes or actual_passes
     if target_passes > actual_passes:
         full_logits = _pad_with_dummy_passes(
             model,
@@ -542,6 +793,40 @@ def segmented_forward(
     )
 
     return {"logits": full_logits}
+
+
+def _run_dummy_passes_with_backward(
+    model: torch.nn.Module,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    num_dummy: int,
+) -> None:
+    """Run `num_dummy` dummy forward+backward pairs for FSDP2 rank sync.
+
+    In per-segment backward mode, every rank needs to execute the same
+    number of (forward, backward) pairs per training step so FSDP2's
+    all-gather / reduce-scatter counts stay matched. If this rank
+    processed K_local real segments and max across ranks is K_global,
+    this fills in the gap with (K_global - K_local) dummy passes.
+
+    Each dummy pass:
+      1. Runs a real forward on a 1-token slice (FSDP2 all-gather fires).
+      2. Constructs a zero-weighted loss (mean * 0) so backward flows
+         into FSDP2 hooks without actually modifying any gradient.
+      3. Calls .backward() to trigger FSDP2's reduce-scatter.
+    """
+    for _ in range(num_dummy):
+        d_out = model(
+            input_ids=input_ids[:, :1],
+            position_ids=position_ids[:, :1],
+        )
+        d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
+        if isinstance(d_logits, dict):
+            d_logits = d_logits["logits"]
+        # float().mean() first to avoid bf16 sum overflow producing Inf
+        # (Inf * 0 = NaN, which would corrupt gradients).
+        dummy_loss = d_logits.float().mean() * 0.0
+        dummy_loss.backward()
 
 
 def _pad_with_dummy_passes(
