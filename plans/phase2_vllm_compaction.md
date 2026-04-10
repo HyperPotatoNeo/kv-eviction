@@ -732,3 +732,25 @@ Verified by adversarial review tracing actual source code:
 - [ ] No-compaction mode passes all existing vLLM tests
 - [ ] Compaction unit tests pass
 - [ ] vLLM server with compaction generates text correctly (smoke test)
+
+## Phase 2.1 Hotfix: Prompt-block alignment (2026-04-10)
+
+**Bug.** `Scheduler._compact_request` trimmed `_all_token_ids[prompt_len : prompt_len + total_evicted]`, but the manager physically frees blocks at indices `[prompt_blocks, prompt_blocks + stride_blocks)` where `prompt_blocks = ceil(prompt_len / block_size)`. Physical eviction starts at `prompt_aligned_len = prompt_blocks * block_size`, not at `prompt_len`. When `prompt_len % block_size != 0`, the first `prompt_aligned_len - prompt_len` generated tokens share the partial last prompt block and are NEVER physically evicted; the old trim removed tokens with different identities (same count by coincidence), silently desynchronizing the logical token list from physical KV. Downstream, the rebuild path in `gpu_model_runner.py:1273-1276` writes the mis-trimmed list into the GPU `all_token_ids` state tensor and sample kernels (penalties, bad_words, prompt_logprob) index it positionally, operating on wrong token identities.
+
+**Fix.** `Scheduler._compact_request` now computes `prompt_aligned_len` from the block_size of the `CompactingKVCacheManager` that actually performed the eviction (not `self.block_size`, to survive future hybrid/multi-group KV caches), then trims `_all_token_ids[prompt_aligned_len : prompt_aligned_len + total_evicted]` and `_output_token_ids[gen_tail : gen_tail + total_evicted]` where `gen_tail = prompt_aligned_len - prompt_len`. Identities now match the physical KV.
+
+**Regression test.** `tests/v1/core/test_scheduler_compaction.py` covers both the non-block-aligned case (prompt_len=50, block_size=16) and the block-aligned sanity case (prompt_len=48). Both verify token identities position-by-position. Verified green against a live scheduler instance at 2026-04-10.
+
+## Phase 2.1 Hotfix #2: Partial evict-block guard + LMCache refusal (2026-04-10)
+
+**Bug #2 (partial last evict block).** The prior `needs_compaction` guard was `num_computed > window_size AND gen_blocks >= stride_blocks`, where `gen_blocks = len(blocks) - prompt_blocks`. Under a user config that picks `window_size` close to `prompt_len` (or any test/ablation that does), compaction could fire when the LAST block to be evicted had only a few real tokens — the rest of its slots were allocated but unwritten. The manager returned `tokens_evicted = stride_blocks * block_size` anyway, and the scheduler decremented `num_computed_tokens` by that amount. Under-decrement was impossible; over-decrement was real. The resulting state had `num_computed_tokens < len(_all_token_ids) - 1`, meaning the next forward pass would be told to compute a token at a position that was already computed (a prompt token or an already-sampled token), corrupting attention. The trim also silently deleted the pending just-sampled token from `_all_token_ids`, losing it from the trajectory.
+
+**Fix #2.** `CompactingKVCacheManager.needs_compaction` now also requires `num_computed_tokens >= (prompt_blocks + stride_blocks) * block_size`. This ensures the last block we'd evict is fully filled, so `tokens_evicted = stride_blocks * block_size` always matches the actual number of logical tokens being removed. In realistic configs (`window_size >> stride_blocks * block_size`) this is a no-op because the window guard dominates; it kicks in only when window is configured aggressively small. Regression test: `test_compaction_waits_for_full_evict_block` with `window_size=64, prompt_len=50, block_size=16, stride=16` — verifies compaction defers from `num_computed=65` (naive fire) to `num_computed=80` (safe fire, last evict block full), preserving the pending sample.
+
+**Bug #3 (LMCache compatibility).** LMCache KV transfer's V1 adapter at `distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py:1426` reads `request._output_token_ids[0]` as a "first_tok" fingerprint for the KV transfer protocol. After any compaction that index no longer refers to the first generated token, which would mis-identify sequences on the transfer path.
+
+**Fix #3.** `Scheduler.__init__` asserts that if `cache_config.compaction_window_size > 0` and `kv_transfer_config.kv_connector` contains "lmcache" (case-insensitive), startup fails with a clear error. The check runs BEFORE the KV connector is constructed so the `lmcache` package is never imported in this path. Regression test: `test_compaction_rejects_lmcache_connector`.
+
+## Known Limitations (carried into Phase 3+)
+
+- **num_cached_tokens is stats-only drift.** It is not decremented when compaction trims the logical view. Only affects metrics/stats output, not scheduler or worker correctness.
