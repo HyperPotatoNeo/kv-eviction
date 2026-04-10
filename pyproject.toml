@@ -1,0 +1,13 @@
+[project]
+name = "kv-eviction"
+version = "0.1.0"
+description = "Native vLLM KV cache compaction for RL training"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

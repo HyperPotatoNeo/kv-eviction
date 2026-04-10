@@ -1,0 +1,6 @@
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/vllm-project/vllm.git
+[submodule "prime-rl"]
+	path = prime-rl
+	url = https://github.com/PrimeIntellect-ai/prime-rl.git
