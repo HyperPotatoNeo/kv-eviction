@@ -74,10 +74,12 @@ source /pscratch/sd/s/siddart2/kv-eviction/.venv/bin/activate
 # window=4096: eviction triggers when KV exceeds 4096 tokens
 # stride=512:  evict 512 tokens (32 blocks) per compaction event
 # block_size defaults to 16, stride must be a multiple of it
+# async_scheduling=False is required (see Constraints below)
 python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen3-4B \
   --max-model-len 16384 \
   --enable-prefix-caching false \
+  --async-scheduling false \
   --compaction-window-size 4096 \
   --compaction-stride 512 \
   --tensor-parallel-size 1 \
@@ -123,6 +125,7 @@ llm = LLM(
     model="Qwen/Qwen3-4B",
     max_model_len=16384,
     enable_prefix_caching=False,
+    async_scheduling=False,  # required with compaction (see Constraints)
     # Compaction args
     compaction_window_size=4096,
     compaction_stride=512,
@@ -173,6 +176,12 @@ bounded by the window size instead of growing linearly with generation length.
 ### Constraints
 
 - `--enable-prefix-caching false` required (compaction splices blocks)
+- `--async-scheduling false` required. In async mode vLLM pre-schedules the next
+  step before the current step's output is processed, so
+  `num_output_placeholders` is always nonzero when `update_from_output` runs.
+  The compaction trigger is guarded on `num_output_placeholders == 0`, so with
+  async scheduling compaction never fires and the run silently degenerates to
+  full context. The scheduler asserts this at init.
 - Pipeline parallelism (`--pipeline-parallel-size > 1`) not supported
 - `stride` must be a multiple of `block_size` (default 16)
 - `window_size` must be greater than `stride`
@@ -184,6 +193,24 @@ bounded by the window size instead of growing linearly with generation length.
 | Long-form generation | 4096 | 512 | Good balance of speed and context |
 | Very long generation | 8192 | 1024 | More context retained |
 | Aggressive compaction | 2048 | 512 | Maximum speed, less context |
+
+## Eval: rg-mix-env (100 problems, 4 samples, ancestral)
+
+Qwen3-4B-Instruct-2507, DP=4/TP=1, max_tokens=16384, temperature=1.0,
+top_p=1, top_k=-1. Script at `experiments/eval/`.
+
+| Metric | Full Context | Compaction (w=4096, s=512) |
+|---|---|---|
+| pass@1 | 0.4675 | 0.3700 |
+| pass@4 | 0.7300 | 0.6600 |
+| wall time (max DP chunk) | 947 s | 510 s |
+| aggregate throughput | 3,757 tok/s | 7,432 tok/s |
+| avg output tokens/sample | 8,896 | 9,469 |
+
+Compaction buys ~1.86x throughput at the cost of ~10 points of absolute pass@1.
+The quality cost is concentrated on tasks that require long-range reasoning
+across the whole generation (zebra puzzles -0.28, sokoban -0.05, cryptarithm
+-0.11). Local tasks (countdown, arc_1d) are neutral or slightly better.
 
 ## Project structure
 
