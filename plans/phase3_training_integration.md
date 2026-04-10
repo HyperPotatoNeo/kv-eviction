@@ -923,3 +923,127 @@ Of the 4 deferred items from RSA review (#37-#40), only #37 (cross-config
 validator between trainer and orchestrator inference args) meaningfully
 affects production robustness. The others are perf/hardening nits that
 don't block the first real runs.
+
+## Pre-production Smoke Test Results (2026-04-10)
+
+### Smoke #1: single-GPU backward pass — PASS
+
+Single A100 80GB, Qwen3-4B bf16 + flash_attention_2, full 16k-token
+sample with all 24 compaction events. Activation checkpointing enabled
+via segmented_forward's new `activation_checkpointing=True` flag (added
+in this round — see Key finding #2 below for why HF's built-in
+`gradient_checkpointing_enable` is unusable).
+
+Results:
+- Forward: 2.7s, 32GB peak
+- Backward: 5.3s, 55.7GB peak
+- All 398 params received non-zero gradients (no dead params from the
+  retained-KV `torch.cat` chain)
+- Zero NaN, zero Inf
+- Global grad norm: 1.49 (healthy)
+- Loss: 0.197 (reasonable teacher-forced policy loss)
+
+Headroom on 80GB A100: ~25GB, which means real training with AdamW
+state (~32GB for a 4B model) will still fit because FSDP2 shards both
+params and optimizer state across ranks in production.
+
+Script: `experiments/phase3_preprod/smoke1_backward.py`
+
+### Smoke #2: FSDP2 segmented_forward — PASS (with caveats)
+
+4-GPU A100 80GB node, torchrun --nproc_per_node=4, each rank loads
+Qwen3-4B, `fully_shard` applied per decoder layer, each rank processes
+the same 4-event sample (truncated to fit without outer AC under
+FSDP2).
+
+Results:
+- Forward: 1.2s, backward: 1.3s
+- Loss cross-rank spread: **0.00e+00** (bit-identical across all 4 ranks)
+- 1592 params (398 × 4 ranks) all received gradients
+- Zero NaN, zero Inf, zero missing grads
+- FSDP2-reduced global grad norm: 3.09
+
+No deadlock despite 5 per-segment all-gathers feeding into one
+backward. The retained-KV `torch.cat` chain survives FSDP2's
+reshard-after-forward cadence.
+
+Script: `experiments/phase3_preprod/smoke2_fsdp2.py`
+
+### Key findings
+
+1. **`fully_shard` on the root model breaks RMSNorm.** Applying
+   `fully_shard(model)` at the top level wraps `model.model.norm` and
+   `model.lm_head` as DTensors, and HF's RMSNorm hits
+   "aten.mul.Tensor got mixed Tensor and DTensor" during backward.
+   Fix: shard only the decoder layers. Prime-rl's production path
+   does this correctly by grouping `[lm_head, norm]` into a separate
+   `fully_shard` unit with `reshard_after_forward=False` — see
+   `prime_rl/trainer/model.py:400-412`. For the smoke test, sharding
+   just the decoder layers is sufficient to exercise FSDP2 all-gather
+   cadence on the large parameter groups.
+
+2. **`segmented_forward(activation_checkpointing=True)` is
+   incompatible with FSDP2 — important production guidance.**
+   `torch.utils.checkpoint.checkpoint` with `use_reentrant=False`
+   does NOT trigger FSDP2's pre-forward hooks on backward re-entry,
+   causing "aten.mul.Tensor got mixed Tensor and DTensor" in RMSNorm
+   when the checkpointed segment's forward is re-run during backward.
+   The production path must use a completely different AC mechanism:
+   prime-rl applies
+   `torch.distributed.algorithms._checkpoint.checkpoint_wrapper`
+   to each transformer block BEFORE `fully_shard`, so the FSDP2 hook
+   ordering works correctly. In production:
+
+   - Trainer config should call prime-rl's per-block AC as normal
+     (`trainer.model.ac.freq = 1`)
+   - `segmented_forward` must be called WITHOUT its own
+     `activation_checkpointing=True`
+   - The per-block AC handles memory inside each segment's forward
+     (~1 block's activations retained), and the between-segment
+     retained-KV chain happens at the outer torch graph level
+
+   The new `activation_checkpointing=True` flag on segmented_forward
+   is still useful for single-GPU debugging and offline tests (like
+   smoke #1), just not under FSDP2.
+
+3. **Computing grad norm on DTensor params needs `.to_local()`.**
+   FSDP2 stores each parameter's grad as a DTensor whose arithmetic
+   dispatch insists both operands be DTensors; naively accumulating
+   into a plain local tensor trips an isinstance assert in
+   `torch/distributed/tensor/_dispatch.py`. Unwrap via
+   `g.to_local()` before computing the squared sum. Relevant for
+   any custom grad-norm or diagnostic code under FSDP2.
+
+### Item #37: RLConfig cross-config validator — DONE
+
+New `@model_validator(mode="after")` on `RLConfig` in
+`prime-rl/src/prime_rl/configs/rl.py` cross-checks that
+`trainer.compaction.{window_size, stride, block_size}` exactly mirrors
+`inference.vllm_extra.{compaction_window_size, compaction_stride,
+block_size}` when KV cache compaction is in use. Bidirectional: either
+side enabling compaction forces the other to match. The three sanity
+tests (window mismatch, stride mismatch, block_size mismatch) plus the
+three valid cases (mirrored, both-disabled, inference-only-enabled
+rejected) all pass.
+
+Sanity-check script:
+`experiments/phase3_preprod/test_rlconfig_validator.py`
+
+### Remaining smoke tests
+
+Smokes #3-5 (end-to-end single step, short stability run,
+production-config smoke) still pending. These require:
+
+- A 2-node allocation (inference node + trainer node)
+- `rg-mix-env` installed into the kv-eviction `.venv` (currently
+  only in mkv-rl's venv — install from
+  `/pscratch/sd/s/siddart2/mkv-rl/experiments/rg_mix/dist/rg_mix_env-0.1.4-py3-none-any.whl`
+  inside the podman container via `uv pip install`)
+- A minimal compaction RL TOML config adapted from
+  `mkv-rl/experiments/rg_mix/rl.toml`, with matching
+  `trainer.compaction` and `inference.vllm_extra.compaction_*` keys
+  plus `trainer.model.impl = "hf"` and
+  `trainer.model.attn = "flash_attention_2"` (enforced by the new
+  config validator).
+
+Best tackled in a fresh session with full context runway.

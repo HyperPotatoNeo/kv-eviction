@@ -47,6 +47,7 @@ This is BPTT through the retained-KV chain. O(window) memory per segment
 import logging
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor
 from transformers import DynamicCache
 
@@ -121,6 +122,104 @@ def _get_kv_from_cache(cache: DynamicCache) -> tuple[list[Tensor], list[Tensor]]
     return keys, values
 
 
+def _run_segment_checkpointed(
+    model: torch.nn.Module,
+    seg_ids: Tensor,
+    seg_positions: Tensor,
+    prev_keys: list[Tensor] | None,
+    prev_values: list[Tensor] | None,
+) -> tuple[Tensor, list[Tensor], list[Tensor]]:
+    """Run a single segment's forward under torch.utils.checkpoint.
+
+    Returns (logits, new_keys, new_values) where each key/value tensor is
+    shape [seq, heads, dim] (the _get_kv_from_cache format).
+
+    The checkpoint re-materializes segment activations during backward, so
+    the multi-segment retained-KV chain can be trained at long sequences
+    without holding every segment's activations in memory simultaneously.
+
+    Why this bypasses HF's gradient-checkpointing / use_cache conflict:
+    HF's built-in gradient_checkpointing_enable() forcibly disables
+    use_cache at the top-level model forward, which strips past_key_values
+    from the output and breaks segmented_forward entirely. We instead
+    leave HF GC disabled and apply checkpointing OUTSIDE the model call,
+    preserving use_cache=True and past_key_values semantics. The wrapped
+    function below is re-run during backward; each re-run constructs a
+    fresh DynamicCache from the same input tensors, so there's no stale
+    cache mutation hazard.
+    """
+    # Flatten prev KV to positional tensor args so checkpoint tracks them
+    # as inputs. checkpoint requires tensor args (or None/lists of tensors
+    # via the non_tensor_args machinery) — flat positional list is cleanest.
+    if prev_keys is not None and prev_values is not None:
+        kv_in_flat: list[Tensor] = []
+        for k, v in zip(prev_keys, prev_values):
+            # _get_kv_from_cache returned [seq, heads, dim]; the model wants
+            # [1, heads, seq, dim] inside its DynamicCache.
+            kv_in_flat.append(k.permute(1, 0, 2).unsqueeze(0).contiguous())
+            kv_in_flat.append(v.permute(1, 0, 2).unsqueeze(0).contiguous())
+    else:
+        kv_in_flat = []
+
+    def _seg_fn(_ids: Tensor, _pos: Tensor, *_kv_flat: Tensor):
+        if len(_kv_flat) > 0:
+            nl = len(_kv_flat) // 2
+            _cache: DynamicCache | None = DynamicCache()
+            for l in range(nl):
+                _cache.update(_kv_flat[2 * l], _kv_flat[2 * l + 1], l)
+        else:
+            _cache = None
+
+        _out = model(
+            input_ids=_ids,
+            position_ids=_pos,
+            past_key_values=_cache,
+            use_cache=True,
+        )
+        _raw_logits = _out["logits"] if isinstance(_out, dict) else _out.logits
+        if isinstance(_raw_logits, dict):
+            _raw_logits = _raw_logits["logits"]
+
+        # Pull the updated cache out of the output; for HF modeling this is
+        # returned on the output object; some custom paths may leave it on
+        # the input cache we passed in.
+        _out_cache = None
+        if hasattr(_out, "past_key_values") and _out.past_key_values is not None:
+            _out_cache = _out.past_key_values
+        elif isinstance(_out, dict) and _out.get("past_key_values") is not None:
+            _out_cache = _out["past_key_values"]
+        else:
+            _out_cache = _cache
+
+        if _out_cache is None:
+            raise RuntimeError(
+                "Checkpointed segment forward did not produce past_key_values. "
+                'Ensure model uses impl="hf".'
+            )
+
+        _new_keys, _new_values = _get_kv_from_cache(_out_cache)
+        # Flatten for checkpoint tensor-output requirement
+        _flat_out: list[Tensor] = [_raw_logits]
+        for _k, _v in zip(_new_keys, _new_values):
+            _flat_out.append(_k)
+            _flat_out.append(_v)
+        return tuple(_flat_out)
+
+    ckpt_out = torch.utils.checkpoint.checkpoint(
+        _seg_fn,
+        seg_ids,
+        seg_positions,
+        *kv_in_flat,
+        use_reentrant=False,
+    )
+    seg_logits = ckpt_out[0]
+    kv_out = ckpt_out[1:]
+    num_layers = len(kv_out) // 2
+    new_keys = [kv_out[2 * l] for l in range(num_layers)]
+    new_values = [kv_out[2 * l + 1] for l in range(num_layers)]
+    return seg_logits, new_keys, new_values
+
+
 def segmented_forward(
     model: torch.nn.Module,
     input_ids: Tensor,  # [1, seq_len]
@@ -131,6 +230,7 @@ def segmented_forward(
     stride: int,  # tokens to drop per eviction (= stride_blocks * block_size)
     temperature: Tensor,  # [1, seq_len] per-token temperatures
     max_forward_passes: int | None = None,  # FSDP synchronization padding
+    activation_checkpointing: bool = False,  # per-segment re-materialization
 ) -> dict[str, Tensor]:
     """Run segmented forward with KV prefix drop between segments, no detach.
 
@@ -166,6 +266,14 @@ def segmented_forward(
             the difference is padded with dummy forward passes that
             contribute to the autograd graph but carry zero gradient weight.
             Must be >= len(segment_boundaries) + 1 when set.
+        activation_checkpointing: When True, each segment's model() call is
+            wrapped in torch.utils.checkpoint.checkpoint(use_reentrant=False).
+            This re-materializes segment activations during backward instead
+            of holding them in memory across the full retained-KV chain,
+            making full-length (16k+ token, 20+ segment) training feasible
+            on a single 80GB GPU. Must NOT be combined with HF's
+            model.gradient_checkpointing_enable() — that call disables
+            use_cache at the top-level forward and strips past_key_values.
 
     Returns:
         {"logits": [1, seq_len, vocab]} with per-token temperature scaling
@@ -234,9 +342,14 @@ def segmented_forward(
         f"segment_boundaries={segment_boundaries}"
     )
 
-    # Capture past_key_values from the backbone via a hook. FSDP2 + custom
-    # output-linear wrappers may drop past_key_values from the top-level
-    # model output, so a hook on the backbone (model.model) is more reliable.
+    # Capture past_key_values from the backbone via a hook (non-checkpointed
+    # path only). FSDP2 + custom output-linear wrappers may drop
+    # past_key_values from the top-level model output, so a hook on the
+    # backbone (model.model) is more reliable.
+    #
+    # The checkpointed path does NOT use this hook — its inner function
+    # reconstructs and returns the cache explicitly to keep everything as
+    # tensor-typed outputs that checkpoint can track.
     captured_kv: dict[str, DynamicCache | None] = {}
 
     def _capture_kv_hook(_module, _input, output):
@@ -246,10 +359,19 @@ def segmented_forward(
             captured_kv["past_key_values"] = output.get("past_key_values")
 
     backbone = model.model if hasattr(model, "model") else model
-    hook_handle = backbone.register_forward_hook(_capture_kv_hook)
+    hook_handle = (
+        backbone.register_forward_hook(_capture_kv_hook)
+        if not activation_checkpointing
+        else None
+    )
 
     all_logits_pieces: list[Tensor] = []
+    # Non-checkpointed path: DynamicCache passed through segments directly.
     past_key_values: DynamicCache | None = None
+    # Checkpointed path: plain tensor lists (shape [seq, heads, dim]) that
+    # serve as positional tensor inputs to the next segment's checkpoint.
+    prev_keys: list[Tensor] | None = None
+    prev_values: list[Tensor] | None = None
 
     saved_use_cache = getattr(model.config, "use_cache", False)
     model.config.use_cache = True
@@ -260,19 +382,24 @@ def segmented_forward(
             seg_positions = position_ids[:, seg_start:seg_end]
             seg_temps = temperature[:, seg_start:seg_end]
 
-            out = model(
-                input_ids=seg_ids,
-                position_ids=seg_positions,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
+            if activation_checkpointing:
+                seg_logits, new_keys, new_values = _run_segment_checkpointed(
+                    model, seg_ids, seg_positions, prev_keys, prev_values
+                )
+            else:
+                out = model(
+                    input_ids=seg_ids,
+                    position_ids=seg_positions,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                raw_logits = out["logits"] if isinstance(out, dict) else out.logits
+                # Some custom output heads (e.g. VanillaOutputLinear) wrap
+                # logits in a dict. Unwrap once if we see that pattern.
+                seg_logits = (
+                    raw_logits["logits"] if isinstance(raw_logits, dict) else raw_logits
+                )
 
-            raw_logits = out["logits"] if isinstance(out, dict) else out.logits
-            # Some custom output heads (e.g. VanillaOutputLinear) wrap logits
-            # in a dict. Unwrap once if we see that pattern.
-            seg_logits = (
-                raw_logits["logits"] if isinstance(raw_logits, dict) else raw_logits
-            )
             scaled_seg_logits = seg_logits / seg_temps.unsqueeze(-1).to(
                 seg_logits.dtype
             )
@@ -289,15 +416,19 @@ def segmented_forward(
 
             # Between-segment KV eviction + cache rebuild (no detach).
             if not is_last_segment:
-                kv_cache = captured_kv.get("past_key_values")
-                assert kv_cache is not None, (
-                    "Hook did not capture past_key_values. Ensure model uses "
-                    'impl="hf" (the custom llama path asserts past_key_values '
-                    "is None and is incompatible with segmented forward)."
-                )
-                captured_kv.clear()
+                if activation_checkpointing:
+                    keys = new_keys
+                    values = new_values
+                else:
+                    kv_cache = captured_kv.get("past_key_values")
+                    assert kv_cache is not None, (
+                        "Hook did not capture past_key_values. Ensure model uses "
+                        'impl="hf" (the custom llama path asserts past_key_values '
+                        "is None and is incompatible with segmented forward)."
+                    )
+                    captured_kv.clear()
+                    keys, values = _get_kv_from_cache(kv_cache)
 
-                keys, values = _get_kv_from_cache(kv_cache)
                 num_layers = len(keys)
                 kv_seq_len = keys[0].shape[0]
 
@@ -311,7 +442,9 @@ def segmented_forward(
                 # would appear twice in the KV cache.
                 trim = 1
 
-                evicted_cache = DynamicCache()
+                evicted_cache = DynamicCache() if not activation_checkpointing else None
+                evicted_keys: list[Tensor] = []
+                evicted_values: list[Tensor] = []
                 for l in range(num_layers):
                     if actual_stride > 0:
                         new_K = torch.cat(
@@ -334,11 +467,18 @@ def segmented_forward(
                         new_K = keys[l][:-trim]
                         new_V = values[l][:-trim]
 
-                    # Permute back to [1, heads, seq, dim]. NO .detach() —
-                    # gradients flow through the retained KV.
-                    new_K = new_K.permute(1, 0, 2).unsqueeze(0)
-                    new_V = new_V.permute(1, 0, 2).unsqueeze(0)
-                    evicted_cache.update(new_K, new_V, l)
+                    # NO .detach() — gradients flow through the retained KV.
+                    if activation_checkpointing:
+                        # Keep [seq, heads, dim] for the helper's input
+                        # format. The helper permutes back to
+                        # [1, heads, seq, dim] internally.
+                        evicted_keys.append(new_K)
+                        evicted_values.append(new_V)
+                    else:
+                        # Permute back to [1, heads, seq, dim] for DynamicCache.
+                        new_K = new_K.permute(1, 0, 2).unsqueeze(0)
+                        new_V = new_V.permute(1, 0, 2).unsqueeze(0)
+                        evicted_cache.update(new_K, new_V, l)
 
                 # Correct new_kv_len accounting: when the stride range
                 # reaches the end of the KV, the trim range overlaps with it,
@@ -360,11 +500,17 @@ def segmented_forward(
                     kept_asst,
                 )
 
-                del keys, values, kv_cache
-                past_key_values = evicted_cache
+                if activation_checkpointing:
+                    del keys, values
+                    prev_keys = evicted_keys
+                    prev_values = evicted_values
+                else:
+                    del keys, values, kv_cache
+                    past_key_values = evicted_cache
 
     finally:
-        hook_handle.remove()
+        if hook_handle is not None:
+            hook_handle.remove()
         model.config.use_cache = saved_use_cache
 
     # Deliberately NOT calling torch.cuda.empty_cache() here: it's a hard
