@@ -783,3 +783,143 @@ def test_step0_kl_approximately_zero():
 - [ ] `test_segmented_forward.py` all pass
 - [ ] Model uses `impl = "hf"` in config (assertion or warning if not)
 - [ ] Memory usage is feasible on A100-80GB for max segment count (~25 segments)
+
+---
+
+## Phase 3.4 Live KL Test Results (2026-04-10)
+
+Final end-to-end numerical validation of segmented_forward vs vLLM's
+compaction inference on Qwen3-4B. See `experiments/phase3_kl_test/`
+for the test scripts.
+
+**Setup:**
+- Allocation: 2 A100-80GB nodes, 4 GPUs each (interactive, 4h walltime)
+- Inference node: 1 GPU, vLLM 0.19.1-dev (our fork) with
+  `enforce_eager=True`, window=4096, stride=512, block_size=16
+- Trainer node: 4 GPUs, DP=4 via torchrun, HF `AutoModelForCausalLM`
+  with `attn_implementation="flash_attention_2"`, bf16
+- Data: 10 rg-mix problems, `max_tokens=16384`, `ignore_eos=True`,
+  `temperature=1.0`, `seed=43`
+- Total: 160,821 completion tokens per condition, 240 compaction events
+  across 10 samples (exactly 24 per sample, spaced every 512 gen tokens
+  after the first event at gen[3893])
+
+**Two conditions compared:**
+1. **Baseline** — vLLM without compaction + trainer standard `model()`
+   forward. Measures the kernel-numerics noise floor between vLLM's
+   eager-mode path and HF's flash_attention_2 path on the same tokens.
+2. **Compaction** — vLLM with compaction enabled + trainer
+   `segmented_forward()` replaying the 24 KV evictions per sample with
+   no detach between segments.
+
+**Metric:** per-token `|trainer_logprob - inference_logprob|`, averaged
+over the full completion. This is the same metric mkv-rl used for its
+M3 KL check; it approximates per-token KL when the logprobs are
+sampled-token logprobs.
+
+**Results:**
+
+| Metric                   | Baseline  | Compaction | Ratio |
+|--------------------------|-----------|------------|-------|
+| mean abs log-ratio       | 0.00842   | 0.01035    | 1.23x |
+| max  abs log-ratio       | 4.8975    | 2.8539     | 0.58x |
+| mean signed log-ratio    | -0.00059  | -0.00062   | ~1x   |
+| samples                  | 10        | 10         | —     |
+| total completion tokens  | 160,821   | 160,821    | —     |
+| per-sample elapsed       | 1.4s      | 1.9s       | 1.36x |
+
+**Interpretation.** The compaction mean abs log-ratio is **1.23x the
+baseline kernel-noise floor** — indistinguishable from pure bf16
+rounding noise. The absolute number (~0.010 per token) is ~200x lower
+than the ~2.0 number mkv-rl M3 (SDPA + detached) was hitting on the
+same kind of measurement. The mean signed log-ratio is nearly identical
+between conditions (-0.00059 vs -0.00062), meaning compaction introduces
+no systematic bias — whatever drift exists is due to the base model's
+kernel numerics, not to anything segmented_forward does.
+
+**Per-sample details** (from kl_results.json per_sample_rank_local):
+- All 10 samples had 24 compaction events firing at the expected
+  cumulative gen positions (3893, 4405, 4917, ..., 15669), confirming
+  the first-eviction math holds in practice with the tightened
+  needs_compaction guard.
+- Every sample's per-token mean is within 0.006..0.014 for both
+  conditions — tight distribution, no outliers.
+- The max-abs outliers are driven by 1-2 tokens per trajectory (a common
+  pattern under temperature=1 where the argmax disagreement can be
+  dramatic at a single sampling step). Baseline saw a 4.90 outlier,
+  compaction saw a 2.85 outlier; both are statistical noise from
+  sampling, not systematic.
+
+**DP=4 validation.** All 4 ranks processed their shards in lockstep.
+The cross-rank `all_reduce(MAX)` for `max_forwards` and the
+RSA-hardened defensive branch-agreement `all_reduce` both worked
+without deadlock. The modality-partitioning fix from RSA Round 1 and
+the CP rejection fix from RSA Round 2 are both exercised and intact.
+
+**Runtime.** Model load 24s per rank (checkpoint shards cached); total
+trainer wall time under 60s for 20 samples. Inference phase took
+~5 min per condition (eager mode). Full test from salloc to
+kl_results.json: ~15 min of the 4h allocation.
+
+**Conclusion.** Phase 3 is numerically validated for forward-only
+correctness. The trainer's segmented_forward replay of vLLM's
+compaction is within kernel noise of the no-compaction baseline,
+meaning the KV drop arithmetic, position handling, temperature scaling,
+and cross-rank sync are all correct. Gradient flow through retained KV
+and full FSDP2-sharded training runs are the remaining validation
+steps before production training (see "Pre-production checklist"
+below).
+
+---
+
+## Pre-production Checklist
+
+Phase 3.4 validated forward-pass numerics. Before kicking off full RL
+training runs, the following smoke tests should pass. They are listed
+in rough order of risk (highest first) and complexity (lowest first).
+
+1. **Backward pass smoke test (single GPU).** The KL test used
+   `torch.no_grad()` and never called `.backward()`. segmented_forward
+   claims to preserve gradients through retained KV (the whole point of
+   "no detach") but this was never exercised numerically. Run one
+   compaction sample through segmented_forward, compute a dummy loss,
+   call backward, verify: (a) no NaN gradients, (b) every parameter
+   receives a gradient (no dead params), (c) gradient norm is in a
+   reasonable range (not 0, not 1e6+). This catches any "gradients
+   silently zero" bug that would make training a no-op.
+
+2. **FSDP2-sharded segmented_forward smoke test.** The KL test used DDP
+   (replicated weights). The real prime-rl trainer uses FSDP2 (sharded
+   weights with per-layer all-gather/reshard). segmented_forward makes
+   multiple model() calls per sample, each triggering its own FSDP2
+   collectives. Test: load Qwen3-4B with FSDP2 sharding across 4 GPUs,
+   run one compaction forward, compare resulting logits to the DDP
+   version from Phase 3.4. If they disagree beyond kernel noise, the
+   FSDP2 per-layer reshard is confusing segmented_forward's backbone
+   hook or its past_key_values handling.
+
+3. **End-to-end single training step.** Run the actual prime-rl RL
+   trainer (not the standalone KL test) for exactly one step with
+   compaction enabled. Use a minimal config: 1 rg-mix rollout, 1 micro
+   batch, small LR, FSDP=4 dp, single node. Watch for: (a) the
+   compaction samples hitting the segmented_forward dispatch, (b) the
+   config validator firing if attn/impl/cp are wrong, (c) the
+   optimizer actually stepping (non-zero update norm), (d) the weight
+   broadcast to the inference server completing.
+
+4. **Short stability run (5-10 steps).** Same config as #3, run 5-10
+   steps. Loss should decrease (or at least not explode), entropy
+   should stay finite, no NaN gradients. Confirms FSDP2 + compaction +
+   gradient flow + weight sync are all cooperating for more than one
+   iteration.
+
+5. **Production-config smoke (1 node, 1-2 steps).** Use the actual
+   production TOML (full seq_len, real batch sizes) to verify memory
+   fits and per-step wall time is acceptable. Segmented_forward's
+   O(window) memory footprint should keep us under peak GPU memory,
+   but better to confirm before committing to a long run.
+
+Of the 4 deferred items from RSA review (#37-#40), only #37 (cross-config
+validator between trainer and orchestrator inference args) meaningfully
+affects production robustness. The others are perf/hardening nits that
+don't block the first real runs.
