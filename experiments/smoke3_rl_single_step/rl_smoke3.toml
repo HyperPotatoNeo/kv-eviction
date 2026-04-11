@@ -1,0 +1,77 @@
+# Smoke #3: single end-to-end RL step with KV compaction
+#
+# Purpose: prove prime-rl's use_segmented dispatch fires end-to-end with
+# live rollouts from the compaction-enabled vLLM, that gradients land, and
+# that per-segment backward aggregates metrics correctly over a real
+# batch. One step, small batch, M3 semantics (bptt_segments=1).
+#
+# 2-node 1-1 split (see experiments/smoke3_rl_single_step/launch.sh):
+#   Node 0: vLLM inference server DP=4 with --compaction-window-size 4096
+#   Node 1: FSDP2 trainer DP=4
+#
+# Compaction settings must mirror inference_smoke3.toml exactly. The RL
+# config's cross-validator is bypassed in the multi-node split (inference
+# runs on node 0 from a separate TOML), so keeping them in sync is manual.
+
+max_steps = 1
+seq_len = 16384
+output_dir = "outputs/smoke3_rl_single_step"
+
+# 4-GPU trainer node, inference lives on a remote node via
+# orchestrator.client.base_url. num_infer_gpus=0 because the RL launcher's
+# embedded inference subprocess is not used here.
+[deployment]
+type = "single_node"
+gpus_per_node = 4
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction-smokes"
+name = "smoke3-rl-single-step"
+
+# Full FT — impl=hf and flash_attention_2 are required for the segmented
+# forward path (the TrainerConfig validator enforces this when
+# compaction.window_size > 0).
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.compaction]
+window_size = 4096
+stride = 512
+block_size = 16
+bptt_segments = 1
+
+[trainer.loss]
+kl_tau = 0.01
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 32
+rollouts_per_example = 8
+oversampling_factor = 1.0
+
+[orchestrator.client]
+base_url = ["http://__INFERENCE_NODE__:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 8192
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "rg-mix-env"
+args = { num_train_examples = 7500, num_eval_examples = 100, seed = 42, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500" }

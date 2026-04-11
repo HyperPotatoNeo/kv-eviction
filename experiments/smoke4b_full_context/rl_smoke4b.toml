@@ -1,0 +1,84 @@
+# Smoke #4b: 5-step full-context baseline — sibling comparison to Smoke #4.
+#
+# Purpose: run the EXACT same config as smoke4_rl_stability_run (same
+# batch, seed, max_steps, model, task, optimizer, loss) but with KV
+# cache compaction disabled on both the inference engine and the
+# trainer. This produces a direct apples-to-apples comparison on:
+#
+#   1. Reward trajectory on the same 5 rg-mix problem batches
+#      (env seed=42 means both runs see the same problems).
+#   2. Mismatch KL (trainer vs inference logprob agreement): the
+#      baseline exercises prime-rl's well-tested vanilla forward path
+#      so we expect near-zero mismatch KL — a reference point for
+#      interpreting Smoke #4's 0.035-0.047 range.
+#
+# Only differences from rl_smoke4.toml:
+#   - [trainer.compaction] section removed (defaults to window_size=0)
+#   - inference_smoke4b.toml has no compaction_* in [vllm_extra]
+#
+# The prefix_caching / async_scheduling flags in the inference config
+# are left disabled to match Smoke #4 exactly. (They only matter for
+# compaction correctness, but matching them avoids adding a second
+# confounding variable to the comparison.)
+#
+# 2-node 1-1 split (see experiments/smoke4b_full_context/launch.sh):
+#   Node 0: vLLM inference server DP=4 (NO compaction)
+#   Node 1: FSDP2 trainer DP=4 (NO compaction)
+
+max_steps = 5
+seq_len = 16384
+output_dir = "outputs/smoke4b_full_context"
+
+[deployment]
+type = "single_node"
+gpus_per_node = 4
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction-smokes"
+name = "smoke4b-full-context-baseline"
+
+# Matching Smoke #4: same impl and attn so the only difference between
+# the two runs is compaction on/off. impl=hf is not strictly required
+# for the full-context path (liger_kernel etc. would also work), but
+# matching it keeps the comparison clean.
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.model.ac]
+freq = 1
+
+# NO [trainer.compaction] section → window_size defaults to 0,
+# TrainerConfig disables the segmented_forward dispatch entirely.
+
+[trainer.loss]
+kl_tau = 0.01
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 8
+oversampling_factor = 1.0
+
+[orchestrator.client]
+base_url = ["http://__INFERENCE_NODE__:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 8192
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "rg-mix-env"
+args = { num_train_examples = 7500, num_eval_examples = 100, seed = 42, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500" }

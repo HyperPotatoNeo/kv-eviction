@@ -1,0 +1,31 @@
+# Smoke #4b inference-side vLLM config (Node 0, 4 GPUs, DP=4).
+# Full-context baseline — NO KV compaction. Sibling to Smoke #4.
+#
+# Matches inference_smoke4.toml exactly EXCEPT:
+#   - no compaction_window_size / compaction_stride / block_size in
+#     [vllm_extra]
+#
+# prefix_caching=false and async_scheduling=false are KEPT to match
+# Smoke #4's inference setup exactly. They're not required in the
+# no-compaction case, but matching them eliminates a second confounding
+# variable in the smoke-to-smoke comparison.
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+async_scheduling = false
