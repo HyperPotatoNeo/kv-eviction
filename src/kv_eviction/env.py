@@ -24,7 +24,7 @@ before the verifiers env so its `add_model_response` runs first.
 
 from typing import Any
 
-from verifiers.types import Messages, ModelResponse, State, TrajectoryStep
+from verifiers.types import Messages, Response as ModelResponse, State, TrajectoryStep
 
 from kv_eviction.types import CompactionEventWire
 
@@ -114,6 +114,107 @@ class CompactionEnvMixin:
             return
         # The base class just appended a step. Attach compaction metadata to it.
         attach_compaction_events_from_response(trajectory[-1], response)
+
+
+# ─── Module-level monkey-patches ───
+#
+# The CompactionEnvMixin approach above requires every env author to
+# explicitly subclass it. In practice, env packages like rg-mix-env do
+# NOT subclass it — their class definitions look like
+# `class RGMixEnv(vf.SingleTurnEnv):` with no mention of compaction. And
+# the upstream verifiers library strips unknown fields during
+# ChatCompletion -> verifiers.Response conversion (see
+# verifiers/clients/openai_chat_completions_client.py:from_native_response,
+# which constructs Response(id=..., created=..., model=..., usage=...,
+# message=...) from a hardcoded field list).
+#
+# Result: when the compaction-enabled vLLM attaches `compaction_events`
+# to its ChatCompletionResponse JSON, the openai-python SDK preserves
+# the field (ChatCompletion model has extra="allow"), but verifiers'
+# client adapter DROPS it when constructing its own Response, and the
+# trajectory step's `extras` never gets populated, and
+# `trainer.compaction_events` is always None. The segmented forward
+# never fires and the trainer reforwards compaction rollouts in full
+# context against post-eviction inference logprobs → large, spurious
+# Mismatch KL.
+#
+# Fix: at module import time, monkey-patch two verifiers hook points to
+# plumb compaction_events all the way through:
+#
+#   1. OpenAIChatCompletionsClient.from_native_response: copy
+#      compaction_events from the native openai ChatCompletion (where
+#      pydantic extra="allow" preserved it) to the verifiers Response
+#      object (whose CustomBaseModel also has extra="allow", so setattr
+#      works).
+#
+#   2. MultiTurnEnv.add_model_response: after the base class appends a
+#      TrajectoryStep with extras={}, read the response's
+#      compaction_events attribute and copy into the step's extras. This
+#      is identical to what CompactionEnvMixin does; we just apply it
+#      unconditionally to the base class so every env subclass benefits.
+#
+# Both patches are idempotent (sentinel-attribute guarded) so repeated
+# imports of this module are safe. The patches only fire if the
+# verifiers package is importable — if verifiers is missing, they
+# silently no-op so unrelated kv_eviction consumers aren't affected.
+
+
+def _install_compaction_event_hooks() -> None:
+    try:
+        from verifiers.clients import openai_chat_completions_client as _vf_client
+        from verifiers.envs import multiturn_env as _vf_mt
+    except ImportError:
+        return
+
+    # --- Patch 1: OpenAIChatCompletionsClient.from_native_response ---
+    base_client_cls = _vf_client.OpenAIChatCompletionsClient
+    orig_from_native = base_client_cls.from_native_response
+    if not getattr(orig_from_native, "__kv_eviction_patched__", False):
+
+        async def patched_from_native(self, response):  # type: ignore[no-untyped-def]
+            # Call the original conversion to get the verifiers Response.
+            verifiers_response = await orig_from_native(self, response)
+            # Read compaction_events off the raw openai ChatCompletion.
+            # openai-python's ChatCompletion has pydantic extra="allow",
+            # so vLLM's compaction_events field is preserved on the
+            # native response either as an attribute or in model_extra.
+            raw_events = getattr(response, "compaction_events", None)
+            if raw_events is None and hasattr(response, "model_extra"):
+                extra = response.model_extra or {}
+                raw_events = extra.get("compaction_events")
+            if raw_events is not None:
+                # Verifiers' Response class is CustomBaseModel with
+                # extra="allow", so setattr on an extra field is
+                # supported in pydantic v2. If for some reason it's
+                # not, fall back to stashing in model_extra directly.
+                try:
+                    setattr(verifiers_response, "compaction_events", raw_events)
+                except Exception:
+                    if hasattr(verifiers_response, "model_extra"):
+                        if verifiers_response.model_extra is None:
+                            verifiers_response.__pydantic_extra__ = {}
+                        verifiers_response.model_extra["compaction_events"] = raw_events
+            return verifiers_response
+
+        patched_from_native.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
+        base_client_cls.from_native_response = patched_from_native  # type: ignore[assignment]
+
+    # --- Patch 2: MultiTurnEnv.add_model_response ---
+    base_env_cls = _vf_mt.MultiTurnEnv
+    orig_add_model_response = base_env_cls.add_model_response
+    if not getattr(orig_add_model_response, "__kv_eviction_patched__", False):
+
+        async def patched_add_model_response(self, state, prompt_messages, response):  # type: ignore[no-untyped-def]
+            await orig_add_model_response(self, state, prompt_messages, response)
+            trajectory = state.get("trajectory", [])
+            if trajectory:
+                attach_compaction_events_from_response(trajectory[-1], response)
+
+        patched_add_model_response.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
+        base_env_cls.add_model_response = patched_add_model_response  # type: ignore[assignment]
+
+
+_install_compaction_event_hooks()
 
 
 def compaction_events_from_step_extras(
