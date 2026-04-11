@@ -29,15 +29,26 @@ from verifiers.types import Messages, Response as ModelResponse, State, Trajecto
 from kv_eviction.types import CompactionEventWire
 
 
-def _extract_compaction_events(
+def _extract_compaction_event_dicts(
     response: ModelResponse,
-) -> list[CompactionEventWire] | None:
-    """Pull compaction events off a vllm ChatCompletion response.
+) -> list[dict] | None:
+    """Pull compaction events off a vllm ChatCompletion response as a list
+    of plain JSON-serializable dicts.
 
     vllm's server attaches an OpenAI-extension field `compaction_events` at
     the top level of ChatCompletionResponse. The official openai-python SDK
     preserves unknown fields via pydantic's model_extra and also exposes them
     as regular attribute access, so `response.compaction_events` works.
+
+    We return dicts (NOT msgspec CompactionEventWire instances) because
+    verifiers routes trajectory-step extras through a JSON-serializability
+    check (`state_columns value for 'trajectory' is not JSON-serializable`).
+    Msgspec structs are not JSON-serializable as-is, so storing them there
+    causes every rollout to fail with `state_columns value ... is not
+    JSON-serializable: list`. The conversion to CompactionEventWire happens
+    later in prime-rl's `orchestrator.trajectories._compaction_events_from_step`
+    which already handles the dict form defensively (see its
+    `elif isinstance(e, dict):` branch).
 
     Returns None when compaction is disabled on the server, the request had
     no compaction events, or the response type is something unexpected.
@@ -45,47 +56,80 @@ def _extract_compaction_events(
     if response is None:
         return None
     raw = getattr(response, "compaction_events", None)
+    # When the attribute is missing but pydantic v2 stashed it in model_extra,
+    # fall through to the extras dict.
+    if raw is None and hasattr(response, "model_extra"):
+        extras = response.model_extra or {}
+        raw = extras.get("compaction_events")
     if raw is None:
         return None
-    # vllm emits a list of dicts: {num_output_tokens_at_compaction,
-    # tokens_evicted, position_offset_after}. Convert each to the msgspec
-    # wire struct. Skip malformed entries defensively rather than crashing
-    # the rollout: the reward has already been earned at this point, losing
-    # compaction metadata downgrades training fidelity but doesn't invalidate
-    # the trajectory for other methods.
-    events: list[CompactionEventWire] = []
+    events: list[dict] = []
     for e in raw:
         if isinstance(e, dict):
             try:
                 events.append(
-                    CompactionEventWire(
-                        num_output_tokens_at_compaction=int(
+                    {
+                        "num_output_tokens_at_compaction": int(
                             e["num_output_tokens_at_compaction"]
                         ),
-                        tokens_evicted=int(e["tokens_evicted"]),
-                        position_offset_after=int(e["position_offset_after"]),
-                    )
+                        "tokens_evicted": int(e["tokens_evicted"]),
+                        "position_offset_after": int(e["position_offset_after"]),
+                    }
                 )
             except (KeyError, TypeError, ValueError):
                 continue
+        elif isinstance(e, CompactionEventWire):
+            # Someone already converted (unlikely in our flow, but defensive).
+            events.append(
+                {
+                    "num_output_tokens_at_compaction": e.num_output_tokens_at_compaction,
+                    "tokens_evicted": e.tokens_evicted,
+                    "position_offset_after": e.position_offset_after,
+                }
+            )
+        else:
+            # Object form (e.g. pydantic CompactionEventPayload from a
+            # locally-constructed vllm response — rare). Best-effort attribute
+            # read.
+            try:
+                events.append(
+                    {
+                        "num_output_tokens_at_compaction": int(
+                            getattr(e, "num_output_tokens_at_compaction")
+                        ),
+                        "tokens_evicted": int(getattr(e, "tokens_evicted")),
+                        "position_offset_after": int(
+                            getattr(e, "position_offset_after")
+                        ),
+                    }
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
     return events or None
+
+
+# Backwards-compat alias for the pre-JSON-fix name.
+def _extract_compaction_events(response):
+    return _extract_compaction_event_dicts(response)
 
 
 def attach_compaction_events_from_response(
     step: TrajectoryStep,
     response: ModelResponse,
 ) -> None:
-    """Mutate the given TrajectoryStep's extras to include compaction_events.
+    """Mutate the given TrajectoryStep's extras to include compaction_events
+    as a list of JSON-serializable dicts (not msgspec CompactionEventWire
+    instances — see `_extract_compaction_event_dicts` docstring for why).
 
     Idempotent: overwrites any existing "compaction_events" entry on the
     step's extras dict with the events pulled from the response.
     """
-    events = _extract_compaction_events(response)
-    if events is None:
+    event_dicts = _extract_compaction_event_dicts(response)
+    if event_dicts is None:
         return
     if step.get("extras") is None:
         step["extras"] = {}
-    step["extras"]["compaction_events"] = events
+    step["extras"]["compaction_events"] = event_dicts
 
 
 class CompactionEnvMixin:
