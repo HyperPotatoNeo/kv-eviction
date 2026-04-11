@@ -1,5 +1,31 @@
 # Phase 2: vLLM KV Cache Compaction Feature
 
+## Status: COMPLETE (2026-04-09 to 2026-04-11)
+
+All Phase 2 components landed on the `compaction` branch of
+`https://github.com/HyperPotatoNeo/vllm`:
+
+- `63d3bc172` Scheduler-integrated KV cache compaction (Phase 2 core)
+- `8e97c6ad6` Assert async_scheduling=False when compaction is enabled
+- `a03238535` Phase 2.1: prompt-block-alignment fix + partial-block + LMCache guard
+- `6ad4e779a` Phase 3.1: plumb compaction_events through vLLM response chain
+
+Plus one small install-time fix on top:
+- `a08f29d9c` vllm_flash_attn: register virtual flash_attn package in symlink-mode
+  (needed for `VLLM_USE_PRECOMPILED=1` editable installs, guarded no-op in
+  non-symlink builds)
+
+A vLLM server launched with `--compaction-window-size 4096
+--compaction-stride 512` now automatically evicts oldest post-prompt
+blocks when a request exceeds the window, returns `compaction_events`
+in ChatCompletionResponse, and produces correct logprobs under
+flash_attention_2. Offline eval (`experiments/eval/`) shows ~1.86x
+throughput vs full-context at ~10 pts absolute pass@1 cost on rg-mix.
+
+Phase 3 depends only on the public API surface (the `compaction_events`
+field on responses + the compaction CLI flags) — Phase 2 is stable and
+doesn't need further edits.
+
 ## Goal
 
 Implement block-level KV cache compaction as a native vLLM V1 scheduler feature. After this

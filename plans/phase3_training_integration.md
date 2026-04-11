@@ -1,5 +1,27 @@
 # Phase 3: Training Integration — Segmented Forward (No Detach)
 
+## Status: COMPLETE (2026-04-11)
+
+All Phase 3 components landed and validated end-to-end by smoke #4 v6
+(5-step stability run at batch_size=64, rollouts_per_example=8, window=4096,
+stride=512). Key metrics from v6:
+
+- Steps 0–4 all pass. Peak memory flat at 45.9 GiB (34 GiB headroom under
+  80 GB), Mismatch KL 0.0009–0.0010 (kernel floor), entropy smoothly
+  decreasing, reward trending upward.
+- D5 (compaction → text modality transition OOM) resolved via unified
+  dispatch: every sample in a compaction run is routed through
+  `segmented_forward`, including event-less short rollouts that run as
+  single-segment forwards. See the "D5 resolution" section at the end of
+  this file for the full investigation.
+- Published forks:
+  - `https://github.com/HyperPotatoNeo/vllm` (branch `compaction`)
+  - `https://github.com/HyperPotatoNeo/tba-prime` (branch `kv-eviction`)
+  - `https://github.com/HyperPotatoNeo/kv-eviction` (top-level)
+
+Next open item is Phase 4 smoke #5 (production-config run). Phase 3 is
+frozen; no further edits should be needed.
+
 ## Goal
 
 Implement the training-side components that match the inference-side compaction from Phase 2.

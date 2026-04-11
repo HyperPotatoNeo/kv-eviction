@@ -1,19 +1,50 @@
 # Phase 4: Experiments
 
+## Current status (2026-04-11)
+
+**Smokes #1-#4 passing. Smoke #5 (production config) is the next work
+item, unblocked after D5 resolution.**
+
+Smoke progression:
+
+| Smoke | Purpose | Status | Notes |
+|---|---|---|---|
+| #1 | Single-GPU backward pass | PASS | Single rank, no FSDP. `experiments/smoke1_single_gpu_backward/`. |
+| #1b | Per-segment backward probe | PASS | Verifies bptt_segments=1 frees segment activations between segments. |
+| #2 | FSDP2 segmented_forward | PASS | 4-rank FSDP2, dummy-pass rank sync, no cross-rank collective drift. |
+| #3 | Single end-to-end RL step | PASS (cosmetically) | Dispatch never actually fired on event-bearing samples due to events-plumbing bugs; real validation came from smoke #4 v5 step 0. |
+| #4 | 5-step stability | PASS (v6) | Earlier v1-v5 attempts were blocked by events plumbing chain (msgspec->JSON, verifiers Response field drop, subprocess import, MultiTurnEnv hook, trainer dispatch), AC + DynamicCache double-update, torch.compile entropy thrash, and finally the D5 compaction→text OOM. v6 passes all 5 steps with peak 45.9 GiB, Mismatch KL 0.0009 kernel floor. |
+| #4b | Full-context baseline | PASS | Runs the same 5 steps with compaction disabled so the Mismatch KL and reward are comparable. Peak 74.9 GiB. Mismatch KL 0.0007. |
+| **#5** | **Production-config smoke** | **PENDING** | Next work item. Tune batch_size / seq_len / bptt_segments above smoke #4 settings, run for enough steps to see reward trajectory, verify memory / mismatch KL / reward all stay healthy. Compare against smoke #4b full-context baseline on the same data. |
+
+Published forks that make this reproducible from a fresh clone:
+
+- `https://github.com/HyperPotatoNeo/kv-eviction` (top-level)
+- `https://github.com/HyperPotatoNeo/vllm` (branch `compaction`)
+- `https://github.com/HyperPotatoNeo/tba-prime` (branch `kv-eviction`)
+
 ## Goal
 
-Run the two experimental conditions on NERSC Perlmutter and verify correctness:
-1. **Full Context** — baseline: standard vLLM + standard prime-rl forward, max_model_len=16384
-2. **Markovian KV** — compaction vLLM (window=4096, stride=512) + segmented forward (no detach)
+Compare two training conditions on the same reasoning-gym workload:
+1. **Full Context** — baseline: stock vLLM + standard prime-rl forward
+   (smoke #4b, `experiments/smoke4b_full_context/`)
+2. **Markovian KV / compaction** — compaction-enabled vLLM (window=4096,
+   stride=512) + segmented forward via the unified D5 dispatch
+   (smoke #4 v6, `experiments/smoke4_rl_stability_run/`)
 
-Each condition uses 2 nodes (4x A100-80GB each): 1 node for inference (vLLM server),
-1 node for training (prime-rl DPPO). Model: Qwen3-4B-Instruct-2507.
+Each condition uses 2 nodes (4× A100-80GB each): 1 node for inference
+(vLLM DP=4), 1 node for training (FSDP2 DP=4). Model:
+`Qwen/Qwen3-4B-Instruct-2507`.
 
 ## Prerequisites
 
-- Phase 2 complete (vLLM compaction working)
-- Phase 3 complete (segmented forward + training hooks working)
-- Both conditions passing unit tests and step-0 KL verification
+- Phase 2 complete: vLLM with compaction returning `compaction_events`
+  in responses. DONE.
+- Phase 3 complete: segmented_forward + unified dispatch + events
+  plumbing from vLLM → verifiers → trajectory → TrainingSample →
+  MicroBatch → trainer. DONE.
+- Both smoke #4 and smoke #4b pass with Mismatch KL at kernel floor.
+  DONE.
 
 ---
 
@@ -507,3 +538,32 @@ class TestLogitMatch:
 - [ ] G_distal norm > 0 for Markovian KV condition
 - [ ] Final reward comparison documented
 - [ ] Speed comparison (inference tok/s, training samples/s) documented
+
+---
+
+## Appendix: current smoke #4 v6 metrics (for smoke #5 to beat or match)
+
+Reference numbers from the D5-validated run — use these as the bar
+smoke #5 must meet at production scale before calling it a successful
+prod smoke.
+
+| Step | Time (s) | Loss | Entropy | Mismatch KL | Grad Norm | Peak Mem | Reward |
+|---|---|---|---|---|---|---|---|
+| 0 | 65.7 | 0.0009 | 0.3086 | 0.0010 | 0.1013 | 38.4 GiB | 0.266 |
+| 1 | 38.5 | 0.0019 | 0.2891 | 0.0009 | 0.1199 | 45.9 GiB | 0.318 |
+| 2 | 55.5 | 0.0021 | 0.2891 | 0.0009 | 0.0925 | 45.9 GiB | 0.297 |
+| 3 | 508.5 | 0.0020 | 0.2930 | 0.0009 | 0.1075 | 45.9 GiB | 0.472 |
+| 4 | 179.8 | 0.0026 | 0.2676 | 0.0009 | 0.1171 | 45.9 GiB | 0.352 |
+
+Notes:
+- Mismatch KL holds at 0.0009 across every step = kernel floor (same
+  flash_attention_2 kernel as inference, measured offline at 0.0007 via
+  `experiments/phase3_kl_test/compare_segforward_modes.py`). Smoke #5
+  should see the same or very close.
+- Peak memory flat at 45.9 GiB across steps 1-4 = no per-step leak.
+- Step 3's 508 s is an orchestrator-side rollout generation stall
+  (memory stayed flat during that step, trainer path was idle waiting
+  for the batch). Not a training issue. Expected variance.
+- Smoke #4b full-context baseline: Mismatch KL 0.0007, peak 74.9 GiB.
+  Compaction is about 1 point higher on KL and 29 GiB lower on peak
+  memory, which is the tradeoff we designed for.

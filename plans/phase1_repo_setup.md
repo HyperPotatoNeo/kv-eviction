@@ -1,10 +1,25 @@
 # Phase 1: Repository Setup
 
-## Status
+## Status: COMPLETE (2026-04-11)
 
-Partially complete. The repo skeleton exists at `$SCRATCH/kv-eviction/` with git initialized,
-submodules added, and `pyproject.toml` + `setup.sh` created. This phase documents the full
-intended state and remaining items.
+Repo skeleton, both submodules, `pyproject.toml`, `setup.sh`, test
+scaffolding, and published GitHub forks are all in place. Fresh-clone
+setup works via `git clone --recursive ...; bash setup.sh`.
+
+Published forks:
+- Top-level: `https://github.com/HyperPotatoNeo/kv-eviction`
+- vLLM submodule: `https://github.com/HyperPotatoNeo/vllm` (branch `compaction`)
+- prime-rl submodule: `https://github.com/HyperPotatoNeo/tba-prime` (branch `kv-eviction`)
+
+`.gitmodules` points at the forks and both submodule remotes have the
+`+refs/heads/*:refs/remotes/origin/*` refspec so `git fetch origin`
+picks up the non-main branches. `setup.sh` uses
+`VLLM_USE_PRECOMPILED=1 uv pip install -e ./vllm --no-build-isolation`
+in step 1b so the compaction-enabled vLLM (not stock PyPI vllm)
+actually gets installed.
+
+The rest of this file documents the full intended state for historical
+reference.
 
 ## Goal
 
