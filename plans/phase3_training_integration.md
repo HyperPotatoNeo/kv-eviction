@@ -1525,3 +1525,133 @@ real fix, but a decent smoke gate.
 - `probe_ac_cache_mutation.py` (pre-existing) — minimal repro of the
   `torch.utils.checkpoint` + `DynamicCache.update()` double-append
   bug that forced the AC config validator.
+
+### D5 resolution (2026-04-11 session 4)
+
+**Root cause turned out NOT to be rank-level FSDP collective divergence.**
+The round-3 plan section's hypothesis was wrong. Actual cause was a
+CUDA OOM on step 1 triggered by the **compaction → text modality
+transition** inside a single training step. Smoke #4's inference config
+(`max_completion_tokens=8192`, `window_size=4096`) produced a mix of
+event-bearing rollouts (long completions, trigger compaction) and
+event-less rollouts (short completions, never compact). The pre-fix
+trainer dispatch routed event-bearing samples through
+`segmented_forward` and event-less samples through the **standard
+packed-text forward**. In a single step each rank processed its
+compaction micro-batches first, then its packed text micro-batches.
+The per-segment allocation pattern from compaction left the allocator
+holding ~11 GiB of cached blocks sized for per-layer/per-segment
+tensors that didn't fit the contiguous shapes the packed text forward
+needed, pushing the total above 80 GiB on step 1 once the optimizer
+state had allocated.
+
+Evidence from the investigation:
+
+1. **Static audit of `segmented_forward`** — traced every tensor lifetime
+   for `bptt_segments=1` + per-segment-backward. All retained-KV storage
+   is reset between iterations; no cross-call leak.
+
+2. **Memory probe** (`experiments/phase3_kl_test/memory_probe_segforward.py`)
+   — 10 sequential `segmented_forward` calls, both frozen and unfrozen
+   variants, real gradient flow. Entry memory is identical on every call
+   (8.122 GB), peak is bounded per call (38.3 GB unfrozen), no growth.
+   Empty-boundaries single-segment path works end-to-end. Mixed-events
+   probe (alternating 24-event and 0-event samples) also stable. The
+   fix's structural correctness is validated at the probe level.
+
+3. **FSDP2 4-rank probe** (`experiments/phase3_kl_test/memory_probe_fsdp.py`)
+   — wrapped Qwen3-4B in per-block FSDP2 matching prime-rl's setup,
+   ran 5 compaction calls + 1 text call at `seq_len=16384`, **reproduced
+   the exact smoke #4 OOM**: 5 × compaction peak ~34 GB, then the text
+   forward OOMs at 78.9 GB. At `seq_len=8192` where text fits, the
+   compaction-then-text sequence left `reserved` at 79.7 GB vs text-only
+   at 68.5 GB — an **11.2 GB fragmentation delta** from the modality
+   transition.
+
+4. **Smoke #4 v5 crash log** (previous session) shows rank 1 OOMing first
+   at 06:40 with 79.04 GiB in use, then ranks 0/2/3 either OOMing
+   themselves or hitting NCCL watchdog timeouts while waiting on the
+   first collective rank 1 never issued. **The NCCL timeout was a
+   downstream symptom of OOM, not a rank-count divergence.**
+
+### The fix: unify dispatch via `segmented_forward`
+
+**Design**. Route every sample in a compaction training run
+(`compaction.window_size > 0`) through `segmented_forward`, even samples
+whose inference rollout never triggered a compaction event. Samples
+with events produce a multi-segment forward; event-less samples produce
+a single-segment forward covering `[0, seq_len)`, which is numerically
+identical to calling `model(input_ids, position_ids)` under the same
+flash_attention_2 kernel. The packer un-packs every non-multimodal
+sample into its own micro-batch in a compaction run. Non-compaction
+runs (`window_size == 0`) are unaffected — they keep the existing
+packed text path.
+
+**Changes across 5 files**:
+
+- `prime-rl/src/prime_rl/trainer/batch.py` — threaded
+  `compaction_enabled` through `prepare_sample`, `packed_samples_into_micro_bs`,
+  `pad_micro_batch`, and `prepare_batch`. When True, every non-multimodal
+  sample becomes its own un-packed micro-batch, gets `prompt_len` set,
+  uses the continuous position-id padding, and lands in the compaction
+  modality bucket.
+- `prime-rl/src/prime_rl/trainer/rl/packer.py` — `BasePacker`,
+  `SinglePacker`, `MultiPacker`, and `setup_packer` accept the flag and
+  pass it to `prepare_batch` calls.
+- `prime-rl/src/prime_rl/trainer/rl/data.py` — `DataLoader.__init__`
+  takes `compaction_enabled` and forwards to `setup_packer`.
+- `prime-rl/src/prime_rl/trainer/rl/train.py` — `DataLoader` is
+  constructed with `compaction_enabled=config.compaction.window_size > 0`.
+  The per-micro-batch dispatch now uses
+  `use_segmented = config.compaction.window_size > 0` instead of
+  checking individual-sample events. The `prompt_len is not None` assert
+  error message updated.
+- `src/kv_eviction/segmented_forward.py` — relaxed the
+  `len(segment_boundaries) > 0` assertion, guarded
+  `segment_boundaries[-1]` access, and added a `seq_len > 0`-guarded
+  fallback that appends `(0, seq_len)` as a single segment when
+  boundaries is empty. `compute_num_segments` already returned 1 for
+  the empty case, so the `all_reduce MAX` dummy-pass sync still keeps
+  FSDP collectives balanced across ranks with different event counts.
+
+### Smoke #4 v6 validation (2026-04-11 09:XX)
+
+All 5 steps passed. Compare to v5 (pre-fix, same config):
+
+| Step | Time (s) | Loss | Entropy | Mismatch KL | Grad Norm | Peak Mem |
+|---|---|---|---|---|---|---|
+| 0 | 65.67 | 0.0009 | 0.3086 | 0.0010 | 0.1013 | 38.4 |
+| 1 | 38.45 | 0.0019 | 0.2891 | 0.0009 | 0.1199 | **45.9** |
+| 2 | 55.48 | 0.0021 | 0.2891 | 0.0009 | 0.0925 | 45.9 |
+| 3 | 508.45 | 0.0020 | 0.2930 | 0.0009 | 0.1075 | 45.9 |
+| 4 | 179.78 | 0.0026 | 0.2676 | 0.0009 | 0.1171 | 45.9 |
+
+v5 for comparison: step 0 passed at 43.7 GiB / 216s / MKL 0.0009, step
+1 OOMed at 79.18 GiB. v6 step 0 is 3.3× faster (one-sample micro-batches
+pack better through the allocator than 16k text bins), peak memory is
+5 GiB lower on step 0 and stays flat at 45.9 GiB across steps 1-4 (no
+leak), Mismatch KL holds at the kernel floor (0.0009-0.0010) confirming
+the single-segment fallback is numerically identical to the standard
+forward. Orchestrator-side reward trends upward (0.266 → 0.472 → 0.352
+on the final step, within run-to-run noise). Step 3's 508 s time is an
+orchestrator-side inference stall, not a training issue (memory stayed
+flat, training metrics remained normal).
+
+**34 GiB of headroom** to the 80 GB limit on step 1+, vs v5 which was
+over the limit by several GiB. Production config (smoke #5) has
+significant safety margin.
+
+### Updated smoke status
+
+- Smoke #4 (5-step stability): **PASS** (2026-04-11 v6 with D5 fix)
+- Smoke #5 (production-config smoke): **UNBLOCKED**, next work item
+
+### Updated deferred items
+
+| ID | Title | Status |
+|---|---|---|
+| D1 | Multi-rank `bptt_segments != 1` under FSDP2 | Blocked via runtime ValueError. |
+| D2 | Entropy for compaction samples | **RESOLVED** (round 3). |
+| D3 | Token-weighted metric aggregation | Still open. Low priority. |
+| D4 | Smokes #3-5 | **#3/#4 DONE**, #5 unblocked. |
+| D5 | Rank-level FSDP collective divergence | **RESOLVED** (this session): not actually the problem — root cause was CUDA OOM from compaction→text allocator fragmentation. Fix: unified dispatch via `segmented_forward` for all samples in a compaction run. Validated by smoke #4 v6. |

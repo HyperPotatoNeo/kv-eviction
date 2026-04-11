@@ -350,10 +350,14 @@ def segmented_forward(
             can log/reduce it without re-entering the graph.
     """
     assert input_ids.shape[0] == 1, "segmented_forward requires batch_size=1"
-    assert len(segment_boundaries) > 0, (
-        "segment_boundaries must be non-empty; dispatch to standard forward "
-        "when the sample has no compaction events"
-    )
+    # Empty segment_boundaries is a legal no-event sample: the trainer's
+    # unified compaction dispatch (D5 fix) routes every sample through
+    # segmented_forward in a compaction run, including short rollouts
+    # whose inference never triggered a compaction event. Those samples
+    # produce seg_ranges = [(0, seq_len)] below — a single segment
+    # covering the whole [prompt + completion] sequence, numerically
+    # equivalent to calling model(input_ids, position_ids) directly
+    # under flash_attention_2. See plans/phase3_training_integration.md.
     assert prompt_aligned_len >= prompt_len, (
         f"prompt_aligned_len ({prompt_aligned_len}) must be >= prompt_len "
         f"({prompt_len})"
@@ -416,9 +420,19 @@ def segmented_forward(
     # treats boundaries as segment END POINTS including the final one. In
     # mkv-rl the last boundary equals completion_len and no tail is needed.
     # We mirror CompactionEvent semantics directly instead.)
-    last_covered = prompt_len + segment_boundaries[-1]
-    if last_covered < seq_len:
-        seg_ranges.append((last_covered - 1, seq_len))
+    if segment_boundaries:
+        last_covered = prompt_len + segment_boundaries[-1]
+        if last_covered < seq_len:
+            seg_ranges.append((last_covered - 1, seq_len))
+    elif seq_len > 0:
+        # No events: single segment covering the whole sample. We still
+        # go through segmented_forward's machinery (per-segment backward
+        # mode, FSDP dummy-pass padding, etc.) so every rank in a
+        # compaction run issues a uniform collective sequence regardless
+        # of whether each rank's sample had any events. Numerically this
+        # is a plain text forward on the full sequence under
+        # flash_attention_2 — same kernel as the non-compaction path.
+        seg_ranges.append((0, seq_len))
 
     assert seg_ranges, (
         f"No segment ranges produced: seq_len={seq_len}, prompt_len={prompt_len}, "
