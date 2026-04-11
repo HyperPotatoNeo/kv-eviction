@@ -235,7 +235,7 @@ apples-to-apples comparison.
 |---|---|
 | Model | `Qwen/Qwen3-4B-Instruct-2507` |
 | `seq_len` | 16384 |
-| `max_completion_tokens` | 8192 |
+| `max_completion_tokens` | 16384 |
 | `batch_size` / `rollouts_per_example` | 128 / 8 |
 | Optimizer | AdamW, `lr=2e-6`, `betas=(0.9, 0.9)`, `wd=0.01`, `max_norm=1.0` |
 | Loss | `kl_tau=0.0` (reference-policy KL off) |
@@ -315,7 +315,7 @@ automatically via the broadcast worker hook.
 - `progress/entropy/mean` — flat or mild downward drift is fine;
   sharp spikes or collapse below ~0.1 indicates mode collapse.
 - `progress/seq_len/mean` — watch for length explosion toward the
-  8192 `max_completion_tokens` ceiling. Growing rollout length is
+  16384 `max_completion_tokens` ceiling. Growing rollout length is
   fundamental to rollout-only GRPO in open-ended tasks and can stall
   steps on long tails.
 - `Peak Mem.` in the trainer log — compaction run peaks around 46 GiB
