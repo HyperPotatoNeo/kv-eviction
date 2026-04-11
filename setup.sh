@@ -16,8 +16,22 @@ source .venv/bin/activate
 #   prime-rl requires transformers >= 5.1.0.dev0 (HF git)
 #   prime-rl ships a vLLM plugin (transformers_v5_compat) that patches the gap.
 
-echo "=== Step 1: vLLM 0.19.0 + all deps ==="
+echo "=== Step 1a: vLLM 0.19.0 from PyPI to pull in runtime deps ==="
+# This pulls in torch, ray, numpy, transformers, etc. — all the
+# transitive deps we need. We'll overwrite the vllm package itself
+# with an editable install of our compaction-enabled fork in step 1b
+# so Phase 2 + Phase 3.1 changes under vllm/vllm/v1/core/compaction/
+# and related files take effect.
 uv pip install "vllm==0.19.0"
+
+echo "=== Step 1b: editable install of the compaction fork ==="
+# VLLM_USE_PRECOMPILED=1 downloads vllm's CI-built .so artifacts and
+# symlinks them into the source tree so we don't need a full source
+# rebuild of C++/CUDA extensions. The vllm_flash_attn symlink-mode
+# shim (committed on the compaction branch) registers a virtual
+# `flash_attn` package at import time, which the symlinked cute/
+# files expect.
+VLLM_USE_PRECOMPILED=1 uv pip install -e ./vllm --no-build-isolation
 
 echo "=== Step 2: transformers v5 from HF git ==="
 uv pip install "transformers @ git+https://github.com/huggingface/transformers.git@c1c3424"

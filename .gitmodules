@@ -1,6 +1,8 @@
 [submodule "vllm"]
 	path = vllm
-	url = https://github.com/vllm-project/vllm.git
+	url = https://github.com/HyperPotatoNeo/vllm.git
+	branch = compaction
 [submodule "prime-rl"]
 	path = prime-rl
-	url = https://github.com/PrimeIntellect-ai/prime-rl.git
+	url = https://github.com/HyperPotatoNeo/tba-prime.git
+	branch = kv-eviction
