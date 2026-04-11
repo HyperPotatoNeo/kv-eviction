@@ -1,11 +1,18 @@
 #!/bin/bash
-# Full setup script for kv-eviction — run INSIDE the container on a compute node.
-# Usage: srun ... podman-hpc run ... bash $SCRATCH/kv-eviction/setup.sh
+# Full setup script for kv-eviction. Run from the project root on a box
+# with CUDA 12.8 + A100/H100 GPUs and `uv` installed.
+#   bash setup.sh
 set -euo pipefail
 
-PROJECT=/pscratch/sd/s/siddart2/kv-eviction
-export UV_CACHE_DIR=/pscratch/sd/s/siddart2/uv-cache
+# Resolve the project root to the directory containing this script so
+# the setup works regardless of where kv-eviction was cloned.
+PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT"
+
+# Optional: pin the uv cache to a scratch path if you're on a shared
+# filesystem where $HOME is small (e.g. HPC clusters). Leave unset to
+# use uv's default cache under $HOME/.cache/uv.
+# export UV_CACHE_DIR=/path/to/fast/uv-cache
 
 echo "=== Creating venv ==="
 uv venv .venv --python python3.12 --clear

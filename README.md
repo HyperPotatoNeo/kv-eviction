@@ -11,44 +11,46 @@ The request becomes physically shorter -- attention is faster, no KV recompute.
 
 ### Prerequisites
 
-- NERSC Perlmutter (or any system with A100 GPUs + CUDA 12.8)
-- `podman-hpc` container: `docker.io/novaskyai/skyrl-train-ray-2.51.1-py3.12-cu12.8`
-- Python 3.12, `uv` package manager (both included in the container)
+- A CUDA 12.8 environment with A100 (or newer) GPUs
+- Python 3.12
+- [`uv`](https://docs.astral.sh/uv/) package manager
+- A container runtime is recommended but not required. A suitable base
+  image is `docker.io/novaskyai/skyrl-train-ray-2.51.1-py3.12-cu12.8`,
+  which bundles CUDA 12.8, Python 3.12, and `uv`.
 
-### 1. Get a compute node
+### 1. Clone the repo
 
 ```bash
-# Interactive (4h max)
-salloc -A m5017 -C "gpu&hbm80g" --qos=interactive --time 4:00:00 --gpus-per-node 4
-
-# Enter the container
-export HOME=$SCRATCH
-export PODMANHPC_PODMAN_BIN=/global/common/shared/das/podman-4.7.0/bin/podman
-podman-hpc run --rm -it \
-  --user "$(id -u):$(id -g)" --replace --name skyrl \
-  --group-add keep-groups --userns keep-id --gpu --nccl --shm-size=8g \
-  -e SCRATCH -e HOME \
-  -v "$SCRATCH":"$SCRATCH" -v "$HOME":"$HOME" \
-  -w "$SCRATCH/kv-eviction" \
-  docker.io/novaskyai/skyrl-train-ray-2.51.1-py3.12-cu12.8 /bin/bash
+git clone --recursive https://github.com/HyperPotatoNeo/kv-eviction.git
+cd kv-eviction
 ```
 
-### 2. Install (inside container)
+If you already cloned without `--recursive`:
 
 ```bash
-# Run the setup script (creates venv, installs vLLM + deps)
-bash setup.sh
+git submodule update --init --recursive
+```
 
-# Or manually:
-cd /pscratch/sd/s/siddart2/kv-eviction
+### 2. Install
+
+```bash
+# One-command install (creates venv, installs vLLM editable + all deps)
+bash setup.sh
+```
+
+Or manually, for development:
+
+```bash
 uv venv .venv --python python3.12 --clear
 source .venv/bin/activate
-export UV_CACHE_DIR=/pscratch/sd/s/siddart2/uv-cache
 
-# vLLM from our fork (editable, includes compaction)
-uv pip install -e ./vllm
+# Editable install of the compaction-enabled vLLM fork. VLLM_USE_PRECOMPILED=1
+# downloads vLLM's CI-built .so artifacts and symlinks them into the source
+# tree so Python edits under vllm/vllm/v1/core/compaction/ take effect
+# without a full C++/CUDA rebuild.
+VLLM_USE_PRECOMPILED=1 uv pip install -e ./vllm --no-build-isolation
 
-# kv-eviction package
+# kv-eviction integration layer
 uv pip install -e .
 ```
 
@@ -68,9 +70,9 @@ import vllm; print(f'vLLM {vllm.__version__}')
 ### Quick start -- vLLM server with compaction
 
 ```bash
-source /pscratch/sd/s/siddart2/kv-eviction/.venv/bin/activate
+source .venv/bin/activate
 
-# Launch vLLM with compaction enabled
+# Launch vLLM with compaction enabled.
 # window=4096: eviction triggers when KV exceeds 4096 tokens
 # stride=512:  evict 512 tokens (32 blocks) per compaction event
 # block_size defaults to 16, stride must be a multiple of it
@@ -219,7 +221,7 @@ kv-eviction/
   vllm/                  # Submodule: vLLM 0.19 fork (compaction branch)
     vllm/v1/core/compaction/
       manager.py         # CompactingKVCacheManager + CompactionEvent
-  prime-rl/              # Submodule: clean prime-rl (for Phase 3 training)
+  prime-rl/              # Submodule: prime-rl with segmented-forward training path
   src/kv_eviction/       # Integration layer (Phase 3: segmented forward)
   plans/                 # Detailed implementation specs
   setup.sh               # One-command install

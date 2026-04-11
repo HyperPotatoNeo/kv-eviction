@@ -25,3 +25,8 @@ experiments/*/rebuild_*.log
 
 # Ad-hoc diagnostic logs from the phase3_kl_test investigations
 experiments/phase3_kl_test/compare_modes_*.log
+
+# Local cluster-specific README (NERSC Perlmutter setup notes with
+# absolute paths, SLURM account codes, podman-hpc invocation, etc.).
+# The tracked README.md has cluster-agnostic instructions.
+README.cluster.md
