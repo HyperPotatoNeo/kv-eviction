@@ -1171,3 +1171,357 @@ tests" section above — requires a 2-node allocation, rg-mix-env
 installed into the kv-eviction venv, and a minimal compaction RL
 TOML config. With the trainer dispatch now landed, these should
 run cleanly end-to-end modulo integration surprises.
+
+## Pre-production session round 3: end-to-end plumbing and smoke #3/#4 (2026-04-10 → 2026-04-11)
+
+This session began as a routine run of smokes #3 (single-step E2E) and #4
+(5-step stability) and turned into a deep investigation after smoke #4's
+reported `Mismatch KL ≈ 0.04` looked ~50× larger than the offline kernel
+floor. The investigation uncovered and fixed a chain of latent bugs in
+the compaction events plumbing that had been silently breaking every
+prior smoke run — D2's partial success and smoke #3's clean exit were
+both misleading because the dispatch to `segmented_forward` **never
+actually fired**. The real scientific validation (trainer-inference
+logprob agreement at the kernel floor under active compaction) finally
+happened on step 0 of smoke #4 v5, reported below.
+
+### Initial observation: anomalous Mismatch KL in smoke #4
+
+Smoke #4 (compaction enabled, 5 steps, batch 64) reported the
+following trainer-side metrics across steps 0-4:
+
+| Step | Loss | Entropy | Mismatch KL | Grad Norm |
+|---:|---:|---:|---:|---:|
+| 0 | 0.0018 | 0.3005 | **0.0382** | 0.1727 |
+| 1 | 0.0049 | 0.2827 | **0.0390** | 0.2220 |
+| 2 | 0.0051 | 0.2527 | **0.0387** | 0.3689 |
+| 3 | 0.0031 | 0.2948 | **0.0466** | 0.2369 |
+| 4 | 0.0035 | 0.2873 | **0.0351** | 0.1694 |
+
+Smoke #4b (same config, compaction **disabled** via absent
+`[trainer.compaction]`, running vLLM without compaction args) was run
+as a control and reported Mismatch KL = **0.0007** dead-flat across all
+5 steps — pure bf16 roundoff noise. The **55× gap** between compaction
+and no-compaction was the triggering anomaly.
+
+### Investigation steps (all independent, all useful as negative results)
+
+1. **Three parallel RSA agents** audited design, numerics, and data
+   pipeline. Agent A (design) correctly identified the boundary re-feed
+   + `trim = 1` as a candidate mechanism but couldn't prove it
+   dominated. Agent B misread `mkv-rl` instead of `kv-eviction/prime-rl`
+   and reached a false "temperature-order" conclusion that was easily
+   disproven at `train.py:790-791` where scaling happens before
+   `selective_log_softmax`. Agent C's "shift_tensor_right mismatch"
+   claim was disproven by reading `batch.py:37` directly — both paths
+   are target-position indexed and consistent.
+
+2. **Historical comparison.** `phase3_kl_test` (Apr 10 14:13) had
+   reported compaction/baseline = 1.23× for `mean_abs_log_ratio`. The
+   file mtime of `segmented_forward.py` (Apr 10 16:37) was AFTER the
+   test, confirming that phase3_kl_test validated the PRE-per-segment-
+   backward version. But more importantly, phase3_kl_test's trainer
+   used `model.eval() + torch.no_grad()` on a bare HF full replica,
+   not FSDP2 + training mode + AC — completely different runtime.
+
+3. **Offline reproduction of segmented_forward both modes.** Wrote
+   `experiments/phase3_kl_test/compare_segforward_modes.py` that runs
+   `segmented_forward` in both legacy (`loss_fn=None`) and per-segment
+   backward modes on the same rollout data and compares per-position
+   owned logits. Result:
+
+   ```
+   raw_logit_diff:              mean=0.000000  max=0.000000
+   logsoftmax_diff_max_vocab:   mean=0.000000  max=0.000000
+   sampled_token_logprob_diff:  mean=0.000000  max=0.000000
+   legacy vs inference:         mean=0.009329  max=0.558362
+   psb    vs inference:         mean=0.009329  max=0.558362
+   psb/legacy ratio: 1.00x
+
+   mismatch_kl mean (token-weighted, 10 samples, full 24 events each):
+     aggregate = 0.000691
+   ```
+
+   Legacy and per-segment-backward modes produce **bit-identical**
+   logits on the full 16k-token sample. The offline kernel floor for
+   the complete 10-sample compaction dataset is **mismatch_kl = 0.0007**,
+   72× smaller than smoke #4's reported 0.0395.
+
+   **Conclusion:** neither the boundary re-feed nor the per-segment
+   backward mode is responsible for the gap. The gap comes from
+   somewhere between the trainer's offline reproduction (which uses
+   segmented_forward) and smoke #4's live trainer (which uses something
+   else).
+
+4. **Direct inspection of smoke #4 rollouts.bin**, loaded from
+   `outputs/smoke4_rl_stability_run/run_default/rollouts/step_*/rollouts.bin`
+   via `msgspec.msgpack.Decoder(TrainingBatch)`:
+
+   ```
+   step 0: 64 examples, 0 w/ compaction_events, 64 rollouts > 4096
+   step 1: 64 examples, 0 w/ compaction_events, 48 rollouts > 4096
+   step 2: 64 examples, 0 w/ compaction_events, 54 rollouts > 4096
+   step 3: 64 examples, 0 w/ compaction_events, 54 rollouts > 4096
+   step 4: 64 examples, 0 w/ compaction_events, 63 rollouts > 4096
+   ```
+
+   **ZERO samples had `compaction_events` populated**, despite
+   inference mean completion length 5000-7500 tokens and vLLM logs
+   showing `[COMPACT] enabled window=4096 stride=512` on all 4 DP
+   ranks. vLLM was evicting KV during generation, but the events
+   never reached the trainer.
+
+   The trainer then took the **standard full-context forward path**
+   for every sample, reforwarding against inference logprobs that
+   were produced under post-eviction attention. That full-vs-evicted
+   mismatch is exactly what the reported 0.04 Mismatch KL measures —
+   **not a bug in segmented_forward; segmented_forward was never called**.
+
+### Root cause chain: the compaction events plumbing was silently broken
+
+Tracing the path vLLM → trainer revealed FIVE consecutive latent bugs,
+any one of which was sufficient to drop every event:
+
+**Bug 1 — verifiers client adapter drops the field.**
+`verifiers/clients/openai_chat_completions_client.py:from_native_response`
+constructs a new `verifiers.types.Response(id, created, model, usage,
+message)` from a hardcoded 5-field list. The openai-python SDK's
+`ChatCompletion` model has `extra='allow'` and does preserve vLLM's
+`compaction_events` field in its `model_extra` dict, but verifiers
+never reads it and never forwards it into its own Response.
+
+**Bug 2 — verifiers base env initializes extras empty.**
+`verifiers/envs/multiturn_env.py:141` creates each `TrajectoryStep`
+with `extras={}` and never populates it from the response. Prime-rl's
+`orchestrator/trajectories.py:297 _compaction_events_from_step(step)`
+reads `step.get("extras").get("compaction_events")` expecting
+something, finds an empty dict, returns None. Every downstream
+`TrainingSample.compaction_events` ends up as None.
+
+**Bug 3 — the existing `CompactionEnvMixin` is dead code.**
+`kv_eviction/env.py` shipped a `CompactionEnvMixin` intended to be
+subclassed by env authors (e.g., `class RGMixEnv(CompactionEnvMixin,
+SingleTurnEnv)`). But `RGMixEnv` doesn't subclass it, and the mixin
+itself was un-importable because it did `from verifiers.types import
+ModelResponse` for a type that had been renamed to `Response` — the
+first instantiation would `ImportError`. Nobody had ever exercised
+this code path in a real run.
+
+**Bug 4 — env server runs in a spawn subprocess.**
+Even after writing module-level monkey-patches in `kv_eviction/env.py`
+and triggering them via `kv_eviction/__init__.py: from . import env`,
+the patches didn't apply in the process where rollouts actually run.
+The env server is spawned via
+`mp.get_context("spawn").Process(target=ZMQEnvServer.run_server)`.
+Spawn starts a fresh Python interpreter; the subprocess does not
+inherit any pre-imported modules from the parent. The subprocess
+imports `verifiers.serve.ZMQEnvServer` directly — it never imports
+`kv_eviction`.
+
+**Bug 5 — compaction_events as msgspec structs fail verifiers'
+state_columns JSON-serializability check.** First attempt at the fix
+stored `list[CompactionEventWire]` in `step.extras["compaction_events"]`
+and every rollout failed with:
+
+```
+ValueError("state_columns value for 'trajectory' is not JSON-serializable:
+  list. Only JSON-serializable types are allowed.")
+```
+
+verifiers routes trajectory step extras through a JSON-serializability
+check that rejects msgspec structs as-is. The fix must store plain
+dicts.
+
+### Fixes applied
+
+All of the following are now committed. Each was separately tested
+either locally (unit-level) or via a smoke re-run.
+
+| Commit | Repo | Purpose |
+|---|---|---|
+| `e216849` | kv-eviction | `env.py` module-level monkey-patches on `OpenAIChatCompletionsClient.from_native_response` and `MultiTurnEnv.add_model_response`. Both are idempotent (sentinel attr `__kv_eviction_patched__`). The `from_native_response` patch uses setattr on the verifiers Response (possible because `CustomBaseModel` has `extra="allow"`) after reading the raw events from the openai SDK's `model_extra`. The `add_model_response` patch calls `attach_compaction_events_from_response` on the trajectory step the base class just appended. Fixes Bugs 1, 2, 3. |
+| `c7c8563b1` | prime-rl | `orchestrator/envs.py`: adds `import kv_eviction` at the top of the module AND adds `_env_server_subprocess_entrypoint(...)` that imports `kv_eviction` before calling `ZMQEnvServer.run_server`. Swaps `mp.Process(target=...)` to the wrapper. The spawn subprocess now applies the patches in both places: at unpickle time (resolving the target function imports `prime_rl.orchestrator.envs` which imports kv_eviction) and as belt-and-suspenders in the wrapper body. Fixes Bug 4. |
+| `f230a58` | kv-eviction | `env.py`: `_extract_compaction_event_dicts` now returns `list[dict]` with the three int fields, and `attach_compaction_events_from_response` stores those dicts directly. Downstream `orchestrator/trajectories.py:_compaction_events_from_step` already had a branch that reconstructs `CompactionEventWire` from dict form, so no reader changes were needed. Fixes Bug 5. |
+| `4005a7d14` | prime-rl | `train.py`: inlined the per-segment entropy math in `_segment_loss_fn` instead of calling `compute_entropy` (which has `@torch.compile(dynamic=True)`). Dynamic-shape handling did not generalize across the sizes segmented_forward produces (300-1000 token segments per sample × 24 segments) and triggered a silent Inductor recompile stall that hung all 4 DP ranks for 25+ minutes at step 0. The inlined `logsumexp - sum(softmax * logits)` under `torch.no_grad` runs in eager mode without touching Inductor. Same arithmetic, no compile dependency. |
+| `4c851fc92` | prime-rl | `configs/trainer.py`: added a config-level validator that rejects `(trainer.compaction.window_size > 0) AND (trainer.model.ac != None)` at load time with a multi-paragraph explanation of the DynamicCache double-update mechanism. Fixes the "AC + compaction crashes on first compaction sample" footgun permanently. |
+| `7b99cfc` | kv-eviction | Bumps prime-rl + updates `experiments/smoke4_rl_stability_run/rl_smoke4.toml` to remove the `[trainer.model.ac]` section (now required by the validator above). |
+
+### Verification: smoke #4 v5 Step 0
+
+With all fixes in place, smoke #4 ran end-to-end through step 0 and
+reported:
+
+| Metric | v1 (pre-fix) | v5 (post-fix) | Offline floor |
+|---|---:|---:|---:|
+| **Mismatch KL** | 0.0382 | **0.0009** | 0.0007 |
+| Loss | 0.0018 | 0.0009 | — |
+| Entropy | 0.3005 | 0.3083 | — |
+| Grad Norm | 0.1727 | 0.1013 | — |
+| Peak mem | 59.2 GiB | **43.7 GiB** | — |
+| Time | 207s | 216s | — |
+
+**Mismatch KL dropped from 0.0382 to 0.0009** — right at the offline
+kernel floor (0.0007–0.0009) measured earlier via
+`compare_segforward_modes.py`. Direct inspection of the post-fix
+step 0 rollouts.bin confirms `58/64 samples have compaction_events
+populated, 467 events total`, matching 1:1 the 58 rollouts that
+exceeded the 4096 window. The `use_segmented` dispatch is firing for
+the first time in this codebase's history. The trainer's per-segment
+logprob reconstruction matches the inference engine's on-the-fly
+PagedAttention eviction to bf16 noise. Peak memory is **lower** than
+the AC-enabled baseline because segmented_forward's per-segment
+backward bounds activation memory to O(1 segment).
+
+**The original scientific question is answered.** Compaction training
+produces trainer-inference logprob agreement at the kernel floor.
+`segmented_forward` is numerically correct. The legacy and
+per-segment-backward modes are bit-identical. The boundary re-feed
+is not the bug (neither mode has a real problem with it; both agree
+with phase3_kl_test's measurements). The inflated Mismatch KL that
+started this investigation was entirely a data-plumbing artifact.
+
+### Still open: D5 — rank-level FSDP collective divergence in mixed batches
+
+**Smoke #4 v5 step 0 succeeded. Step 1 crashed with an NCCL
+watchdog timeout on `_ALLGATHER_BASE` at seq 27,393** (default 600s
+timeout). Last-enqueued vs last-completed work diverged by 1, meaning
+one rank enqueued the 27,393rd all-gather but at least one other rank
+never reached it. Classic rank-level divergence where different DP
+ranks issue different numbers of FSDP collectives per step.
+
+**Mechanism.** A step's rollouts are partitioned by
+`trainer/batch.py:prepare_batch` into compaction micro-batches
+(single-sample, not bin-packed) and non-compaction micro-batches
+(packed). Each compaction sample triggers ~20+ forward passes in
+`segmented_forward` (one per segment) plus its own reduce-scatter /
+all-gather chain; each non-compaction sample triggers one forward.
+So a compaction sample has many more FSDP collectives than a
+non-compaction sample.
+
+When a step's rollouts have uneven (compaction : non-compaction)
+distribution across DP ranks — for example, rank 0 gets 14 compaction
++ 1 non-compaction, rank 1 gets 13 + 2 — the total FSDP collective
+count per rank DIFFERS even if `pad_micro_batch` equalizes the number
+of micro-batches. `pad_micro_batch` pads to the max count across
+ranks with empty/dummy micro-batches, but a dummy non-compaction
+micro-batch costs 1 collective while a dummy compaction micro-batch
+would cost ~20+ collectives, and there's no bookkeeping to reconcile
+the two.
+
+Step 0 of v5 worked because all 4 ranks happened to have similar
+compaction ratios (64/64 samples exceeded the window in step 0's
+particular draw). Step 1 had a different draw, one rank had a
+skewed ratio, FSDP collective counts diverged, NCCL timed out.
+
+**This is a separate latent bug from everything else debugged in
+this session.** It was undetectable before the events-plumbing fix
+because the dispatch never took the compaction path — every sample
+went through the standard forward, all ranks had symmetric collective
+counts, no divergence. v5 is the first run in which the dispatch
+actually fires, so this is the first run to exercise the mixed-batch
+path.
+
+### D5 detailed problem description (for the next session)
+
+**Observed failure mode.** With smoke #4 v5 config (4096 window,
+512 stride, batch_size=64, rollouts_per_example=8, DP=4, rg-mix-env
+with natural eos), step 0 completes cleanly but step 1 hangs on
+`WorkNCCL(SeqNum=27393, OpType=_ALLGATHER_BASE, NumelIn=25232704,
+NumelOut=100930816)` for 600 seconds before the NCCL watchdog aborts
+the process. The log line:
+
+```
+[Rank 0] First PG on this rank to signal dumping.
+last enqueued work: 27393, last completed work: 27392.
+This is most likely caused by incorrect usages of collectives, e.g.,
+wrong sizes used across ranks, the order of collectives is not same
+for all ranks or the scheduled collective, for some reason, didn't
+run.
+```
+
+confirms the divergence: rank 0 enqueued the 27,393rd collective
+but at least one other rank never issued its matching call.
+
+**Required fix — sketch.** `prepare_batch` in `trainer/batch.py`
+already partitions compaction samples (kept single) from
+non-compaction samples (packed). The missing piece is
+**FSDP-collective-count equalization** across DP ranks when the
+compaction:non-compaction ratio differs. Two candidate approaches:
+
+1. **Per-rank collective-aware padding.** Count the expected number
+   of FSDP forward-pass collectives per rank under the current batch
+   partition (for each compaction micro-batch, this is the max over
+   ranks of `compute_num_segments(...)` which is already all-reduce-
+   synced inside `segmented_forward`; for each non-compaction
+   micro-batch, it's 1). Take the max across ranks. Pad lower ranks
+   with dummy compaction OR non-compaction micro-batches until their
+   collective count matches. Need to also match the BACKWARD count
+   (per-segment backward runs one backward per segment, so both
+   forward and backward counts must be padded consistently).
+
+2. **Uniform sample partitioning.** Enforce at the trainer batch-
+   build step that every DP rank gets the SAME number of compaction
+   samples and the SAME number of non-compaction samples. Requires
+   modifying the orchestrator→trainer send path to group samples by
+   modality before per-rank distribution. More invasive but avoids
+   dummy passes entirely.
+
+Option 1 is closer to the existing `pad_micro_batch` mechanism and
+leverages the already-working per-micro-batch segment-count sync.
+Option 2 is cleaner architecturally but touches more code.
+
+**Verification for the fix.** Re-run smoke #4 v5 (same TOML) with
+the fix applied. Expected: all 5 steps complete with Mismatch KL
+staying in the 0.001 range (kernel floor), no NCCL timeouts, reward
+trajectory similar to the 4b baseline modulo noise.
+
+**Safety net.** A config-level sanity check in `TrainerConfig`
+could also warn if `use_token_client=True` with compaction and
+`rollouts_per_example * batch_size > dp_size` — any config where
+ranks are likely to see uneven compaction ratios. Weaker than the
+real fix, but a decent smoke gate.
+
+### Smoke status
+
+- Smoke #1 (single-GPU backward): **PASS** (2026-04-10)
+- Smoke #1b (per-segment backward probe): **PASS** (2026-04-10)
+- Smoke #2 (FSDP2 segmented forward): **PASS** (2026-04-10)
+- Smoke #3 (single end-to-end RL step): **PASS** cosmetically
+  (2026-04-10), but the compaction dispatch never fired because
+  of the events-plumbing bugs. Real validation came from
+  smoke #4 v5 step 0.
+- Smoke #4 (5-step stability): **STEP 0 PASS**, steps 1-4 blocked
+  on D5. Partial pass. (2026-04-11)
+- Smoke #4b (5-step full-context baseline): **PASS** (2026-04-11)
+- Smoke #5 (production-config smoke): **BLOCKED** on D5.
+
+### Updated deferred items summary
+
+| ID | Title | Status |
+|---|---|---|
+| D1 | Multi-rank `bptt_segments != 1` under FSDP2 | Blocked via runtime ValueError at training init. Recompute max_backwards via all_reduce MAX + mixed-dummy pad. |
+| D2 | Entropy for compaction samples | **RESOLVED** this session via inlined per-segment entropy math in `_segment_loss_fn` (commit `4005a7d14`). |
+| D3 | Token-weighted metric aggregation | Still open. Empirically confirmed the aggregation artifact is small (offline token-weighted vs per-segment-unweighted differ by < 10% on 10-sample test). Low priority until metrics drive decisions. |
+| D4 | Smokes #3-5 | **PARTIALLY DONE**: #3 passes, #4 step 0 passes, #4 steps 1-4 blocked on D5, #5 blocked on D5. |
+| **D5** | **Rank-level FSDP collective divergence in mixed compaction batches** | **NEW — blocking prod**. Detailed above. This is the next work item. |
+
+### Useful artifacts from this session
+
+- `experiments/phase3_kl_test/compare_segforward_modes.py` — offline
+  tool that runs segmented_forward in both legacy and per-segment
+  backward modes on saved rollouts and reports both token-weighted
+  and per-segment-unweighted mismatch_kl. Useful for future kernel-
+  floor measurements and regression testing. See
+  `run_compare_modes.sh` + `_compare_modes_inner.sh` for the srun
+  wrapper that puts execution on a real 80GB compute node (a bare
+  `salloc ... bash script.sh` runs on the login node's 40GB GPU,
+  which surfaced as an initial OOM).
+
+- Saved rollouts.bin from v1 and v3 in
+  `outputs/smoke4_rl_stability_run.*` directories can be used to
+  empirically measure (compaction_events count, distribution across
+  ranks, segment count variance) if needed for D5 triage.
+
+- `probe_ac_cache_mutation.py` (pre-existing) — minimal repro of the
+  `torch.utils.checkpoint` + `DynamicCache.update()` double-append
+  bug that forced the AC config validator.
