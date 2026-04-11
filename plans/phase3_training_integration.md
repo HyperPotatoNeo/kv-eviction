@@ -1047,3 +1047,127 @@ production-config smoke) still pending. These require:
   config validator).
 
 Best tackled in a fresh session with full context runway.
+
+## Pre-production session round 2: per-segment backward + trainer dispatch
+
+Second pre-prod session (same date) pivoted from M4 BPTT attempt to
+M3 per-segment backward after finding that M4 interacts fatally with
+prime-rl's per-block checkpoint_wrapper under `use_cache=True`. See
+`experiments/phase3_preprod/probe_ac_cache_mutation.py` for the
+minimal crash reproduction: `torch.utils.checkpoint` (non-reentrant)
+re-runs each block's forward during backward, and HF's
+`DynamicCache.update()` takes the "concatenate existing slot" branch
+instead of "append new slot", producing 2x-length K/V tensors. Torch
+catches this loudly via `CheckpointError: Recomputed values have
+different metadata than during the forward pass`
+(`[1, 1024, 8, 128]` → `[1, 2048, 8, 128]`).
+
+Design pivot: per-segment forward + backward + detach, with an
+optional `bptt_segments` knob for truncated BPTT windows:
+  - `bptt_segments=1` (default, M3 semantics): detach between every
+    segment, one backward per segment, O(1 segment) memory
+  - `bptt_segments=K > 1`: gradients flow through retained KV
+    within K consecutive segments before detach, O(K) memory
+  - `bptt_segments=None`: full trajectory in one BPTT window,
+    M4-equivalent semantics, O(all segments) memory
+
+Validation (smoke #1b, single A100 80GB, full 16k / 24-event sample):
+  - k=1:  40.9 GB, 5.5s, grad norm 1.22, PASS
+  - k=4:  55.4 GB, 5.2s, grad norm 1.30, PASS
+  - k=12: OOM at torch.cat in eviction (expected)
+  - Loss identical across k (deterministic forward)
+  - k=4 grad norm 6% higher than k=1, confirming intra-window
+    BPTT actually flows gradients through retained KV
+
+Trainer dispatch wired in `prime-rl/src/prime_rl/trainer/rl/train.py`:
+the `use_segmented` branch now builds a `_segment_loss_fn` closure
+that slices `labels`, `advantages`, `loss_mask`,
+`inference_logprobs`, `teacher_logprobs` to match each segment's
+owned logit range and delegates to prime-rl's existing
+`compute_loss` (no duplication of the loss formula, just range
+bookkeeping). Alignment detail: the last segment's final logit
+predicts a nonexistent token at position `seq_len` and must be
+dropped explicitly (matching what `shift_tensor_right` does in the
+standard path). Three adversarial review rounds caught and fixed
+several bugs before landing; see commit messages for details.
+
+### Deferred items (recorded here so future instances can find them)
+
+**D1. Multi-rank `bptt_segments != 1` under FSDP2.** The dummy-pass
+padding inside `segmented_forward` pads forwards with paired
+(forward + backward) dummies, which only keeps total backward
+counts matched across ranks when every real segment also has
+exactly one backward — i.e., `bptt_segments == 1`. With
+`bptt_segments > 1` or `None`, the number of real backwards per
+rank is `ceil(per_rank_segments / K)`, which varies across ranks
+when per-rank segment counts differ. Reduce-scatter counts then
+diverge and FSDP2 deadlocks.
+
+Proper fix: compute `max_backwards` via `all_reduce(ReduceOp.MAX)`
+across ranks (where `max_backwards = max(ceil(actual_i / K))`),
+pass it to `segmented_forward` alongside `max_forwards`, and have
+the dummy-pass logic issue a mix of:
+  - `Y_local = max_backwards - real_bw_count` dummy (forward+backward)
+    pairs
+  - `X_local - Y_local` forward-only dummies (where
+    `X_local = max_forwards - actual`)
+
+The condition `X_local >= Y_local` is provably satisfied because
+`f(x) = x - ceil(x/K)` is non-decreasing in x, so
+`max_forwards - max_backwards >= actual - ceil(actual/K)` for every
+rank. See the third adversarial review agent's analysis in
+`.claude/projects/-pscratch-sd-s-siddart2-mkv-rl/` session
+transcript (2026-04-10) for the full derivation.
+
+Current state: blocked at training init via a runtime check in
+`train.py` right after `parallel_dims = get_parallel_dims(...)`
+that raises `ValueError` if `world_size > 1 and bptt_segments != 1`.
+Single-GPU runs can freely set any `bptt_segments` value.
+
+**D2. Entropy for compaction samples.** `segmented_forward` returns
+a scalar loss, not per-token logits, so `out["entropy"]` is not
+populated for segmented micro-batches. The debug-log f-string at
+`train.py` is guarded on `not use_segmented and
+len(tensors['entropy']) > 0` and simply omits the entropy field
+for compaction samples. `compute_stats` downstream handles
+missing per-micro-step entries by emitting NaN, so step-level
+entropy averages for compaction-heavy steps will come out as NaN.
+
+To fix: extend the `_segment_loss_fn` closure (or a parallel
+callback) to compute `compute_entropy(seg_logits_effective)`,
+apply `seg_loss_mask`, and accumulate into a per-micro-batch list.
+After `segmented_forward` returns, `torch.cat` the accumulated
+entropy values and append to `tensors['entropy']` just like the
+standard path does at line 673.
+
+**D3. Token-weighted metric aggregation for compaction.** The
+per-segment `compute_loss` call wraps each `_safe_mean`-style
+metric in `torch.stack([scalar_0d]) → shape [1]`; the closure
+appends these to an `accumulated_loss_tensors` dict and the
+post-loop `torch.cat(v)` gives a shape `[n_segments]` 1-D tensor
+that's appended to `tensors[metric_name]`. Downstream
+`compute_stats` averages these unweighted across segments, which
+gives a mean-of-means rather than a token-weighted mean. For a
+sample whose segments are token-count-skewed (e.g. 4000/4000/1000
+trainable tokens per segment) the logged metric value drifts
+from what the standard path would report.
+
+The LOGGED LOSS is still correct because the loss decomposition is
+exact: `sum_over_segments(compute_loss(seg).loss) ==
+compute_loss(full_seq).loss` when every call uses the same global
+`loss_scale`. Only the derived metrics (`mismatch_kl`, `is_masked`,
+etc.) drift.
+
+To fix: have the closure collect raw per-token `(values, mask)`
+pairs per metric instead of per-segment `_safe_mean` outputs,
+concatenate across segments, and recompute `_safe_mean` once at
+the end before appending to `tensors`. Or: change
+`compute_loss`'s per-sequence metrics contract to expose
+`(numerator_sum, denominator_count)` so the closure can
+accumulate weighted.
+
+**D4. Smokes #3-5 still pending.** As noted in the "Remaining smoke
+tests" section above — requires a 2-node allocation, rg-mix-env
+installed into the kv-eviction venv, and a minimal compaction RL
+TOML config. With the trainer dispatch now landed, these should
+run cleanly end-to-end modulo integration surprises.
