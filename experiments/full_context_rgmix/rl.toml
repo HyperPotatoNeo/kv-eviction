@@ -52,6 +52,16 @@ attn = "flash_attention_2"
 [trainer.model.ac]
 freq = 1
 
+# Activation offloading to CPU. Smoke4b at seq_len=16384 + AC freq=1
+# peaked at 74.9 GiB per rank — only ~5 GiB of headroom over 80 GB.
+# With max_completion_tokens also at 15000, the per-microbatch
+# activation footprint is similar, so offloading adds a safety margin
+# at the cost of some throughput (activations stream to pinned host
+# memory and back during backward).
+[trainer.model.ac_offloading]
+pin_memory = true
+max_inflight_activations = 5
+
 # NO [trainer.compaction] section -> window_size defaults to 0, the
 # segmented_forward dispatch is disabled, training uses the standard
 # packed forward path.
@@ -78,7 +88,7 @@ base_url = [
 ]
 
 [orchestrator.train.sampling]
-max_completion_tokens = 16384
+max_completion_tokens = 15000
 temperature = 1.0
 
 [[orchestrator.train.env]]

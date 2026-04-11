@@ -81,7 +81,7 @@ base_url = [
 ]
 
 [orchestrator.train.sampling]
-max_completion_tokens = 16384
+max_completion_tokens = 15000
 temperature = 1.0
 
 [[orchestrator.train.env]]

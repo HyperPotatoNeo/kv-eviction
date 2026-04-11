@@ -16,6 +16,8 @@
 #          --gpus-per-node 4 -N 3
 #   bash experiments/compaction_rgmix/launch.sh
 set -e
+set -o pipefail  # so `ssh ... | tee` propagates the ssh/trainer exit
+                 # status into $PIPESTATUS[0] below, not tee's always-0.
 
 #SBATCH --job-name=compaction_rgmix
 #SBATCH --output=/pscratch/sd/s/siddart2/kv-eviction/experiments/compaction_rgmix/slurm_%j.out
@@ -148,10 +150,20 @@ fi
 echo "Both inference servers ready."
 
 # ─── Step 6: Launch trainer on Node 2 ───
+#
+# IMPORTANT: we redirect trainer output straight to file (not through
+# `tee`) so $! and `wait $PID` cleanly reflect the trainer's exit code.
+# A prior version used `ssh ... | tee LOG &` which made $! the tee PID —
+# so a crashed trainer looked like a successful run to SLURM.
 TRAIN_LOG="$EXP_DIR/trainer_${SLURM_JOB_ID:-local}.log"
 echo "=== Launching trainer on $NODE_TRAIN ==="
-ssh "$NODE_TRAIN" "export HOME=$SCRATCH && export PODMANHPC_PODMAN_BIN=/global/common/shared/das/podman-4.7.0/bin/podman && podman-hpc exec $CONTAINER_TRAIN bash $EXP_DIR/node2_trainer.sh $TOML_RESOLVED" 2>&1 | tee "$TRAIN_LOG" &
+ssh "$NODE_TRAIN" "export HOME=$SCRATCH && export PODMANHPC_PODMAN_BIN=/global/common/shared/das/podman-4.7.0/bin/podman && podman-hpc exec $CONTAINER_TRAIN bash $EXP_DIR/node2_trainer.sh $TOML_RESOLVED" > "$TRAIN_LOG" 2>&1 &
 PID_TRAIN=$!
+
+# Live-tail the trainer log to the launch.sh stdout so SLURM %j.out
+# shows training progress alongside the inference spinup summary.
+tail -f "$TRAIN_LOG" &
+PID_TAIL=$!
 
 echo "==========================================="
 echo "compaction_rgmix launched!"
@@ -160,9 +172,13 @@ echo "  Inf1:    $NODE_INF1 (PID $PID_INF1, log: $(basename $INF1_LOG))"
 echo "  Trainer: $NODE_TRAIN (PID $PID_TRAIN, log: $(basename $TRAIN_LOG))"
 echo "==========================================="
 
+set +e  # don't let wait's non-zero kill us before cleanup runs
 wait $PID_TRAIN
 TRAIN_EXIT=$?
+set -e
+kill $PID_TAIL 2>/dev/null || true
 
+echo "Trainer exited with status $TRAIN_EXIT"
 echo "Stopping inference servers..."
 kill $PID_INF0 $PID_INF1 2>/dev/null || true
 wait $PID_INF0 $PID_INF1 2>/dev/null || true
