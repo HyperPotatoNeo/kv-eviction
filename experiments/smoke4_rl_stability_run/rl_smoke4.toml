@@ -49,8 +49,25 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 impl = "hf"
 attn = "flash_attention_2"
 
-[trainer.model.ac]
-freq = 1
+# NOTE: per-block activation checkpointing (`[trainer.model.ac]`) is
+# DISABLED for compaction training. Prime-rl's per-block
+# `checkpoint_wrapper` re-runs each decoder layer's forward during
+# backward under non-reentrant checkpoint mode. When the forward has
+# `use_cache=True` with a DynamicCache (which segmented_forward
+# requires for past_key_values to flow between segments), each layer's
+# re-run appends K/V to the SAME cache object AGAIN, doubling the
+# cache length and producing a CheckpointError: "Recomputed values
+# have different metadata than during the forward pass: saved
+# [1, N, ...] vs recomputed [1, 2N, ...]". The per-segment backward
+# mode alone doesn't sidestep this because the double-update happens
+# inside window_loss.backward() within a single segment before any
+# subsequent segment starts. probe_ac_cache_mutation.py reproduces
+# the exact issue on a minimal 1024-token single-segment case.
+#
+# Without AC, peak memory on 4 x A100-80GB for this config is within
+# budget (~70 GiB for the no-compaction baseline smoke #4b, possibly
+# a few GiB higher without AC). If OOM hits, switch to
+# trainer.model.ac.mode = "selective" with narrow targets.
 
 [trainer.compaction]
 window_size = 4096
