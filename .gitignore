@@ -18,10 +18,12 @@ uv.lock
 # ignore everything produced at runtime.
 experiments/*/resolved_*.toml
 experiments/*/trainer_*.log
-experiments/*/inference_*.log
+experiments/*/inference*.log
 experiments/*/launch_*.log
 experiments/*/setup_*.log
 experiments/*/rebuild_*.log
+experiments/*/slurm_*.out
+experiments/*/slurm_*.err
 
 # Ad-hoc diagnostic logs from the phase3_kl_test investigations
 experiments/phase3_kl_test/compare_modes_*.log

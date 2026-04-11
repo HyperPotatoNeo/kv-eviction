@@ -1,0 +1,27 @@
+# full_context_rgmix: inference-side vLLM config (each inference node, DP=4).
+#
+# Mirrors compaction_rgmix/inference.toml with compaction_* stripped.
+# prefix_caching and async_scheduling are left off to match compaction_rgmix
+# exactly — flipping them would add a second confounding variable to the
+# baseline comparison.
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false

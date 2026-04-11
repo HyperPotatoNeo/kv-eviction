@@ -1,0 +1,89 @@
+# full_context_rgmix: full-context baseline matching compaction_rgmix.
+#
+# Same config as compaction_rgmix/rl.toml, with [trainer.compaction]
+# removed and compaction-specific flags stripped from inference. This
+# pair is the apples-to-apples comparison: identical optimizer, loss,
+# data, seed, batch size, rollouts — only difference is whether KV
+# eviction is active. Reward / mismatch KL / entropy / seq_len
+# trajectories on the two runs are the core baseline plot.
+#
+# 3-node 2-1 split (see experiments/full_context_rgmix/launch.sh):
+#   Node 0: vLLM inference server DP=4 (NO compaction)
+#   Node 1: vLLM inference server DP=4 (NO compaction)
+#   Node 2: FSDP2 trainer DP=4
+
+max_steps = 500
+seq_len = 16384
+output_dir = "outputs/full_context_rgmix"
+clean_output_dir = true
+
+[ckpt]
+interval = 50
+
+[deployment]
+type = "single_node"
+gpus_per_node = 4
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "full-context-rgmix"
+
+# Matching compaction_rgmix: same impl and attn so the only trainer
+# difference between the two runs is the compaction section + AC (which
+# compaction_rgmix cannot use — see note below). Without AC, full-context
+# at seq_len=16384 and bs=128 may OOM; AC is a pragmatic memory
+# accommodation, not a research variable.
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+# Per-block activation checkpointing: required for full-context at
+# 16k without OOM. Compaction cannot enable this because prime-rl's
+# non-reentrant checkpoint_wrapper re-runs each decoder layer's forward
+# during backward, and DynamicCache with use_cache=True double-appends
+# K/V on that re-run. Standard forward (this run) has no DynamicCache,
+# so AC is safe.
+[trainer.model.ac]
+freq = 1
+
+# NO [trainer.compaction] section -> window_size defaults to 0, the
+# segmented_forward dispatch is disabled, training uses the standard
+# packed forward path.
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+
+[orchestrator.client]
+base_url = [
+  "http://__INFERENCE_NODE_0__:8000/v1",
+  "http://__INFERENCE_NODE_1__:8000/v1",
+]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 8192
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "rg-mix-env"
+args = { num_train_examples = 7500, num_eval_examples = 100, seed = 42, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500" }
+
+# NO [orchestrator.eval] section — no eval before train, no eval between
+# training steps. Same as compaction_rgmix.

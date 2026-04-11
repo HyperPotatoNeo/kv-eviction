@@ -1,0 +1,35 @@
+# compaction_rgmix: inference-side vLLM config (each inference node, DP=4).
+#
+# MUST mirror rl.toml's [trainer.compaction] exactly:
+#   window_size -> vllm_extra.compaction_window_size
+#   stride      -> vllm_extra.compaction_stride
+#   block_size  -> vllm_extra.block_size
+#
+# Mismatch between these and the trainer side silently corrupts the
+# policy gradient. See the RLConfig validator in prime-rl/configs/rl.py.
+
+seed = 0
+
+# vLLM's V1 prefix caching is incompatible with KV cache compaction
+# (the compaction path asserts this in arg_utils.py). Must disable.
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+# Compaction requires synchronous scheduling (see scheduler.py assert).
+async_scheduling = false

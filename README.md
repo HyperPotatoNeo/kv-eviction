@@ -214,6 +214,128 @@ The quality cost is concentrated on tasks that require long-range reasoning
 across the whole generation (zebra puzzles -0.28, sokoban -0.05, cryptarithm
 -0.11). Local tasks (countdown, arc_1d) are neutral or slightly better.
 
+## RL training
+
+Two matched end-to-end RL configs live in `experiments/`. Both train
+Qwen3-4B-Instruct-2507 on the `rg-mix-env` reasoning task with GRPO
+through prime-rl's FSDP2 trainer and a separately-launched vLLM
+inference pool. They differ only in whether KV compaction is active —
+everything else (optimizer, loss, dataset, seed, batch size, rollouts,
+sequence length, checkpointing) is identical, so the pair is an
+apples-to-apples comparison.
+
+| Experiment | Inference | Trainer forward |
+|---|---|---|
+| `experiments/compaction_rgmix/` | vLLM with `compaction_window_size=4096`, `compaction_stride=512` | `segmented_forward` (no detach), per-segment backward (`bptt_segments=1`) |
+| `experiments/full_context_rgmix/` | vLLM with compaction disabled | standard packed forward with per-block activation checkpointing |
+
+### Shared configuration
+
+| | |
+|---|---|
+| Model | `Qwen/Qwen3-4B-Instruct-2507` |
+| `seq_len` | 16384 |
+| `max_completion_tokens` | 8192 |
+| `batch_size` / `rollouts_per_example` | 128 / 8 |
+| Optimizer | AdamW, `lr=2e-6`, `betas=(0.9, 0.9)`, `wd=0.01`, `max_norm=1.0` |
+| Loss | `kl_tau=0.0` (reference-policy KL off) |
+| `max_steps` | 500, checkpoint every 50 steps |
+| Dataset | `rg-mix-env` (5 reasoning tasks, 7500 train examples, seed=42) |
+| Weight sync | filesystem broadcast (trainer writes, inference reads) |
+
+Each run uses 3 nodes with 4×A100-80GB GPUs each: two nodes run a
+DP=4 vLLM inference server each (8 engines total), one node runs the
+FSDP2 trainer. The orchestrator round-robins rollouts across the two
+inference URLs.
+
+### Why activation checkpointing only for full context
+
+Compaction training requires a `DynamicCache` with `use_cache=True` so
+retained KV flows between segments in `segmented_forward`. Prime-rl's
+non-reentrant `checkpoint_wrapper` re-runs each decoder layer's forward
+during backward, which double-appends K/V to the same cache object and
+fails with `CheckpointError: Recomputed values have different metadata`.
+The full-context path has no `DynamicCache`, so AC is safe and is
+enabled at `freq=1` to keep the 16k sequence length within the 80 GB
+budget. Compaction stays within budget without AC because each segment
+is individually short (window=4096).
+
+### Launching a run
+
+Both experiments include a SLURM + podman-hpc launcher script
+(`launch.sh`) as a reference implementation. It is written for a
+cluster that exposes 3 GPU nodes over SSH, mounts a shared filesystem
+on `/pscratch`, and uses `podman-hpc` for containers — adapt as
+needed. The pieces you need in any environment are:
+
+1. **Allocate 3 GPU nodes** (2 for inference, 1 for training). The
+   filesystem used for `output_dir` (default `outputs/compaction_rgmix`
+   or `outputs/full_context_rgmix`) must be visible from all three
+   nodes so weight broadcast can hand weights from trainer to
+   inference.
+
+2. **Resolve inference URLs in the trainer TOML.** Both `rl.toml`
+   files contain placeholder hostnames `__INFERENCE_NODE_0__` and
+   `__INFERENCE_NODE_1__`. Before launching the trainer, substitute
+   the actual hostnames of your two inference nodes:
+   ```bash
+   sed -e "s/__INFERENCE_NODE_0__/<host0>/g" \
+       -e "s/__INFERENCE_NODE_1__/<host1>/g" \
+       experiments/compaction_rgmix/rl.toml > /tmp/rl_resolved.toml
+   ```
+
+3. **Start both inference servers** (one on each inference node).
+   This is the `node1_inference.sh` step inside a container on each
+   inference node — it just runs:
+   ```bash
+   source .venv/bin/activate
+   CUDA_VISIBLE_DEVICES=0,1,2,3 uv run inference @ experiments/compaction_rgmix/inference.toml
+   ```
+   Wait until both servers return a Qwen model from
+   `GET /v1/models` on port 8000 before continuing.
+
+4. **Start the trainer** on the third node against the resolved TOML:
+   ```bash
+   source .venv/bin/activate
+   uv run rl @ /tmp/rl_resolved.toml
+   ```
+
+The trainer streams rollouts asynchronously from the inference pool,
+runs GRPO updates over the micro-batches, and pushes updated weights
+to the filesystem after each step. Inference reloads weights
+automatically via the broadcast worker hook.
+
+### What to watch during training
+
+- `progress/reward/mean` — should trend up; baseline after 5 steps at
+  smaller batch (smoke run) was 0.26 → 0.47
+- `loss/mismatch_kl_mean` — trainer-vs-inference logprob agreement.
+  With flash_attention_2 on both sides this sits at the kernel floor
+  ~0.0009. Any climb is a real correctness bug.
+- `progress/entropy/mean` — flat or mild downward drift is fine;
+  sharp spikes or collapse below ~0.1 indicates mode collapse.
+- `progress/seq_len/mean` — watch for length explosion toward the
+  8192 `max_completion_tokens` ceiling. Growing rollout length is
+  fundamental to rollout-only GRPO in open-ended tasks and can stall
+  steps on long tails.
+- `Peak Mem.` in the trainer log — compaction run peaks around 46 GiB
+  at batch_size=64 on 4×A100-80GB, scales roughly linearly in
+  seq_len, not batch size (each micro-batch is one sample).
+
+### Constraints to keep in mind
+
+- `[trainer.compaction]` in `rl.toml` MUST mirror the inference
+  side's `[vllm_extra].compaction_window_size` / `compaction_stride` /
+  `block_size` exactly. A mismatch silently corrupts the policy
+  gradient; prime-rl's `RLConfig` validator catches it only when
+  inference is co-configured in the same TOML, so in a split
+  deployment the sync is manual.
+- Compaction requires `impl = "hf"` and `attn = "flash_attention_2"`
+  on the trainer side — the `TrainerConfig` validator enforces this
+  when `compaction.window_size > 0`.
+- `stride` must be a multiple of `block_size` (default 16), and
+  `window_size` must be greater than `stride`.
+
 ## Project structure
 
 ```
@@ -223,6 +345,10 @@ kv-eviction/
       manager.py         # CompactingKVCacheManager + CompactionEvent
   prime-rl/              # Submodule: prime-rl with segmented-forward training path
   src/kv_eviction/       # Integration layer (Phase 3: segmented forward)
+  experiments/
+    compaction_rgmix/    # RL training run WITH compaction (paper main)
+    full_context_rgmix/  # RL training run WITHOUT compaction (baseline)
+    eval/                # Inference-only eval harness (rg-mix-env)
   plans/                 # Detailed implementation specs
   setup.sh               # One-command install
 ```
