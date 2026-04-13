@@ -6,6 +6,14 @@ Supersedes the earlier draft of this file, which was a looser design
 discussion about "lower the protected boundary from full prompt to
 system prompt only". This plan commits to a concrete policy + wiring.
 
+**Scope: vLLM-only.** Every change in this plan lives inside
+`vllm/`. No edits to `src/kv_eviction/`, `segmented_forward.py`, or
+`prime-rl/` are required. The new `CompactionEvent` fields
+(`last_turn_evicted`, `num_turns_evicted_after`) are additive and
+the trainer can ignore them — `segmented_forward` already replays
+from the existing fields. Trainer-side work is only required for
+the optional follow-up in `plans/block_aligned_message_padding.md`.
+
 ## Motivation
 
 Current block-FIFO compaction (`compaction_window_size`,
@@ -41,22 +49,33 @@ turns. This happens at the same `_should_compact` check point as block
 FIFO, so no new scheduler hook.
 
 **Turn definition.** A turn = the 2 consecutive messages
-`(user, assistant)`. The system message is turn 0 and is implicitly
-protected (never evicted). In a ChatML stream, the K-th turn ends at
-the (2K+1)-th `<|im_end|>` token:
+`(user, assistant)`. The system message is **NOT** a turn — it is the
+protected prefix and is **never** evicted, regardless of `max_turns`,
+`stride`, or any other configuration. Turns are 1-indexed and only
+count user+assistant pairs. In a ChatML stream:
 
 ```
-<|im_start|>system...<|im_end|>    ← 1st im_end, end of turn 0 (sys)
+<|im_start|>system...<|im_end|>    ← 1st im_end, end of system prompt (PROTECTED, never evicted)
 <|im_start|>user...<|im_end|>      ← 2nd im_end, end of user msg of turn 1
 <|im_start|>assistant...<|im_end|> ← 3rd im_end, end of turn 1
 <|im_start|>user...<|im_end|>      ← 4th im_end, end of user msg of turn 2
 <|im_start|>assistant...<|im_end|> ← 5th im_end, end of turn 2
 ```
 
-So if we let `P = list of absolute positions of the token AFTER each
-<|im_end|>`, then `P[0]` is the end of the system message, and
-`P[2k]` (for k >= 1) is the end of turn k. `num_completed_turns =
+If we let `P = list of absolute positions of the token AFTER each
+<|im_end|>`, then `P[0]` is the end of the system prompt, and `P[2k]`
+(for k >= 1) is the end of turn k. `num_completed_turns =
 (len(P) - 1) // 2`.
+
+**System-prompt protection is a hard invariant of this design**, not a
+side effect: every eviction range computed by `_compact_request` is
+constrained to start at or after `P[0]`. Even if `num_turns_evicted`
+were to advance to `num_completed_turns - 1`, the lower bound of the
+evict range stays at `P[0]` (the start of the oldest live turn,
+which is always >= end of system prompt). Code in
+`_turn_mode_effective_prompt` and the turn-aligned eviction range
+computation must both enforce this and is unit-tested under
+`test_turn_mode_system_prompt_never_evicted`.
 
 ## Key constraints
 
@@ -460,6 +479,13 @@ Explicitly **not** touched:
 7. `test_turn_mode_compaction_event_fields` — verify
    `CompactionEvent.last_turn_evicted`, `num_turns_evicted_after`,
    `num_prompt_tokens` all populated, msgspec round-trip works.
+8. `test_turn_mode_system_prompt_never_evicted` — fabricate a stream
+   with a known system-prompt length, then trigger many compaction
+   rounds (`max_turns=2, stride=1` over 10+ turns). After each event
+   assert `evict_start >= len(system_prompt_token_ids)` and that the
+   first `len(system_prompt_token_ids)` tokens of `_all_token_ids`
+   are byte-for-byte identical to the original system prompt.
+   Hard invariant; failure means the protection logic regressed.
 
 ### Integration smoke (no unit infra needed)
 
@@ -489,10 +515,13 @@ Explicitly **not** touched:
 
 ## Open decisions (flag to user before implementing)
 
-1. **Inward-snap orphan tolerance.** Is it OK to leave ~12% fragments
-   of evicted turns in the stream as described above, or do we need
-   exact eviction? If exact: the follow-up is message-boundary
-   padding in the chat template, which is a larger scope.
+1. **Inward-snap orphan tolerance.** This plan accepts ~12% orphan
+   fragments per evicted turn (block alignment leaves dead tail
+   tokens of evicted turns alive in KV). If production output
+   quality shows this is harmful, the exact-eviction follow-up is
+   `plans/block_aligned_message_padding.md` (pad each chat message
+   so `<|im_end|>` lands on a block boundary). Decision deferred
+   until smoke results from this plan are in.
 
 2. **Single-turn eviction vs batched.** Default `stride=1` gives more
    predictable output-quality tests but more compaction events
@@ -545,3 +574,99 @@ Explicitly **not** touched:
   **Confirm with the user whether the balrog loop uses one request
   per episode or one request per turn** — this affects whether turn
   mode is the right fix at all.
+
+## Event flow
+
+Lifecycle of one request under turn mode (`max_turns=2, stride=1`).
+"Step" = one scheduler step. SYS = system prompt, U_k / A_k = user /
+assistant message of turn k.
+
+```
+Engine                   Scheduler                       Request state
+                                                         (turn_end_positions, num_turns_evicted)
+─────────────────────────────────────────────────────────────────────────────
+add_request    ───►  Request.__init__                    P=[],  evicted=0
+                     (turn fields zeroed)
+                          │
+                          ▼
+                     1st schedule()                       _all_token_ids = [SYS U_1]
+                          │                               (prefill of initial prompt)
+                          ▼
+decode step 1  ───►  _scan_new_turn_boundaries            P=[end_SYS, end_U_1]
+                     _effective_prompt = P[0] = end_SYS   evicted=0
+                     _should_compact?  → no
+                     (live_turns = 0, A_1 not finished)
+                          │
+                          ▼
+                     ... A_1 streams ... <|im_end|> sampled
+                          │
+                          ▼
+decode step N  ───►  _scan_new_turn_boundaries            P=[end_SYS,end_U_1,end_A_1]
+                     live_turns = (3-1)//2 = 1            evicted=0
+                     1 < max_turns=2, no compaction
+                          │
+                          ▼
+                     ... U_2 appended (next turn fed back) ...
+                     ... A_2 streams ... <|im_end|> sampled
+                          │
+                          ▼
+decode step M  ───►  _scan_new_turn_boundaries            P=[end_SYS,
+                     live_turns = (5-1)//2 = 2               end_U_1,end_A_1,
+                     2 >= max_turns=2 ──► compact!          end_U_2,end_A_2]
+                          │
+                          ▼
+                     _compact_request:
+                       turn_first_start = P[0]            ┌─ evicting turn 1 ─┐
+                       turn_last_end    = P[2]            │                   │
+                       evict_start = align_up(P[0])       ▼                   ▼
+                       evict_end   = align_dn(P[2])    [SYS|U_1 A_1|U_2 A_2]
+                                                           ─── evict ───
+                          │
+                          ▼
+                     mgr.compact_request(eviction_fn) ──► free blocks
+                     trim _all_token_ids[evict_start:evict_end]
+                     trim _output_token_ids (output portion)
+                     num_prompt_tokens -= prompt_evicted
+                     num_computed_tokens -= total_evicted
+                     position_offset += total_evicted
+                          │
+                          ▼
+                     update turn-tracking:                 P=[end_SYS, end_U_2',end_A_2']
+                       drop P entries inside evict range   evicted=1
+                       shift surviving entries left by total_evicted
+                       num_turns_evicted += stride
+                          │
+                          ▼
+                     append CompactionEvent:               event = {
+                       last_turn_evicted = 0                 tokens_evicted: T,
+                       num_turns_evicted_after = 1           position_offset_after: T,
+                       num_prompt_tokens (post-trim)         num_prompt_tokens: <new>,
+                                                             last_turn_evicted: 0,
+                                                             num_turns_evicted_after: 1
+                                                           }
+                          │
+                          ▼
+                     next decode runs against              physical KV: [SYS_blocks | U_2 A_2 blocks ...]
+                     the shorter sequence,                 logical view: same, with RoPE
+                     RoPE corrected by position_offset     positions = phys + offset
+─────────────────────────────────────────────────────────────────────────────
+                                                          SYS prefix in P[0] is
+                                                          NEVER touched by the trim:
+                                                          evict_start >= P[0] always.
+```
+
+Wire path of the resulting `CompactionEvent` (unchanged from current
+code — turn-mode just adds two fields):
+
+```
+Scheduler._compact_request
+        │  appends to request.compaction_events
+        ▼
+EngineCoreOutput  (existing plumbing)
+        ▼
+ChatCompletionResponse.compaction_events  (existing payload)
+        ▼
+prime-rl orchestrator/trajectories.py     (Phase B merge)
+        ▼
+prime-rl trainer  segmented_forward       (replays per-event eviction)
+```
