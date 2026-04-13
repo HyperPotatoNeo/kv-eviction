@@ -23,10 +23,12 @@ before the verifiers env so its `add_model_response` runs first.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from verifiers.types import Messages, Response as ModelResponse, State, TrajectoryStep
 
+from kv_eviction.padding import render_padded_prompt
 from kv_eviction.types import CompactionEventWire
 
 logger = logging.getLogger(__name__)
@@ -138,6 +140,46 @@ def attach_compaction_events_from_response(
     if step.get("extras") is None:
         step["extras"] = {}
     step["extras"]["compaction_events"] = event_dicts
+
+
+def _extract_prompt_token_ids(response: ModelResponse) -> list[int] | None:
+    """Pull `prompt_token_ids` off a response object.
+
+    Block-aligned-padding mode: the AsyncCompletions interceptor
+    (`_install_message_padding_interceptor`) stashes the padded ids on
+    the native ChatCompletion before returning it to verifiers. Patch #1
+    then copies it onto the verifiers Response. Either location works;
+    we handle both for robustness."""
+    if response is None:
+        return None
+    ids = getattr(response, "prompt_token_ids", None)
+    if ids is None and hasattr(response, "model_extra"):
+        extras = response.model_extra or {}
+        ids = extras.get("prompt_token_ids")
+    if ids is None:
+        return None
+    # Defensive copy + type coercion so downstream JSON-serialization works.
+    try:
+        return [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return None
+
+
+def attach_prompt_token_ids_from_response(
+    step: TrajectoryStep,
+    response: ModelResponse,
+) -> None:
+    """Mutate the given TrajectoryStep's extras to include `prompt_token_ids`
+    — the padded token stream vLLM actually ran on.
+
+    Idempotent: overwrites any existing entry. No-op when the response
+    has no `prompt_token_ids` (padding disabled for this request)."""
+    ids = _extract_prompt_token_ids(response)
+    if ids is None:
+        return
+    if step.get("extras") is None:
+        step["extras"] = {}
+    step["extras"]["prompt_token_ids"] = ids
 
 
 class CompactionEnvMixin:
@@ -258,6 +300,20 @@ def _install_compaction_event_hooks() -> None:
     orig_from_native = base_client_cls.from_native_response
     if not getattr(orig_from_native, "__kv_eviction_patched__", False):
 
+        def _forward_extra(verifiers_response, key, value):
+            """Copy a vLLM-extension field onto the verifiers Response.
+            Handles pydantic v2 `extra="allow"` via setattr, falls back to
+            `model_extra` if setattr is rejected."""
+            if value is None:
+                return
+            try:
+                setattr(verifiers_response, key, value)
+            except Exception:
+                if hasattr(verifiers_response, "model_extra"):
+                    if verifiers_response.model_extra is None:
+                        verifiers_response.__pydantic_extra__ = {}
+                    verifiers_response.model_extra[key] = value
+
         async def patched_from_native(self, response):  # type: ignore[no-untyped-def]
             # Call the original conversion to get the verifiers Response.
             verifiers_response = await orig_from_native(self, response)
@@ -269,18 +325,18 @@ def _install_compaction_event_hooks() -> None:
             if raw_events is None and hasattr(response, "model_extra"):
                 extra = response.model_extra or {}
                 raw_events = extra.get("compaction_events")
-            if raw_events is not None:
-                # Verifiers' Response class is CustomBaseModel with
-                # extra="allow", so setattr on an extra field is
-                # supported in pydantic v2. If for some reason it's
-                # not, fall back to stashing in model_extra directly.
-                try:
-                    setattr(verifiers_response, "compaction_events", raw_events)
-                except Exception:
-                    if hasattr(verifiers_response, "model_extra"):
-                        if verifiers_response.model_extra is None:
-                            verifiers_response.__pydantic_extra__ = {}
-                        verifiers_response.model_extra["compaction_events"] = raw_events
+            _forward_extra(verifiers_response, "compaction_events", raw_events)
+
+            # Block-aligned padding extension: the AsyncCompletions
+            # interceptor (Patch #3) stashes `prompt_token_ids` on the
+            # native response so training/downstream code sees the exact
+            # token stream vLLM ran on, not a re-tokenization of messages.
+            raw_ptids = getattr(response, "prompt_token_ids", None)
+            if raw_ptids is None and hasattr(response, "model_extra"):
+                extra = response.model_extra or {}
+                raw_ptids = extra.get("prompt_token_ids")
+            _forward_extra(verifiers_response, "prompt_token_ids", raw_ptids)
+
             return verifiers_response
 
         patched_from_native.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
@@ -301,12 +357,214 @@ def _install_compaction_event_hooks() -> None:
             trajectory = state.get("trajectory", [])
             if trajectory:
                 attach_compaction_events_from_response(trajectory[-1], response)
+                attach_prompt_token_ids_from_response(trajectory[-1], response)
 
         patched_add_model_response.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
         base_env_cls.add_model_response = patched_add_model_response  # type: ignore[assignment]
 
 
 _install_compaction_event_hooks()
+
+
+# ─── Block-aligned message padding (orchestrator-side) ───
+#
+# When enabled by the orchestrator via `configure_message_padding(...)`,
+# the AsyncCompletions.create interceptor below:
+#   1. Reads `messages` + `tools` off each chat.completions.create kwargs.
+#   2. Renders a block-aligned padded token stream via
+#      `kv_eviction.padding.render_padded_prompt`.
+#   3. Merges `{"prompt_token_ids": padded}` into `extra_body` so the
+#      server-side render_chat bypass (see vLLM fork) skips chat
+#      templating and feeds these ids to the engine verbatim.
+#   4. Stashes the padded ids on the returned ChatCompletion as an
+#      attribute so Patch #1 (from_native_response) forwards them to the
+#      verifiers Response and Patch #2 (add_model_response) attaches them
+#      to the trajectory step's extras.
+#
+# The interceptor is a module-level monkey-patch of
+# `openai.resources.chat.completions.completions.AsyncCompletions.create`.
+# We intercept there (not at verifiers' `get_response`) because verifiers
+# does not forward arbitrary kwargs to create() — it builds the kwarg list
+# explicitly. Patching one level deeper means we don't need to touch
+# verifiers at all.
+#
+# When `_padding_config` is None or `enabled=False`, the wrapper is a
+# pure passthrough — zero runtime cost.
+
+
+@dataclass
+class MessagePaddingConfig:
+    """Config installed by the orchestrator at startup. All fields are
+    plumbed from prime-rl's `orchestrator.compaction_padding` section;
+    `block_size` MUST be identical across inference / orchestrator /
+    trainer (cross-validated at config load time)."""
+
+    enabled: bool
+    tokenizer: Any
+    block_size: int
+    filler_token_id: int
+    im_end_token_id: int
+
+
+_padding_config: MessagePaddingConfig | None = None
+
+
+def configure_message_padding(
+    *,
+    enabled: bool,
+    tokenizer: Any,
+    block_size: int,
+    filler_token_id: int,
+    im_end_token_id: int,
+) -> None:
+    """Install the orchestrator-wide message-padding config.
+
+    Called once by prime-rl's orchestrator at startup, before any
+    rollouts fire. Idempotent — repeated calls overwrite the previous
+    config (useful for tests).
+
+    When `enabled=False`, the interceptor is still installed on the
+    AsyncCompletions class (no way to un-install a monkey-patch
+    cleanly) but becomes a no-op passthrough. This keeps behavior
+    bit-identical to the pre-patch state when padding is disabled —
+    see Gate 5 in `plans/prime_rl_message_padding_patch.md`.
+    """
+    global _padding_config
+    _padding_config = MessagePaddingConfig(
+        enabled=enabled,
+        tokenizer=tokenizer,
+        block_size=block_size,
+        filler_token_id=filler_token_id,
+        im_end_token_id=im_end_token_id,
+    )
+    if enabled:
+        logger.info(
+            "kv_eviction: block-aligned message padding ENABLED "
+            "(block_size=%d, filler_token_id=%d, im_end_token_id=%d)",
+            block_size,
+            filler_token_id,
+            im_end_token_id,
+        )
+
+
+def _install_message_padding_interceptor() -> None:
+    """Monkey-patch `AsyncCompletions.create` to pre-pad messages into
+    block-aligned token streams when padding is enabled.
+
+    Idempotent — sentinel-attribute guarded so repeated imports / test
+    teardowns don't stack wrappers. No-op passthrough when
+    `_padding_config` is None or disabled.
+    """
+    try:
+        from openai.resources.chat.completions.completions import (
+            AsyncCompletions,
+        )
+    except ImportError:
+        return
+
+    orig_create = AsyncCompletions.create
+    if getattr(orig_create, "__kv_eviction_padding_patched__", False):
+        return
+
+    async def patched_create(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        cfg = _padding_config
+        if cfg is None or not cfg.enabled:
+            logger.info("[PAD-TRACE] interceptor fired: cfg_enabled=False")
+            return await orig_create(self, *args, **kwargs)
+
+        messages = kwargs.get("messages")
+        tools = kwargs.get("tools")
+        logger.info(
+            "[PAD-TRACE] interceptor fired: messages_is_none=%s "
+            "num_messages=%s has_tools=%s",
+            messages is None,
+            len(messages) if messages is not None else "n/a",
+            tools is not None,
+        )
+        if messages is None:
+            # Someone called create() positionally or without messages
+            # (streaming edge cases, non-chat paths). Don't touch it.
+            return await orig_create(self, *args, **kwargs)
+
+        try:
+            _raw, padded, _pads = render_padded_prompt(
+                tokenizer=cfg.tokenizer,
+                messages=messages,
+                tools=tools,
+                block_size=cfg.block_size,
+                filler_token_id=cfg.filler_token_id,
+                im_end_token_id=cfg.im_end_token_id,
+            )
+        except Exception:
+            # If padding fails (unusual chat template, bad messages),
+            # log and fall back to the unpadded path rather than
+            # breaking the rollout. The trainer's padding-mode assertion
+            # will fail-loud if this drift silently propagates.
+            logger.exception(
+                "kv_eviction: render_padded_prompt failed; falling back to "
+                "unpadded chat template"
+            )
+            return await orig_create(self, *args, **kwargs)
+
+        # Merge into extra_body. `extra_body` is an officially-supported
+        # passthrough kwarg on openai-python's create(); its contents go
+        # straight into the HTTP request body, where vLLM's
+        # ChatCompletionRequest pydantic model picks up the new
+        # `prompt_token_ids` field.
+        extra_body = dict(kwargs.pop("extra_body", None) or {})
+        extra_body["prompt_token_ids"] = padded
+        kwargs["extra_body"] = extra_body
+
+        logger.info(
+            "[PAD-TRACE] padded: raw->padded len %d->%d fillers_inserted=%d",
+            len(_raw),
+            len(padded),
+            sum(_pads),
+        )
+
+        response = await orig_create(self, *args, **kwargs)
+
+        # Stash the padded ids on the response so Patch #1 can forward
+        # them to the verifiers Response and Patch #2 can attach them
+        # to the trajectory step's extras. `ChatCompletion` in
+        # openai-python is a pydantic BaseModel with `extra="allow"`,
+        # so setattr writes to __pydantic_extra__.
+        try:
+            setattr(response, "prompt_token_ids", padded)
+        except Exception:
+            if hasattr(response, "model_extra"):
+                if response.model_extra is None:
+                    response.__pydantic_extra__ = {}
+                response.model_extra["prompt_token_ids"] = padded
+        return response
+
+    patched_create.__kv_eviction_padding_patched__ = True  # type: ignore[attr-defined]
+    AsyncCompletions.create = patched_create  # type: ignore[assignment]
+
+
+_install_message_padding_interceptor()
+
+
+def padded_ids_from_step_extras(
+    extras: dict[str, Any] | None,
+) -> list[int] | None:
+    """Read-side helper for orchestrator code: pull `prompt_token_ids`
+    (the block-aligned padded token stream vLLM ran on) from a
+    trajectory step's extras dict, returning None if absent.
+
+    Used by prime-rl's `interleave_rollout` to thread padded ids onto
+    `TrainingSample.prompt_token_ids`, so the trainer does not
+    re-tokenize from `messages` (which would lose the padding).
+    """
+    if not extras:
+        return None
+    ids = extras.get("prompt_token_ids")
+    if not ids:
+        return None
+    try:
+        return [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return None
 
 
 def compaction_events_from_step_extras(

@@ -1,328 +1,667 @@
-# Plan: Block-Aligned Message Padding via prime-rl Patch
+# Plan: Block-Aligned Message Padding via prime-rl Patch (Option A)
+
+## Status: Steps 1–4 done, Steps 5–7 pending
+
+**Implementation progress (as of 2026-04-13):**
+
+| Step | Scope | Status |
+|---|---|---|
+| 1 | vLLM patch — `prompt_token_ids` field + `render_chat` bypass + tests | ✅ done |
+| 2 | `src/kv_eviction/padding.py` + unit tests | ✅ done |
+| 3 | Orchestrator-side monkey-patch wrapping `AsyncOpenAI.chat.completions.create` (Changes 6 + 7) + tests | ✅ done |
+| 4 | prime-rl config + trajectory plumbing (Changes 8, 9, 10) | ✅ done |
+| 5 | Trainer loss mask + segmented_forward defensive assertion (Changes 11, 12, 13) | ⏸ deferred (user constraint: "not doing the trainer implementations yet") |
+| 6 | Backward-compat gate (padding off, end-to-end smoke parity) | ⏸ pending |
+| 7 | Deprecate `plans/block_aligned_message_padding.md` | ⏸ pending |
+
+**What landed (concrete):**
+
+- **vLLM fork** (`vllm/` submodule, branch `eviction-turn-based`):
+  - `vllm/entrypoints/openai/chat_completion/protocol.py` — `prompt_token_ids: list[int] | None` added inside the `chat-completion-extra-params` doc block on `ChatCompletionRequest`.
+  - `vllm/entrypoints/serve/render/serving.py::render_chat` — bypass branch at top: when `request.prompt_token_ids is not None`, returns `(list(messages), [tokens_input(prompt_token_ids, cache_salt=...)])` and skips `preprocess_chat`. Empty-list → `ErrorResponse`.
+  - `tests/entrypoints/openai/chat_completion/test_prompt_token_ids_bypass.py` — 3 unit tests (verbatim passthrough, empty-list error, `cache_salt` threading) using mocked `OpenAIServingRender` + `AsyncMock` trip-wire on `preprocess_chat`. Driven via `asyncio.run()` from sync test bodies (no pytest-asyncio dependency).
+
+- **kv-eviction integration** (parent repo):
+  - `src/kv_eviction/padding.py` (new) — `render_padded_prompt(...)` + `resolve_filler_token_id(tokenizer, override)` + `resolve_im_end_token_id(tokenizer)`. Pure functions, no side effects.
+  - `tests/test_padding.py` (new) — 7 unit tests covering single/multi-turn boundaries, zero-pad-when-aligned, generation-prompt suffix not padded, filler resolution chain.
+  - `src/kv_eviction/env.py` — added `MessagePaddingConfig` dataclass, module-level `_padding_config`, `configure_message_padding(...)`, `_install_message_padding_interceptor()` (class-level monkey-patch on `openai.resources.chat.completions.completions.AsyncCompletions.create`), plus `attach_prompt_token_ids_from_response(step, response)` and `padded_ids_from_step_extras(extras)` read-side helpers. Existing Patches #1 (`patched_from_native`) and #2 (`patched_add_model_response`) extended to forward `prompt_token_ids` alongside `compaction_events`.
+  - `tests/test_padding_interceptor.py` (new) — 3 tests: passthrough when disabled, injection of `extra_body["prompt_token_ids"]` when enabled, merge with preexisting `extra_body`.
+
+- **prime-rl** (`prime-rl/` submodule, branch `kv-eviction`):
+  - `src/prime_rl/configs/orchestrator.py` — `CompactionPaddingConfig` (`enabled`, `block_size=16`, `filler_token_id`, `im_end_token_id`) on `OrchestratorConfig`.
+  - `src/prime_rl/configs/rl.py` — `validate_compaction_padding` `@model_validator(mode="after")` asserts `block_size` matches across trainer/orchestrator/inference and requires `trainer.compaction.window_size > 0`.
+  - `src/prime_rl/orchestrator/orchestrator.py` — startup block resolves filler/im_end ids from the tokenizer and calls `configure_message_padding(...)` when enabled.
+  - `src/prime_rl/orchestrator/trajectories.py::prepare_step_tokens` — when `step["extras"]["prompt_token_ids"]` is present, overrides `prompt_ids` with the padded ids and rebuilds `prompt_mask = [False] * len(prompt_ids)`.
+
+- **Smoke verified:** `OrchestratorConfig()` parses cleanly with both default (disabled) and `compaction_padding.enabled=True` configs.
+
+**Remaining work — see "Order of operations" below for the original step list.** Steps 5–7 still need to land. Step 5 is gated on explicit user permission to touch trainer code. Step 7 is docs-only and can proceed independently.
+
+---
 
 ## Status: Draft / Follow-up to `block_aligned_message_padding.md`
 
-**Starting commit:** `014179c` (branch `eviction-turn-based`) —
-"WIP: protected-prefix compaction + turn-based eviction plan". The
-vLLM submodule at this point carries the in-progress turn-mode
-implementation (cache/arg_utils/scheduler/request changes) on top of
-its `compaction` branch at `c23308919`. Implementation work for this
-plan should branch from here.
+**Starting commit:** `2cd0bac` on branch `eviction-turn-based`
+(parent repo) with `vllm/` submodule at `5bfe16642` on branch
+`eviction-turn-based` ("Turn-based compaction: evict whole
+user+assistant turns"). Implementation branches from here.
 
-This plan is an alternative realization of the padding idea in
-`block_aligned_message_padding.md` — instead of applying padding
-*server-side* in vLLM's chat-completion serving code, we apply it
-*client-side* in a prime-rl / kv-eviction monkey-patch, mirroring the
-existing compaction-events monkey-patch at
-`src/kv_eviction/env.py:249`. vLLM is left untouched.
+Supersedes the "Options A/B/C transport" discussion in the prior
+draft — **Option A is committed**. See "Decision record" below for
+why B and C are rejected.
 
 ## Motivation
 
 The prototype in `experiments/debug_balrog/compaction_test.ipynb`
-(cells ~144–296, `_render_padded`) already demonstrates that:
+demonstrates that padding each chat message so `<|im_end|>` lands on
+a block boundary produces exact-edge eviction under turn mode (no
+orphan fragments, no mid-message cuts). The prototype runs in-process
+via `vllm.LLM(...).generate(prompts=[{"prompt_token_ids": …}])`, which
+sidesteps the OpenAI server entirely.
 
-- Rendering chat messages via `tokenizer.apply_chat_template(..., tokenize=True)`
-  to get raw token ids,
-- Inserting `pad_n` filler tokens **before** each `<|im_end|>` so the
-  `<|im_end|>` occupies the last slot of a block (i.e. the position
-  right after `<|im_end|>` is a multiple of `block_size`),
-- Feeding the padded token list to vLLM via `prompt_token_ids=…`,
+Prime-rl's rollout path, however, talks to vLLM over HTTP via
+`verifiers.clients.openai_chat_completions_client.OpenAIChatCompletionsClient`
+which sends `messages=[…]` and lets the server apply the chat
+template. This plan ports the notebook's padding recipe to that
+client-server path with minimal surgery:
 
-works cleanly with turn-mode compaction and produces block-aligned turn
-boundaries. Observed in the notebook log: `raw=368 -> padded=372 (+4)`
-per turn-0, `pads=[3,1]` — i.e. 3 filler tokens to land the system
-`<|im_end|>` at the end of block 22 (368-token boundary → pad to 368,
-`<|im_end|>` at slot 367, next token at 368 — a clean block edge).
+1. **Tiny vLLM-fork patch** (~30 lines, 2 files) adds a
+   `prompt_token_ids` field to `ChatCompletionRequest`. When set,
+   vLLM skips `apply_chat_template` and feeds the provided tokens
+   directly to the engine.
+2. **kv-eviction monkey-patch** in `src/kv_eviction/env.py` wraps
+   the verifiers client: tokenize + pad messages client-side, send
+   as `extra_body={"prompt_token_ids": padded}` alongside the
+   regular `messages=…` (the latter kept for tool-call metadata
+   downstream).
+3. **prime-rl config + trainer** gain a `message_padding_aware`
+   flag that masks filler tokens out of the loss.
 
-The scheduler then evicts `[336, 688)` and `[336, 608)` — exact
-multiples of 16 at both ends, matching the turn boundaries. No orphan
-fragments.
+This eliminates Bug 2 (`prompt_aligned_len` mismatch) by construction:
+with padded prompts, the trainer's block-alignment and vLLM's
+block-alignment produce the same boundary because the prompt length
+is a multiple of `block_size`.
 
-The remaining open question is how to port this prototype from a local
-`LLM(...).generate(prompts=[{"prompt_token_ids": …}])` call into the
-prime-rl rollout path, which today talks to vLLM's OpenAI-compatible
-server via `client.chat.completions.create(messages=…)` (no
-pre-tokenized path). This plan lays out that port.
+## Invariants
 
-## Invariant & constraints (inherited)
+1. **Inference and training use identical token streams.** The
+   trainer's `TrainingSample.prompt_token_ids` is set from the
+   padded ids vLLM actually ran on, not re-rendered from `messages`.
+2. **Padding tokens contribute zero gradient.** The trainer-side loss
+   mask is ANDed with `(input_ids != filler_id)` at positions inside
+   the prompt that came from padding. (Positions in the completion
+   are never padded; filler collisions there are genuine model
+   output and must not be masked.)
+3. **Padding never biases generation.** Filler tokens are inserted
+   only *before* `<|im_end|>` tokens that are already committed (in
+   the prompt). The sampler is never constrained toward fillers.
+4. **Deterministic padding rule.** Given
+   `(messages, tools, block_size, filler_id)`, the padded id list is
+   unique. Enables prefix-cache hits across requests with identical
+   prompts.
 
-These are identical to `block_aligned_message_padding.md` — the plan
-fails if they are violated:
-
-1. **Inference and training MUST use identical padded token streams.**
-   If the trainer reconstructs the sample from un-padded messages, the
-   per-token alignment is off by `sum(pad_n)` and gradients land on
-   wrong positions.
-2. **Padding tokens must be ignored in the loss.** Training-side mask
-   must zero them out — they are scaffolding, not learned content.
-3. **Padding must not bias generation.** Filler tokens are inserted
-   only in the prompt, *before* `<|im_end|>` tokens that have already
-   been committed (either by the chat template for past turns, or by
-   the sampler for completed assistant messages). The sampler is never
-   forced to predict a filler token.
-4. **`block_size` must be known at chat-template apply time.** The
-   orchestrator must read it from the trainer-side compaction config
-   (or a new orchestrator-side knob).
-
-## Where to hook
-
-The current flow (see the `Explore` map from pre-plan research):
+## Flow diagram
 
 ```
-orchestrator/trajectories.py:74-87
-        │  _render_messages() for initial prompt (unused here — verifiers
-        │  re-renders anyway for /v1/chat/completions)
-        ▼
-verifiers.envs.multiturn_env:88-97  get_prompt_messages()
-        │  builds per-turn messages list (role/content dicts)
-        ▼
-verifiers.clients.openai_chat_completions_client:280,288
-        │  client.chat.completions.create(messages=prompt, ...)
-        ▼
-vLLM /v1/chat/completions  (server applies chat template → token ids)
+                   rollout worker (prime-rl)
+                   ┌──────────────────────────────────────────┐
+                   │ verifiers.MultiTurnEnv.get_prompt_messages│
+                   │   returns messages=[sys,u,a,u,a,...,u]    │
+                   └─────────────────────┬────────────────────┘
+                                         │ messages, tools
+                                         ▼
+                   ┌──────────────────────────────────────────┐
+                   │ OpenAIChatCompletionsClient.get_response  │
+                   │   (monkey-patched in src/kv_eviction/env) │
+                   ├──────────────────────────────────────────┤
+                   │ if cfg.pad_messages_to_block:             │
+                   │   raw  = tokenizer.apply_chat_template(   │
+                   │           messages, tools, tokenize=True, │
+                   │           add_generation_prompt=True)     │
+                   │   pad  = _render_padded(raw, im_end_id,   │
+                   │           block_size, filler_id)          │
+                   │   body = {"prompt_token_ids": pad}        │
+                   │ else:                                     │
+                   │   body = {}                               │
+                   └─────────────────────┬────────────────────┘
+                                         │ POST /v1/chat/completions
+                                         │ { messages, tools,         }
+                                         │ { extra_body: {            }
+                                         │ {   prompt_token_ids: pad  }
+                                         │ { }                         }
+                                         ▼
+  vllm/entrypoints/serve/render/serving.py::render_chat
+   ┌───────────────────────────────────────────────────────┐
+   │ if request.prompt_token_ids is not None:              │
+   │     token_ids = request.prompt_token_ids              │
+   │     conversation = request.messages  # metadata-only  │
+   │     engine_input = TokensPrompt(                      │
+   │         prompt_token_ids=token_ids, prompt=None)      │
+   │     return conversation, [engine_input]               │
+   │ else:                                                 │
+   │     # existing apply_chat_template path               │
+   └─────────────────────┬─────────────────────────────────┘
+                         │ engine_input (TokensPrompt)
+                         ▼
+              vllm engine runs inference on padded tokens
+                         │
+                         │ ChatCompletionResponse with
+                         │   prompt_token_ids=padded,
+                         │   compaction_events=[…]
+                         ▼
+                   ┌──────────────────────────────────────────┐
+                   │ OpenAIChatCompletionsClient.from_native_ │
+                   │   response  (monkey-patched, existing)    │
+                   │   + new: forward padded ids to step.extras│
+                   └─────────────────────┬────────────────────┘
+                                         ▼
+                     TrajectoryStep.extras
+                       ├── compaction_events
+                       └── prompt_token_ids   (new)
+                                         │
+                                         ▼
+         orchestrator/trajectories.py::interleave_rollout
+           TrainingSample.prompt_token_ids = extras[prompt_token_ids]
+                                         │
+                                         ▼
+                   ┌──────────────────────────────────────────┐
+                   │ trainer/rl/data.py::_micro_batch_to_tensor│
+                   │   loss_mask &= (input_ids != filler_id)   │
+                   │              (over prompt positions only) │
+                   └─────────────────────┬────────────────────┘
+                                         ▼
+                 segmented_forward — unchanged, same padded ids
+                 as vLLM ran, so prompt_aligned_len matches exactly
 ```
 
-The existing monkey-patch in `src/kv_eviction/env.py:249-309` already
-demonstrates the pattern: intercept `OpenAIChatCompletionsClient`
-methods at import time, wrap them, keep the rest of verifiers
-untouched. We add a **third patch**: wrap `get_response` (or the
-narrower `_make_chat_request` used on line 280/288) so that when
-padding is enabled:
+## Changes — vLLM fork
 
-1. Apply the chat template locally to get raw token ids.
-2. Run `_render_padded` → padded token ids + per-`<|im_end|>` pad counts.
-3. Send the padded ids to vLLM using a pre-tokenized endpoint (see
-   "Transport" below).
-4. On the response, carry the padded `prompt_token_ids` + pad metadata
-   back to the trajectory step so the trainer can see them.
+### Change 1: accept `prompt_token_ids` on `ChatCompletionRequest`
 
-## Phasing
+**File:** `vllm/entrypoints/openai/chat_completion/protocol.py`
 
-Phase 1 = inference-only. Phase 2 = training-side alignment. They land
-independently; Phase 1 is testable without Phase 2.
-
-### Phase 1 — Orchestrator/env-side padding (no trainer changes)
-
-Goal: every request to vLLM carries padded `prompt_token_ids` so turn
-boundaries land on block edges. Gate on a new orchestrator config flag,
-default off → bit-for-bit no-op.
-
-| File | Change |
-|---|---|
-| `src/kv_eviction/padding.py` *(new)* | Port `_render_padded` + `_filler_token_id` from the notebook. Pure function: `(messages, tools, tokenizer, block_size, im_end_id, filler_id) -> (raw_ids, padded_ids, pads, render_kwargs)`. Single source of truth. |
-| `src/kv_eviction/env.py` | Add a third monkey-patch: wrap `OpenAIChatCompletionsClient.get_response` (or the inner call on line 280/288) to do the padding + pre-tokenized dispatch when `KV_EVICTION_PAD_MESSAGES=1` (env) or the orchestrator has set it via a shared module-level flag. Also stash `prompt_token_ids` + `pads` on the response for the downstream `from_native_response` patch. |
-| `src/kv_eviction/env.py` (existing patch 1) | Extend `patched_from_native` to also forward the padded `prompt_token_ids` and `pads` onto the verifiers response (same extras mechanism already used for `compaction_events`). |
-| `prime-rl/src/prime_rl/orchestrator/config.py` | Add `pad_messages_to_block: bool = False`, `block_size: int = 16`, `filler_token_id: int | None = None` (None → auto via `tokenizer.pad_token_id`, Qwen3 → 151643). Validation: if true, require the trainer-side flag `[trainer.compaction].message_padding_aware = True` (added in Phase 2). |
-| `prime-rl/src/prime_rl/orchestrator/trajectories.py` | When padding is enabled, carry the padded `prompt_token_ids` from the first step's extras into `TrainingSample.prompt_token_ids` (overriding the orchestrator-side re-tokenization path). This keeps the trainer's per-token ground truth byte-identical to what vLLM saw. |
-
-### Phase 2 — Trainer-side padding awareness
-
-Goal: a compaction-enabled training run can consume padded samples
-end-to-end without computing gradients on filler tokens.
-
-| File | Change |
-|---|---|
-| `prime-rl/src/prime_rl/trainer/rl/config.py` | Add `message_padding_aware: bool = False` and `filler_token_id: int | None = None` to `trainer.compaction`. Validator: must match orchestrator. |
-| `prime-rl/src/prime_rl/trainer/rl/data.py` (or wherever `_micro_batch_to_tensor` builds the loss mask) | Build `is_padding = (input_ids == filler_id)`, AND it into the existing loss mask. Padded positions contribute zero gradient. |
-| `src/kv_eviction/segmented_forward.py` | No eviction-path changes — the existing `prompt_aligned_len` computation still works because the padded prompt is what vLLM actually evicted from, and `num_prompt_tokens` on the event is the post-padding prompt length. The loss mask is applied by the caller; segmented_forward itself is loss-agnostic. Add a sanity assertion that any `compaction_events[0].eviction_start` (if/when that field lands) matches the block-aligned boundary we'd compute from the padded prompt. |
-| `plans/block_aligned_message_padding.md` — trainer section | Merge / supersede with this one. The vLLM-side patch plan there becomes deprecated in favor of this client-side approach. |
-
-Phase 2 is **required** before enabling padding in a compaction RL
-training run. Phase 1 alone is safe for inference-only smokes (the
-notebook prototype is effectively Phase 1).
-
-## Transport: how to send pre-tokenized input over the OpenAI API
-
-The crux of the port. Verifiers uses
-`client.chat.completions.create(messages=…)` — OpenAI's schema, no
-`prompt_token_ids` field. Three options:
-
-### Option A: `extra_body={"prompt_token_ids": [...]}` on chat completions *(recommended, pending confirmation)*
-
-vLLM's OpenAI-compatible server accepts extra fields on
-`ChatCompletionRequest` — check `vllm/entrypoints/openai/protocol.py`
-for whether `prompt_token_ids` is already accepted or can be added as a
-small server-side patch. If supported, when set, vLLM skips chat
-template application and uses the provided ids verbatim. Client code:
+Insert near the other vLLM-specific fields of `ChatCompletionRequest`
+(class starts at line 171; put the new field alongside
+`kv_transfer_params` / `compaction_events` extensions):
 
 ```python
-response = await self.client.chat.completions.create(
-    model=model,
-    messages=prompt,              # ignored when prompt_token_ids is set
-    extra_body={"prompt_token_ids": padded_ids},
-    **normalize_sampling_args(sampling_args),
-)
+# vLLM extension — kv-eviction message-padding patch.
+# When set, the server SKIPS apply_chat_template and uses these
+# token ids verbatim. `messages` is still consulted for tool-call
+# metadata (reasoning parser, tool_choice validation) but is not
+# re-rendered. Intended for clients that need byte-exact control
+# over the prompt token stream (e.g. block-aligned padding for
+# turn-based KV compaction).
+prompt_token_ids: list[int] | None = None
 ```
 
-**Pros:** cleanest port — response shape (roles, tool_calls,
-finish_reason) is preserved, compaction_events machinery unchanged.
-**Cons:** requires verifying / patching vLLM's chat-completion schema
-to accept this extra. If not supported natively, this becomes a small
-vLLM-side change (still much smaller than the full server-side padding
-plan).
+Pydantic `OpenAIBaseModel` already allows extras, but making this
+an explicit typed field gives us validation + an OpenAPI entry.
 
-### Option B: Route to `/v1/completions` instead of `/v1/chat/completions`
+### Change 2: bypass branch in `render_chat`
 
-The completions endpoint natively accepts `prompt` as a list of ints.
-We tokenize+pad client-side, send via `client.completions.create(...)`,
-then reconstruct the chat-shaped response envelope for verifiers.
+**File:** `vllm/entrypoints/serve/render/serving.py`
 
-**Pros:** no vLLM changes at all.
-**Cons:** loses `tool_calls` parsing (BALROG BabyAI uses the hermes
-tool-call parser — we'd have to replicate that parsing client-side).
-Response-shape adapter is non-trivial. Likely rules this out for BALROG
-in the short term.
+Current `render_chat` starts at line 177. Its contract:
+`(ChatCompletionRequest) -> (conversation, [engine_input]) | ErrorResponse`.
 
-### Option C: Send padded text (decode back to string) via `messages`
+Add a bypass at the top of the method — before any tokenizer /
+tool-parser work that assumes we're going to re-render. Sketch:
 
-Decode padded tokens → text → send as a single `user` message with the
-full rendered prompt. Relies on vLLM re-tokenizing the text deterministically.
+```python
+async def render_chat(
+    self,
+    request: ChatCompletionRequest,
+) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
+    # Fast path: caller supplied pre-tokenized prompt. Skip chat
+    # template application, but still surface `messages` as the
+    # `conversation` so downstream tool-call parsing / reasoning
+    # handlers have their metadata.
+    if request.prompt_token_ids is not None:
+        if not request.prompt_token_ids:
+            return self.create_error_response(
+                "prompt_token_ids is set but empty"
+            )
+        # Use request.messages directly as the ConversationMessage
+        # list. The openai message typed-dict is structurally a
+        # superset of ConversationMessage for our uses.
+        conversation = list(request.messages)  # type: ignore[arg-type]
+        engine_input = TokensPrompt(
+            prompt_token_ids=list(request.prompt_token_ids),
+        )
+        return conversation, [engine_input]
 
-**Pros:** zero server changes.
-**Cons:** filler tokens may not round-trip cleanly through `decode →
-encode` (esp. `<|endoftext|>` as filler). And we lose the role/tool
-structure in the request (vLLM won't apply chat template anyway since
-we'd be sending pre-rendered text, but also can't guarantee
-tokenization matches). Fragile. Not recommended.
+    # --- existing path below unchanged ---
+    tokenizer = self.renderer.tokenizer
+    ...
+```
 
-**Decision:** Default to Option A, with a fallback implementation of
-Option B for environments where the vLLM fork does not (yet) accept
-`prompt_token_ids` on chat completions. Confirm Option A viability as
-the first implementation step (a 5-minute scan of
-`vllm/entrypoints/openai/protocol.py` and `serving_chat.py`).
+**Add import** at top of file:
+```python
+from vllm.inputs import TokensPrompt
+```
+(it may already be imported transitively — check before adding.)
 
-## Carrying padded ids through to the trainer
+### Change 3: downstream input-length / truncation checks
 
-vLLM already echoes the resolved `prompt_token_ids` back on the
-`ChatCompletion` object (under `choices[0].prompt_token_ids` or in an
-extra field, depending on version). We piggyback on the existing
-monkey-patch:
+**File:** `vllm/entrypoints/serve/render/serving.py` (around line
+145-151 in `render_chat_request`).
 
-1. `patched_get_response` (new) attaches the padded ids it generated
-   locally to the response it returns.
-2. `patched_from_native` (existing) reads that field and stashes it on
-   the verifiers response in `extras`.
-3. `patched_add_model_response` (existing) copies from the response
-   into the trajectory step's extras.
-4. `orchestrator/trajectories.py` reads step extras and writes
-   `TrainingSample.prompt_token_ids` (first-step only).
+`extract_prompt_components` and `extract_prompt_len` already handle
+both `TokensPrompt` and `TextPrompt` shapes — no change expected.
+Verify by running the existing pytest for chat completions with
+token-only prompts (`tests/entrypoints/openai/...`).
 
-The compaction_events pipeline is unchanged — pads and events travel
-together on the same response.
+### Change 4: test
 
-## Validation
+**File:** `vllm/tests/entrypoints/openai/test_chat_prompt_token_ids.py`
+(new)
 
-### Phase 1 (inference only)
-- Re-run `experiments/debug_balrog/compaction_test.ipynb` pointed at
-  the OpenAI-compatible server rather than the local `LLM` instance,
-  with `pad_messages_to_block=True`. The server logs should show
-  `evict=[336,688)` / `evict=[336,608)` etc. — the same block-exact
-  boundaries the notebook's local path already produces.
-- Confirm assistant output quality is indistinguishable from the
-  notebook's local-LLM padded run (no `"I new observation"` fragments,
-  no `"TheThe"`, etc.).
+One test case: POST `/v1/chat/completions` with `messages=[{role:
+system, content: "s"}]` plus `prompt_token_ids=[1,2,3,4,5]`. Assert
+the response's echoed `prompt_token_ids` is `[1,2,3,4,5]` (not the
+result of applying the chat template to `messages`). No model run
+needed — can mock at the `render_chat` boundary.
 
-### Phase 2 (end-to-end RL)
-- 5-step RL smoke on `experiments/debug_balrog/rl.toml` with
-  `pad_messages_to_block=True` + `compaction_max_turns=4`,
-  `compaction_eviction_turn_stride=2`. Mismatch KL must stay at kernel
-  floor (~1e-3). This is the direct analogue of the current failing
-  KL=1.27 case once Bug 2's auto-detect is fixed OR once padding
-  eliminates the need for auto-detect entirely (see below).
-- Logging hook: per-batch, count positions where `is_padding` is true
-  and assert loss contribution on those positions is exactly 0.
+### Total vLLM diff: ~40 lines across 3 files (2 source + 1 test).
 
-## Interaction with Bug 2 (`explanation_bug_2_*.md`)
+## Changes — kv-eviction integration layer
 
-Bug 2 is the `prompt_aligned_len` mismatch between trainer (400) and
-vLLM (368) in protected-prefix auto-detect mode. The root cause is that
-vLLM's eviction starts at the block-aligned auto-detected system-prompt
-boundary, but the trainer's fallback computes a different block
-boundary from the turn-0 prompt length.
+### Change 5: `src/kv_eviction/padding.py` (new)
 
-Padding eliminates this bug by construction: with
-`pad_messages_to_block=True`, every `<|im_end|>` (including the end of
-the system prompt) lands on a block boundary. The trainer's
-`ceil(mb_prompt_len / 16) * 16` formula and vLLM's
-`ceil(effective_prompt / 16) * 16` formula both return the same
-physical slot, because after padding `mb_prompt_len ≡ effective_prompt
-(mod block_size)` — they differ only by whole blocks of filler that
-both sides see identically.
+Ports `_render_padded` + `_filler_token_id` from
+`experiments/debug_balrog/compaction_test.ipynb` into a reusable
+module. Pure functions, no side effects. API:
 
-So Phase 2 of this plan is a **harder but structurally cleaner** fix
-for Bug 2 than adding `eviction_start` to `CompactionEvent`. If we ship
-padding, the Bug 2 wire-format change becomes optional (nice-to-have
-for defense-in-depth; not required for correctness).
+```python
+def render_padded_prompt(
+    tokenizer,
+    messages: list[dict],
+    tools: list[dict] | None,
+    block_size: int,
+    filler_token_id: int,
+    im_end_token_id: int,
+    *,
+    add_generation_prompt: bool = True,
+) -> tuple[list[int], list[int], list[int]]:
+    """
+    Returns (raw_ids, padded_ids, per_im_end_pads).
+    - raw_ids:     tokenizer.apply_chat_template output
+    - padded_ids:  filler tokens inserted so each <|im_end|> lands
+                   at the LAST slot of a block_size-sized block
+    - per_im_end_pads: pad count inserted before each <|im_end|>,
+                   in order of appearance. For debugging / trainer
+                   mask reconstruction.
+    """
 
-## Open decisions (flag before implementing)
+def resolve_filler_token_id(tokenizer, override: int | None) -> int:
+    """override -> tokenizer.pad_token_id -> encode(' ')[-1] -> endoftext."""
+```
 
-1. **Option A viability.** Does vLLM's
-   `ChatCompletionRequest` accept `prompt_token_ids` as an extra? If
-   not, is the small server-side patch to allow it acceptable, or do
-   we commit to Option B (completions endpoint + hermes tool-call
-   reparsing) instead? This determines whether the patch is truly
-   client-side-only.
-2. **Where to read `block_size` on the orchestrator side.** Currently
-   `inference.vllm_extra.block_size` is server-owned. Options:
-   duplicate it as `orchestrator.compaction.block_size` (explicit,
-   risks drift), or plumb it from the `inference` config section.
-   Recommend: add a cross-validator in `trainer/rl/config.py` that
-   asserts the three copies (orchestrator, trainer, inference) agree.
-3. **Filler token choice.** Notebook uses `tokenizer.pad_token_id`
-   (Qwen3 → 151643 = `<|endoftext|>`). That works for inference (model
-   conditions on it harmlessly), but the trainer-side loss mask has to
-   distinguish "real `<|endoftext|>` in the data" from "filler" — they
-   share the id. Alternatives:
-   - Use a dedicated unused token id (requires probing the tokenizer
-     for a safe one).
-   - Rely on the assumption that `<|endoftext|>` never appears inside
-     a real turn (true for BALROG chat traffic, probably true in
-     general for chat models).
-   - Plumb a per-sample `is_padding` mask through the wire instead of
-     recomputing it from token id (cleaner but a wire-format change).
-4. **Streaming vs non-streaming.** Verifiers uses non-streaming
-   completions by default. Confirm no streaming path exists for the
-   BALROG pipeline before committing to a non-streaming-only patch.
-5. **Prefix caching.** Padding is deterministic given
-   `(messages, tools, block_size, filler_id)`, so APC hashes are
-   stable. Unit-test this — a 2-request smoke with identical prompts
-   must hit the cache.
+### Change 6: `src/kv_eviction/env.py` — third monkey-patch
+
+Mirrors the existing patches at `env.py:249-309`. Wraps
+`OpenAIChatCompletionsClient.get_response` so that when the
+orchestrator has enabled padding, the wrapper:
+
+1. Builds `padded_ids` via `render_padded_prompt`.
+2. Calls the original `get_response` with an extra kwarg
+   `extra_body={"prompt_token_ids": padded_ids}` merged into the
+   underlying `client.chat.completions.create` call.
+3. Stashes `padded_ids` on the returned OpenAI `ChatCompletion`
+   object as an attribute (pydantic `extra="allow"` supports this),
+   so patch #1 (`from_native_response`) can read it.
+4. Extends patch #1 (`patched_from_native`): alongside
+   `compaction_events`, also forward `prompt_token_ids` onto the
+   verifiers `Response` extras.
+5. Extends patch #2 (`patched_add_model_response`): alongside
+   `attach_compaction_events_from_response`, also attach
+   `prompt_token_ids` to the trajectory step's extras.
+
+Sketch of the new third patch:
+
+```python
+base_client_cls = _vf_client.OpenAIChatCompletionsClient
+orig_get_response = base_client_cls.get_response
+if not getattr(orig_get_response, "__kv_eviction_padding_patched__", False):
+    async def patched_get_response(self, *args, **kwargs):
+        cfg = _padding_config()  # module-level, set by orchestrator at startup
+        if cfg is None or not cfg.enabled:
+            return await orig_get_response(self, *args, **kwargs)
+
+        # Verifiers calls get_response(prompt=messages, tools=tools, ...).
+        messages = kwargs.get("prompt") or (args[0] if args else None)
+        tools = kwargs.get("tools")
+        padded = render_padded_prompt(
+            tokenizer=cfg.tokenizer,
+            messages=messages,
+            tools=tools,
+            block_size=cfg.block_size,
+            filler_token_id=cfg.filler_token_id,
+            im_end_token_id=cfg.im_end_token_id,
+        )[1]
+
+        # Thread into the underlying openai client.chat.completions.create.
+        # Verifiers' get_response forwards **kwargs to create(), so we can
+        # piggyback extra_body through there.
+        extra_body = kwargs.pop("extra_body", {}) or {}
+        extra_body["prompt_token_ids"] = padded
+        kwargs["extra_body"] = extra_body
+
+        response = await orig_get_response(self, *args, **kwargs)
+        # Stash padded ids for the from_native patch to forward.
+        try:
+            setattr(response, "prompt_token_ids", padded)
+        except Exception:
+            if hasattr(response, "model_extra"):
+                if response.model_extra is None:
+                    response.__pydantic_extra__ = {}
+                response.model_extra["prompt_token_ids"] = padded
+        return response
+
+    patched_get_response.__kv_eviction_padding_patched__ = True
+    base_client_cls.get_response = patched_get_response
+```
+
+**Hook point (Q1 resolved):** Wrap the underlying
+`AsyncOpenAI.chat.completions.create` method directly rather than
+verifiers' `get_response`. This is one level deeper but bypasses
+verifiers' `normalize_sampling_args` filtering entirely and means
+we don't need to patch verifiers at all.
+
+Concretely: at orchestrator startup, after the verifiers env is
+built, walk each registered `OpenAIChatCompletionsClient`'s
+`.client` attribute (an `AsyncOpenAI`) and wrap
+`client.chat.completions.create` in-place with a closure that:
+1. Reads `messages` and `tools` from the kwargs.
+2. Renders padded ids via `render_padded_prompt`.
+3. Merges `{"prompt_token_ids": padded}` into `extra_body` (kwarg
+   on `AsyncOpenAI`'s `create`, officially supported).
+4. Calls the original `create`.
+5. Attaches `padded` to the response object before returning.
+
+This keeps the wrapper self-contained on the AsyncOpenAI client and
+leaves all existing verifiers patches (Patches #1 and #2 in
+`env.py`) untouched.
+
+### Change 7: `src/kv_eviction/env.py` — padding-config registration
+
+Add a small module-level function the orchestrator calls once at
+startup:
+
+```python
+def configure_message_padding(
+    *,
+    enabled: bool,
+    tokenizer,
+    block_size: int,
+    filler_token_id: int,
+    im_end_token_id: int,
+) -> None:
+    """Called once by the orchestrator before rollouts start. Stores
+    the config in a module-level variable read by the patched
+    get_response wrapper. No-op when enabled=False."""
+```
+
+This keeps the orchestrator → monkey-patch coupling explicit (not
+env-var based).
+
+## Changes — prime-rl
+
+### Change 8: `prime-rl/src/prime_rl/orchestrator/config.py`
+
+Add to the orchestrator config schema:
+
+```python
+class CompactionPaddingConfig(BaseModel):
+    enabled: bool = False
+    block_size: int = 16           # must match inference.vllm_extra.block_size
+    filler_token_id: int | None = None  # None = auto via tokenizer.pad_token_id
+    im_end_token_id: int | None = None  # None = auto from tokenizer
+
+class OrchestratorConfig(BaseModel):
+    ...
+    compaction_padding: CompactionPaddingConfig = CompactionPaddingConfig()
+```
+
+Cross-validator (in the top-level RLConfig): when
+`orchestrator.compaction_padding.enabled is True`,
+require `trainer.compaction.message_padding_aware is True` AND
+require `inference.vllm_extra.block_size == orchestrator.compaction_padding.block_size`.
+
+### Change 9: `prime-rl/src/prime_rl/orchestrator/orchestrator.py` (startup)
+
+After the orchestrator loads its tokenizer and before kicking off
+rollouts, call `kv_eviction.env.configure_message_padding(...)`
+with the resolved tokenizer + config values.
+
+### Change 10: `prime-rl/src/prime_rl/orchestrator/trajectories.py`
+
+In the rollout-to-TrainingSample conversion path (near the existing
+`compaction_events_from_step_extras` call), add:
+
+```python
+from kv_eviction.env import padded_ids_from_step_extras
+
+padded_ids = padded_ids_from_step_extras(first_step.extras)
+if padded_ids is not None:
+    sample.prompt_token_ids = padded_ids
+    # Do NOT re-tokenize from messages — would lose the padding.
+```
+
+Requires adding the read-side helper `padded_ids_from_step_extras`
+to `src/kv_eviction/env.py` (mirrors the existing
+`compaction_events_from_step_extras`).
+
+### Change 11: `prime-rl/src/prime_rl/trainer/rl/config.py`
+
+```python
+class CompactionConfig(BaseModel):
+    ...
+    message_padding_aware: bool = False
+    # When True, positions where input_ids == filler_token_id are
+    # masked out of the loss. filler_token_id is read from the
+    # orchestrator's compaction_padding section via a cross-config
+    # validator (must match).
+    filler_token_id: int | None = None
+```
+
+### Change 12: `prime-rl/src/prime_rl/trainer/rl/data.py`
+
+In `_micro_batch_to_tensor` (where `loss_mask` is built for the
+batch): when `config.compaction.message_padding_aware is True`,
+AND the existing loss mask with `(input_ids != filler_token_id)`
+restricted to prompt positions. Completion positions are never
+masked — filler collisions there are genuine model output and must
+count.
+
+### Change 13: no changes to `src/kv_eviction/segmented_forward.py`
+
+Eviction-path math is already correct once the prompt length is
+block-aligned: `prompt_aligned_len = ceil(mb_prompt_len / bs) * bs`
+equals `mb_prompt_len` when padding is on, which equals what vLLM
+used. Bug 2 (`explanation_bug_2_*.md`) is resolved by construction.
+
+Add one defensive assertion: if compaction events are present and
+padding is on, assert `mb_prompt_len % bs == 0`. Fail loud if not
+(indicates config drift between orchestrator and trainer).
+
+## Validation plan
+
+### Gate 1 — vLLM unit test
+`pytest vllm/tests/entrypoints/openai/test_chat_prompt_token_ids.py`
+passes. New branch in `render_chat` returns `TokensPrompt` when
+`prompt_token_ids` is set, and the echoed response carries the same
+ids.
+
+### Gate 2 — notebook-to-server parity
+Rerun the loop in `compaction_test.ipynb` against the OpenAI-
+compatible server (not the local `LLM`). With padding on, the server
+logs' `evict=[…,…)` ranges should be identical to the notebook's
+local-LLM logs on a fixed seed. Any divergence means the
+tokenize-server roundtrip isn't byte-exact.
+
+### Gate 3 — inference smoke
+Run `experiments/debug_balrog/rl.toml` with
+`orchestrator.compaction_padding.enabled = True`,
+`trainer.compaction.message_padding_aware = True`, and
+`inference.vllm_extra.compaction_max_turns = 4`. Inference-only (no
+gradient step). Assistant output quality must match the notebook's
+padded run (no `"I new observation"` fragments, no `"TheThe"`).
+
+### Gate 4 — end-to-end RL
+Same config, 5-step RL. Mismatch KL must stay at kernel floor
+(~0.001). Loss-curve logging hook: per-batch, count positions where
+`is_padding` mask fires; assert `loss.masked_select(is_padding).sum()
+== 0`. This is the gate that confirms the whole pipeline — if Bug 2
+is fixed by padding, KL should drop from 1.27 to ~0.001 immediately.
+
+### Gate 5 — backward compat
+Same config but `compaction_padding.enabled = False`. Bit-for-bit
+identical behavior to the pre-patch state. Run the existing
+compaction_rgmix smoke and diff wandb traces.
+
+## Interaction with Bug 2
+
+Bug 2 (`explanation_bug_2_prompt_aligned_len_mismatch_with_protected_prefix.md`)
+is the `prompt_aligned_len` mismatch between trainer (400) and vLLM
+(368) in protected-prefix auto-detect mode — 32-token positional
+offset → KL 1.27.
+
+With padding on:
+- `<|im_end|>` after the system prompt lands on a block boundary.
+- vLLM's auto-detect: `boundary = pos(sys_<|im_end|>) + 1 = 16*k`
+  (already block-aligned), so `evict_start = 16*k`.
+- Trainer's fallback: `ceil(mb_prompt_len / 16) * 16`. With padding,
+  `mb_prompt_len = 16 * m` exactly (every message ends on a
+  boundary), so the `ceil(...)` is a no-op and
+  `prompt_aligned_len = 16 * m`.
+
+Both compute the same physical boundary. **Bug 2 cannot manifest
+when padding is on**, regardless of whether we also ship the
+`eviction_start` wire-format fix.
+
+## Decision record
+
+### Why Option A (vLLM schema extension) and not B or C
+
+| Option | Transport | vLLM change | Client change | Tool-call parsing |
+|---|---|---|---|---|
+| **A (picked)** | `extra_body={"prompt_token_ids": …}` on `/v1/chat/completions` | ~40 LOC, 1 new optional field + 1 bypass branch | monkey-patch only | preserved (conversation still built from `messages`) |
+| B | route to `/v1/completions` with `prompt=…` | none | replicate hermes tool-call parser in client | **must re-implement** client-side |
+| C | decode padded tokens → text → `messages` | none | lossy roundtrip | preserved but fragile |
+
+B's cost (re-implementing hermes tool-call parsing for BALROG) is
+larger than A's total cost. C's fragility (`<|endoftext|>` as filler
+may not roundtrip cleanly through detokenize → tokenize) rules it
+out.
+
+### Why filler = `tokenizer.pad_token_id` (Qwen3: `<|endoftext|>` = 151643)
+
+- The notebook prototype validated it produces clean eviction on
+  BALROG BabyAI.
+- It's not a chat-structural token (unlike `<|im_end|>` /
+  `<|im_start|>`), so chat-template round-trip is unaffected.
+- Open risk: if real `<|endoftext|>` appears in data, masking-by-id
+  would incorrectly mask it. See Q3.
+
+## Resolved design questions
+
+**Q1 — monkey-patch hook point.** Wrap the underlying
+`AsyncOpenAI` client's `chat.completions.create` method directly
+(option (a) in the earlier draft). Verifiers' `get_response` wraps
+this but does not forward arbitrary kwargs; patching one level
+deeper is bulletproof. No touching of verifiers code.
+
+**Q2 — `block_size` source of truth.** Plumb `block_size` explicitly
+in the prime-rl config. It must be identical across
+`inference.vllm_extra.block_size`,
+`orchestrator.compaction_padding.block_size`, and
+`trainer.compaction.block_size`; add a cross-config validator that
+fails loud on drift. (Three declarations but single asserted value.)
+
+**Q3 — filler token identity.** Use `tokenizer.pad_token_id`
+(= Qwen3 `<|endoftext|>` = 151643) and mask by id in the trainer.
+Collision risk accepted: real `<|endoftext|>` in chat data is
+vanishingly rare, and the trainer mask only applies to prompt
+positions (filler is never in completion). No wire-format change.
+
+**Q4 — padding the trailing assistant-generation prompt.** NOT
+padded. The trailing `<|im_start|>assistant\n` belongs to an
+in-progress turn, which by the turn-mode eviction contract can never
+be evicted (turn-mode only considers *completed* turns with both
+`<|im_end|>`s committed). When this assistant turn later becomes a
+prior turn — because a follow-up user message is appended —
+`_render_padded` runs again on the full message list and block-aligns
+its now-closed `<|im_end|>` before it ever becomes evictable.
+Invariant: at the moment any turn becomes eligible for eviction, its
+`<|im_end|>` is already block-aligned.
+
+**Q5 — upstream vs fork.** Land on the `HyperPotatoNeo/vllm` fork,
+branch `eviction-turn-based`. Not upstreaming. Upstream's AGENTS.md
+duplicate-work / human-accountability rules do not apply.
+
+**Q6 — notebook regression test.** Skip notebook migration. Validate
+directly against real prime-rl rollouts (Gates 3–5 below).
 
 ## Order of operations
 
-1. Confirm **Option A** (scan vLLM's chat completion protocol; 5 min).
-2. Implement `src/kv_eviction/padding.py` as a straight port of
-   `_render_padded` + `_filler_token_id` from the notebook.
-3. Add the third monkey-patch to `env.py` behind a default-off flag.
-4. Validate Phase 1 against the notebook (server-side vs. local
-   generate should produce byte-identical padded prompts and
-   identical compaction event streams on a fixed seed).
-5. Land Phase 2 (trainer loss mask + config). Gate the RL smoke on
-   Mismatch KL < 0.005.
-6. Once Phase 2 is green, deprecate the server-side plan in
-   `block_aligned_message_padding.md` (or mark superseded).
+1. Land the vLLM patch (Changes 1–4). Pytest gate 1 passes.
+2. Land `src/kv_eviction/padding.py` (Change 5). Unit-test against
+   the notebook's `_render_padded` output for a fixed fixture.
+3. Land the orchestrator-side monkey-patch (Changes 6–7, resolving
+   Q1). Gate 2 passes (notebook-to-server parity).
+4. Land the prime-rl config + trajectory plumbing (Changes 8–10).
+   Gate 3 passes (inference smoke with padding on).
+5. Land the trainer loss mask (Changes 11–13). Gate 4 passes
+   (KL drops to kernel floor in a padded RL smoke).
+6. Gate 5 (backward compat with padding off).
+7. Deprecate `plans/block_aligned_message_padding.md` (server-side
+   design) — mark as superseded by this plan.
 
-## Files touched (summary)
+## Files touched — summary
 
-New:
+**New:**
 - `src/kv_eviction/padding.py`
-- `plans/prime_rl_message_padding_patch.md` (this file)
+- `vllm/tests/entrypoints/openai/test_chat_prompt_token_ids.py`
 
-Modified:
-- `src/kv_eviction/env.py` — new patch #3 wrapping `get_response`,
-  extend patch #1 to forward padded ids.
-- `prime-rl/src/prime_rl/orchestrator/config.py` — new knobs.
-- `prime-rl/src/prime_rl/orchestrator/trajectories.py` — carry padded
-  ids into `TrainingSample`.
-- `prime-rl/src/prime_rl/trainer/rl/config.py` — `compaction.message_padding_aware`,
-  `compaction.filler_token_id`; cross-validation.
-- `prime-rl/src/prime_rl/trainer/rl/data.py` — loss-mask AND with
+**Modified — vLLM fork:**
+- `vllm/vllm/entrypoints/openai/chat_completion/protocol.py` — add
+  `prompt_token_ids` field to `ChatCompletionRequest`.
+- `vllm/vllm/entrypoints/serve/render/serving.py::render_chat` —
+  add bypass branch when `request.prompt_token_ids is not None`.
+
+**Modified — kv-eviction integration:**
+- `src/kv_eviction/env.py` — third monkey-patch wrapping chat
+  completions; `configure_message_padding` helper;
+  `padded_ids_from_step_extras` helper. Extend existing patches 1 &
+  2 to forward `prompt_token_ids` alongside `compaction_events`.
+
+**Modified — prime-rl:**
+- `src/prime_rl/orchestrator/config.py` — `CompactionPaddingConfig`.
+- `src/prime_rl/orchestrator/orchestrator.py` — call
+  `configure_message_padding` at startup.
+- `src/prime_rl/orchestrator/trajectories.py` — carry padded ids
+  into `TrainingSample`.
+- `src/prime_rl/trainer/rl/config.py` — `message_padding_aware`,
+  `filler_token_id`, cross-validator.
+- `src/prime_rl/trainer/rl/data.py` — loss-mask AND with
   `is_padding`.
 
-Not modified (vs. the server-side plan's scope):
-- vLLM chat template / serving code **unless** Option A needs a
-  one-liner to whitelist `prompt_token_ids` on `ChatCompletionRequest`.
-- `src/kv_eviction/segmented_forward.py` — no eviction-path changes
-  (padding only shifts where the boundary lands, not how eviction is
-  computed).
-- `vllm/v1/core/compaction/*` — untouched.
+**Not modified:**
+- `src/kv_eviction/segmented_forward.py` — eviction math already
+  correct under padded prompts; add one defensive assertion only.
+- `vllm/v1/core/compaction/*` — untouched. Turn-mode eviction
+  already block-aligned; padding just makes it exact.
+- `CompactionEvent` wire format — unchanged.
+
+## Total scope
+
+- vLLM fork: ~50 LOC across 3 files (2 source + 1 test).
+- kv-eviction: ~150 LOC across 2 files (new padding.py + env.py
+  extensions).
+- prime-rl: ~100 LOC across 5 files (config, orchestrator
+  plumbing, trainer loss mask).
+
+Single coherent feature, gated on a default-off flag, resolves Bug 2
+as a side effect.

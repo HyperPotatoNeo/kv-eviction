@@ -4,9 +4,9 @@
 # Compaction evicts old conversation turns while protecting the system
 # prompt via protected_prefix_tokens. Small batch for single-node debug.
 
-max_steps = 20
+max_steps = 3
 seq_len = 16384
-output_dir = "/tmp/kv-eviction/debug_balrog_20260412g"
+output_dir = "/tmp/kv-eviction/debug_balrog_padding_smoke"
 clean_output_dir = true
 
 [deployment]
@@ -51,6 +51,16 @@ batch_size = 8
 rollouts_per_example = 2
 oversampling_factor = 1.0
 
+[orchestrator.compaction_padding]
+# Block-aligned message padding: orchestrator pads each chat message so
+# the closing <|im_end|> lands on a PagedAttention block boundary. Mirrors
+# the notebook's PAD=True path (experiments/debug_balrog/compaction_test.ipynb).
+enabled = true
+block_size = 16
+# Debug-only: decode each compaction event's evicted token range and log a
+# framed `| ... |` block. Mirrors out_turn.txt. Off in production.
+log_evicted_text = true
+
 [orchestrator.client]
 base_url = ["http://localhost:8000/v1"]
 
@@ -86,5 +96,15 @@ compaction_window_size = 1024
 compaction_stride = 256
 block_size = 16
 compaction_protected_prefix_tokens = -1
+# Turn-based eviction: drop whole completed user+assistant turns instead of
+# raw token windows. Mirrors the notebook's loader cell.
+compaction_max_turns = 4
+compaction_eviction_turn_stride = 2
+# Match orchestrator.compaction_padding.enabled=true: each <|im_end|> is
+# padded so the NEXT message's first token lands on a block boundary. The
+# scheduler's turn-mode planner then snaps evict_end UP (align_up) to
+# include the padding of the last evicted turn, eliminating the orphan
+# tail that align_down leaves behind.
+compaction_assume_aligned_turn_boundaries = true
 async_scheduling = false
 enable_auto_tool_choice = true
