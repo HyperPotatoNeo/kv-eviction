@@ -1,0 +1,64 @@
+# Local 2-GPU smoke: compaction RL on a single node (1 train GPU + 1 infer GPU).
+#
+# Inference is launched separately via the inference.toml on GPU 0.
+# Trainer runs on GPU 1.
+#
+# Uses math-env (loads from HuggingFace, no local dataset needed) instead
+# of rg-mix-env. Batch size is small (8) to fit single-GPU training.
+
+max_steps = 3
+seq_len = 8192
+output_dir = "outputs/local_2gpu_smoke"
+
+[deployment]
+type = "single_node"
+gpus_per_node = 2
+num_train_gpus = 1
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "kv-eviction-smokes"
+name = "local-2gpu-compaction"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 2048
+stride = 512
+block_size = 16
+bptt_segments = 1
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 8
+rollouts_per_example = 2
+oversampling_factor = 1.0
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 4096
+# Rollouts can be up to 4096 tokens; compaction window is 2048 so the
+# segmented forward processes ~2048-token windows without AC, fitting
+# comfortably in 80 GiB.
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "math-env"
+args = { min_avg_reward = 0.0 }

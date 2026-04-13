@@ -1,0 +1,49 @@
+# BabyAI baseline: multi-turn RL with no compaction.
+#
+# Uses the BALROG BabyAI environment (MiniGrid grid-world tasks).
+# The LLM generates actions via tool calls; the env responds with
+# text observations. No KV cache compaction during inference or training.
+
+max_steps = 100
+seq_len = 8192
+output_dir = "/tmp/kv-eviction/babyai_baseline"
+clean_output_dir = true
+
+[deployment]
+type = "single_node"
+gpus_per_node = 4
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "auto"
+attn = "flash_attention_2"
+
+# No [trainer.compaction] -- baseline without compaction.
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 8
+oversampling_factor = 1.0
+
+[orchestrator.train.sampling]
+max_completion_tokens = 6000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "balrog-bench"
+args = { environments = ["babyai"], max_text_history = 16 }

@@ -1,0 +1,90 @@
+# debug_balrog: BabyAI multi-turn RL with KV cache compaction.
+#
+# Uses the BALROG BabyAI environment (MiniGrid grid-world tasks).
+# Compaction evicts old conversation turns while protecting the system
+# prompt via protected_prefix_tokens. Small batch for single-node debug.
+
+max_steps = 20
+seq_len = 16384
+output_dir = "/tmp/kv-eviction/debug_balrog_20260412g"
+clean_output_dir = true
+
+[deployment]
+type = "single_node"
+gpus_per_node = 2
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "debug-balrog-compaction"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 1024
+stride = 256
+block_size = 16
+bptt_segments = 1
+# -1 = auto-detect: protect up to the end of the first system message
+# by scanning for the first eos token in the prompt.
+protected_prefix_tokens = -1
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 8
+rollouts_per_example = 2
+oversampling_factor = 1.0
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 6000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "balrog-bench"
+args = { environments = ["babyai"], max_text_history = 16, max_turns = 30 }
+
+[inference]
+seed = 0
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 8192
+enforce_eager = true
+tool_call_parser = "hermes"
+
+[inference.parallel]
+dp = 1
+tp = 1
+
+[inference.vllm_extra]
+compaction_window_size = 1024
+compaction_stride = 256
+block_size = 16
+compaction_protected_prefix_tokens = -1
+async_scheduling = false
+enable_auto_tool_choice = true

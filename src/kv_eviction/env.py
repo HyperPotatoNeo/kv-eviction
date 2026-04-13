@@ -22,11 +22,14 @@ care which base class it sits alongside, as long as the MRO places it
 before the verifiers env so its `add_model_response` runs first.
 """
 
+import logging
 from typing import Any
 
 from verifiers.types import Messages, Response as ModelResponse, State, TrajectoryStep
 
 from kv_eviction.types import CompactionEventWire
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_compaction_event_dicts(
@@ -74,6 +77,7 @@ def _extract_compaction_event_dicts(
                         ),
                         "tokens_evicted": int(e["tokens_evicted"]),
                         "position_offset_after": int(e["position_offset_after"]),
+                        "num_prompt_tokens": int(e.get("num_prompt_tokens", 0)),
                     }
                 )
             except (KeyError, TypeError, ValueError):
@@ -85,6 +89,7 @@ def _extract_compaction_event_dicts(
                     "num_output_tokens_at_compaction": e.num_output_tokens_at_compaction,
                     "tokens_evicted": e.tokens_evicted,
                     "position_offset_after": e.position_offset_after,
+                    "num_prompt_tokens": e.num_prompt_tokens,
                 }
             )
         else:
@@ -100,6 +105,9 @@ def _extract_compaction_event_dicts(
                         "tokens_evicted": int(getattr(e, "tokens_evicted")),
                         "position_offset_after": int(
                             getattr(e, "position_offset_after")
+                        ),
+                        "num_prompt_tokens": int(
+                            getattr(e, "num_prompt_tokens", 0)
                         ),
                     }
                 )
@@ -203,6 +211,41 @@ class CompactionEnvMixin:
 # silently no-op so unrelated kv_eviction consumers aren't affected.
 
 
+_MAX_SEQ_LEN_WARNING_EMITTED = False
+
+
+def _disable_per_turn_truncation(env: Any) -> None:
+    """Disable verifiers' per-turn max_seq_len truncation for compaction runs.
+
+    verifiers' parse_response_tokens truncates completion_ids when
+    prompt_len + completion_len > max_seq_len, but does NOT truncate the
+    compaction events (which are in response metadata, not the token
+    lists). This puts completion_ids and compaction event coordinates in
+    different spaces, causing a non-monotonic boundary assertion in
+    interleave_rollout.
+
+    With compaction active, per-turn truncation is unnecessary: the
+    trainer's prepare_sample (batch.py) handles final seq_len clamping
+    with proper compaction event filtering via _clamp_compaction_events.
+
+    We null out max_seq_len on the env instance so parse_response_tokens
+    skips the truncation and completion_ids stays aligned with the events.
+    """
+    global _MAX_SEQ_LEN_WARNING_EMITTED
+    max_seq_len = getattr(env, "max_seq_len", None)
+    if max_seq_len is not None:
+        if not _MAX_SEQ_LEN_WARNING_EMITTED:
+            logger.warning(
+                "kv_eviction: compaction hooks active — ignoring env.max_seq_len=%d "
+                "for per-turn token truncation. Compaction events require untruncated "
+                "completion_ids to maintain coordinate alignment. Final seq_len "
+                "clamping is handled by the trainer's prepare_sample.",
+                max_seq_len,
+            )
+            _MAX_SEQ_LEN_WARNING_EMITTED = True
+        env.max_seq_len = None
+
+
 def _install_compaction_event_hooks() -> None:
     try:
         from verifiers.clients import openai_chat_completions_client as _vf_client
@@ -244,11 +287,16 @@ def _install_compaction_event_hooks() -> None:
         base_client_cls.from_native_response = patched_from_native  # type: ignore[assignment]
 
     # --- Patch 2: MultiTurnEnv.add_model_response ---
+    #
+    # Two responsibilities:
+    #   a) Attach compaction events from the response to the trajectory step.
+    #   b) Disable per-turn max_seq_len truncation (see _disable_per_turn_truncation).
     base_env_cls = _vf_mt.MultiTurnEnv
     orig_add_model_response = base_env_cls.add_model_response
     if not getattr(orig_add_model_response, "__kv_eviction_patched__", False):
 
         async def patched_add_model_response(self, state, prompt_messages, response):  # type: ignore[no-untyped-def]
+            _disable_per_turn_truncation(self)
             await orig_add_model_response(self, state, prompt_messages, response)
             trajectory = state.get("trajectory", [])
             if trajectory:
@@ -291,15 +339,17 @@ def compaction_events_from_step_extras(
                     ),
                     tokens_evicted=int(e["tokens_evicted"]),
                     position_offset_after=int(e["position_offset_after"]),
+                    num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
                 )
             )
         elif isinstance(e, (list, tuple)) and len(e) >= 3:
-            # array_like msgspec form: [n, tokens_evicted, position_offset_after]
+            # array_like msgspec form: [n, tokens_evicted, position_offset_after, num_prompt_tokens]
             out.append(
                 CompactionEventWire(
                     num_output_tokens_at_compaction=int(e[0]),
                     tokens_evicted=int(e[1]),
                     position_offset_after=int(e[2]),
+                    num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
                 )
             )
     return out or None

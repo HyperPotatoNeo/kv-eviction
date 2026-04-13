@@ -11,7 +11,7 @@
 
 max_steps = 500
 seq_len = 16384
-output_dir = "outputs/compaction_rgmix"
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/new_runs/rg_mix"
 clean_output_dir = true
 
 # Shared checkpoint block — auto-propagates to trainer.ckpt and

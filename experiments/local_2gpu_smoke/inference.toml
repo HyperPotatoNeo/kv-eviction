@@ -1,0 +1,28 @@
+# Local 2-GPU smoke: inference side (GPU 0, DP=1, TP=1).
+#
+# Must mirror rl.toml [trainer.compaction] exactly:
+#   window_size -> vllm_extra.compaction_window_size
+#   stride      -> vllm_extra.compaction_stride
+#   block_size  -> vllm_extra.block_size
+
+seed = 0
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B"
+max_model_len = 16384
+enforce_eager = true
+
+[parallel]
+dp = 1
+tp = 1
+
+[vllm_extra]
+compaction_window_size = 2048
+compaction_stride = 512
+block_size = 16
+async_scheduling = false

@@ -322,6 +322,47 @@ automatically via the broadcast worker hook.
   at batch_size=64 on 4×A100-80GB, scales roughly linearly in
   seq_len, not batch size (each micro-batch is one sample).
 
+### Sequence-length truncation in compaction runs
+
+When compaction is active, two per-turn and per-sample truncation
+stages are disabled to keep completion token counts and compaction
+event coordinates in the same space:
+
+| Stage | Variable | Location | Compaction runs | Non-compaction runs |
+|-------|----------|----------|-----------------|---------------------|
+| Per-turn | `env.max_seq_len` | `kv_eviction/env.py` monkey-patch on `MultiTurnEnv.add_model_response` | Set to `None` — per-turn truncation skipped | Unchanged (verifiers truncates as normal) |
+| Final sample | `seq_len` | `prime-rl trainer/batch.py` `prepare_sample` | Skipped when `compaction_enabled=True` | Active — truncates sample + clamps events |
+
+**Why**: verifiers' `parse_response_tokens` truncates `completion_ids`
+when `prompt_len + completion_len > max_seq_len`, but does NOT truncate
+compaction events (which live in response metadata). This puts token
+counts and event coordinates in different spaces, causing a
+non-monotonic boundary assertion crash in `interleave_rollout`. The
+trainer-side `seq_len` truncation has the same issue unless
+`_clamp_compaction_events` is called, but skipping it entirely in
+compaction runs is cleaner: `segmented_forward` with `bptt_segments=1`
+processes one segment at a time, so peak memory is bounded by the
+largest segment (~prompt_len tokens), not total sequence length.
+
+**Scope**: both disables apply ONLY to multi-turn compaction envs.
+The `env.py` monkey-patch targets `MultiTurnEnv.add_model_response`
+specifically — `SingleTurnEnv` is never patched. The `prepare_sample`
+skip gates on `compaction_enabled=True`, which is set from the trainer
+config (`compaction.window_size > 0`).
+
+**Potential failure mode**: if `kv_eviction.env` is imported in a
+process that also runs non-compaction `MultiTurnEnv` instances, those
+envs will have `max_seq_len` set to `None` (the monkey-patch applies
+to the base class unconditionally at import time). This is harmless
+when Stage 2 (`seq_len`) is active, since the trainer-side truncation
+catches oversized samples. But if both stages are disabled (e.g.,
+`compaction_enabled=True` in the trainer config while some envs don't
+actually use compaction), non-compaction multi-turn samples will flow
+through untruncated, which can cause OOM in the standard forward path.
+**Fix**: ensure `compaction_enabled` is only set when ALL envs in the
+run are backed by a compaction-enabled vLLM server. Do not mix
+compaction and non-compaction multi-turn envs in the same process.
+
 ### Constraints to keep in mind
 
 - `[trainer.compaction]` in `rl.toml` MUST mirror the inference
