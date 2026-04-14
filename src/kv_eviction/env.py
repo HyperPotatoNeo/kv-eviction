@@ -80,6 +80,7 @@ def _extract_compaction_event_dicts(
                         "tokens_evicted": int(e["tokens_evicted"]),
                         "position_offset_after": int(e["position_offset_after"]),
                         "num_prompt_tokens": int(e.get("num_prompt_tokens", 0)),
+                        "evict_start": int(e.get("evict_start", 0)),
                     }
                 )
             except (KeyError, TypeError, ValueError):
@@ -92,6 +93,7 @@ def _extract_compaction_event_dicts(
                     "tokens_evicted": e.tokens_evicted,
                     "position_offset_after": e.position_offset_after,
                     "num_prompt_tokens": e.num_prompt_tokens,
+                    "evict_start": e.evict_start,
                 }
             )
         else:
@@ -111,6 +113,7 @@ def _extract_compaction_event_dicts(
                         "num_prompt_tokens": int(
                             getattr(e, "num_prompt_tokens", 0)
                         ),
+                        "evict_start": int(getattr(e, "evict_start", 0)),
                     }
                 )
             except (AttributeError, TypeError, ValueError):
@@ -649,16 +652,18 @@ def compaction_events_from_step_extras(
                     tokens_evicted=int(e["tokens_evicted"]),
                     position_offset_after=int(e["position_offset_after"]),
                     num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
+                    evict_start=int(e.get("evict_start", 0)),
                 )
             )
         elif isinstance(e, (list, tuple)) and len(e) >= 3:
-            # array_like msgspec form: [n, tokens_evicted, position_offset_after, num_prompt_tokens]
+            # array_like msgspec form: [n, tokens_evicted, position_offset_after, num_prompt_tokens, evict_start]
             out.append(
                 CompactionEventWire(
                     num_output_tokens_at_compaction=int(e[0]),
                     tokens_evicted=int(e[1]),
                     position_offset_after=int(e[2]),
                     num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
+                    evict_start=int(e[4]) if len(e) >= 5 else 0,
                 )
             )
     return out or None
