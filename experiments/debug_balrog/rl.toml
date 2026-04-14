@@ -50,6 +50,13 @@ max_norm = 1.0
 batch_size = 8
 rollouts_per_example = 2
 oversampling_factor = 1.0
+# TITO (token-in-token-out) bypasses openai-python's chat.completions.create,
+# which is where the block-aligned padding interceptor lives
+# (src/kv_eviction/env.py). Disable it so every turn's full padded conversation
+# flows through AsyncCompletions.create → extra_body.prompt_token_ids → vLLM
+# render_chat bypass. This mirrors the debug script's llm.generate(prompts=
+# [{"prompt_token_ids": padded}], ...) path exactly.
+use_token_client = false
 
 [orchestrator.compaction_padding]
 # Block-aligned message padding: orchestrator pads each chat message so
@@ -85,7 +92,6 @@ port = 8000
 name = "Qwen/Qwen3-4B-Instruct-2507"
 max_model_len = 8192
 enforce_eager = true
-tool_call_parser = "hermes"
 
 [inference.parallel]
 dp = 1
@@ -107,4 +113,9 @@ compaction_eviction_turn_stride = 2
 # tail that align_down leaves behind.
 compaction_assume_aligned_turn_boundaries = true
 async_scheduling = false
-enable_auto_tool_choice = true
+# Hermes parser disabled: we parse <tool_call> from raw text in env_response
+# (matches the debug script path exactly). Keeping tools in apply_chat_template
+# so the model sees the # Tools header, but not using vLLM's structured
+# tool_calls extraction.
+# enable_auto_tool_choice = true
+# tool_call_parser = "hermes"

@@ -84,9 +84,9 @@ os.environ.setdefault("VLLM_COMPACTION_DEBUG_TOKENS", "1")
 PAD = os.environ.get("PAD", "1") == "1"
 BLOCK_SIZE = 16
 PAD_FILLER_ID: int | None = None
-MAX_TURNS = int(os.environ.get("MAX_TURNS", "30"))
-TASK = os.environ.get("TASK", "BabyAI-MixedTrainLocal-v0/goto")
-SEED = int(os.environ.get("SEED", "1"))
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "20"))
+TASK = os.environ.get("TASK", "BabyAI-MixedTrainLocal-v0/putnext")
+SEED = int(os.environ.get("SEED", "0"))
 OUT_PATH = os.environ.get(
     "OUT_PATH",
     "/home/toolkit/kv-eviction/experiments/debug_balrog/out_turn_debug.txt",

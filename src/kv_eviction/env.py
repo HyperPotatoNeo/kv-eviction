@@ -469,12 +469,11 @@ def _install_message_padding_interceptor() -> None:
     async def patched_create(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         cfg = _padding_config
         if cfg is None or not cfg.enabled:
-            logger.info("[PAD-TRACE] interceptor fired: cfg_enabled=False")
             return await orig_create(self, *args, **kwargs)
 
         messages = kwargs.get("messages")
         tools = kwargs.get("tools")
-        logger.info(
+        logger.debug(
             "[PAD-TRACE] interceptor fired: messages_is_none=%s "
             "num_messages=%s has_tools=%s",
             messages is None,
@@ -515,7 +514,7 @@ def _install_message_padding_interceptor() -> None:
         extra_body["prompt_token_ids"] = padded
         kwargs["extra_body"] = extra_body
 
-        logger.info(
+        logger.debug(
             "[PAD-TRACE] padded: raw->padded len %d->%d fillers_inserted=%d",
             len(_raw),
             len(padded),
@@ -543,6 +542,58 @@ def _install_message_padding_interceptor() -> None:
 
 
 _install_message_padding_interceptor()
+
+
+def _autoconfigure_padding_from_env() -> None:
+    """Auto-enable block-aligned message padding from environment variables.
+
+    The orchestrator process sets these before spawning the verifiers env
+    server subprocess (which runs in a fresh `mp.spawn` interpreter and
+    thus won't inherit the orchestrator's `configure_message_padding(...)`
+    call). The subprocess imports `kv_eviction` via its entrypoint shim,
+    which triggers this function and re-configures padding from env vars.
+
+    Env var contract (all required when KV_EVICTION_PADDING_MODEL is set):
+      KV_EVICTION_PADDING_MODEL          — tokenizer name_or_path
+      KV_EVICTION_PADDING_BLOCK_SIZE     — int, must match inference/trainer
+      KV_EVICTION_PADDING_FILLER_ID      — int, already-resolved filler id
+      KV_EVICTION_PADDING_IM_END_ID      — int, already-resolved im_end id
+
+    No-ops if already configured (idempotent) or if env vars are absent.
+    """
+    import os as _os
+
+    global _padding_config
+    if _padding_config is not None and _padding_config.enabled:
+        return
+    model_name = _os.environ.get("KV_EVICTION_PADDING_MODEL")
+    if not model_name:
+        return
+    try:
+        block_size = int(_os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"])
+        filler_id = int(_os.environ["KV_EVICTION_PADDING_FILLER_ID"])
+        im_end_id = int(_os.environ["KV_EVICTION_PADDING_IM_END_ID"])
+    except (KeyError, ValueError) as e:
+        logger.warning(
+            "kv_eviction: KV_EVICTION_PADDING_MODEL set but other "
+            "KV_EVICTION_PADDING_* vars missing/invalid (%s); padding NOT "
+            "enabled in this process",
+            e,
+        )
+        return
+    from transformers import AutoTokenizer  # local import to keep env.py lean
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    configure_message_padding(
+        enabled=True,
+        tokenizer=tokenizer,
+        block_size=block_size,
+        filler_token_id=filler_id,
+        im_end_token_id=im_end_id,
+    )
+
+
+_autoconfigure_padding_from_env()
 
 
 def padded_ids_from_step_extras(

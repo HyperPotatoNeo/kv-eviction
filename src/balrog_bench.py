@@ -7,6 +7,7 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,10 @@ from omegaconf import OmegaConf
 logger = logging.getLogger(__name__)
 
 from verifiers.envs.multiturn_env import MultiTurnEnv
+
+# Regex for extracting tool calls from raw assistant text.
+# Matches the debug script's parse_action pattern exactly.
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
 ACTIONS = {
     "babaisai": {
@@ -449,147 +454,86 @@ class BalrogEnv(MultiTurnEnv):
         return None
 
     async def env_response(self, messages: vf.Messages, state: vf.State, **kwargs) -> vf.Messages:
+        """Parse raw assistant text for <tool_call> JSON and step the env.
+
+        Returns a plain user message with the next observation (no
+        ToolMessage / <tool_response> wrapping), matching the debug
+        script's conversation structure exactly.
+        """
         last_message = messages[-1]
-        tool_calls = None
 
-        if hasattr(last_message, "tool_calls"):
-            tool_calls = last_message.tool_calls
-        elif isinstance(last_message, dict) and "tool_calls" in last_message:
-            tool_calls = last_message["tool_calls"]
+        # Extract raw text content from the assistant message.
+        content = ""
+        if hasattr(last_message, "content") and last_message.content:
+            content = str(last_message.content)
+        elif isinstance(last_message, dict) and last_message.get("content"):
+            content = str(last_message["content"])
 
-        if not tool_calls:
-            return []
+        # Parse action from <tool_call> JSON (same regex as debug script).
+        action = None
+        m = _TOOL_CALL_RE.search(content)
+        if m:
+            try:
+                blob = json.loads(m.group(1))
+                action = blob.get("arguments", {}).get("action")
+            except Exception:
+                pass
 
-        messages_out = []
+        if action is None:
+            return [{"role": "user", "content": "Error: No valid tool_call found. You must use the take_action tool to interact with the environment. Please emit a <tool_call> with take_action and a valid action."}]
 
-        # Extract reasoning from assistant message (before tool calls)
-        assistant_reasoning = None
-        if len(messages) >= 2:
-            prev_message = messages[-2] if len(messages) > 1 else None
-            if prev_message and hasattr(prev_message, "role") and prev_message.role == "assistant":
-                assistant_reasoning = self.extract_reasoning_from_message(prev_message)
-            elif isinstance(prev_message, dict) and prev_message.get("role") == "assistant":
-                assistant_reasoning = self.extract_reasoning_from_message(prev_message)
+        try:
+            env = state["env"]
+            history_manager = state["history_manager"]
 
-        if not assistant_reasoning:
+            logger.info(f"[DEBUG] Executing BALROG action '{action}' in environment")
+
             assistant_reasoning = self.extract_reasoning_from_message(last_message)
+            if assistant_reasoning:
+                history_manager.update_reasoning(assistant_reasoning)
 
-        for tool_call in tool_calls:
-            call_id = None
-            action = None
+            valid_action: str = env.check_action_validity(action)
+            obs, reward, terminated, truncated, info = env.step(valid_action)
+            done = bool(terminated or truncated)
 
-            if hasattr(tool_call, "id"):
-                call_id = tool_call.id
-            elif isinstance(tool_call, dict):
-                call_id = tool_call.get("id")
+            state["observation"] = obs
+            state["step_count"] += 1
+            state["done"] = done
+            state["episode_return"] += float(reward)
 
-            if hasattr(tool_call, "name"):
-                if tool_call.name == "take_action":
-                    try:
-                        raw_args = tool_call.arguments
-                        if isinstance(raw_args, str):
-                            args = json.loads(raw_args)
-                        elif isinstance(raw_args, dict):
-                            args = raw_args
-                        else:
-                            args = {}
-                        action = args.get("action")
-                    except:
-                        pass
-            elif isinstance(tool_call, dict):
-                if tool_call.get("name") == "take_action" or tool_call.get("function", {}).get("name") == "take_action":
-                    try:
-                        args = tool_call.get("arguments") or tool_call.get("function", {}).get("arguments", {})
-                        if isinstance(args, str):
-                            args = json.loads(args)
-                        elif not isinstance(args, dict):
-                            args = {}
-                        action = args.get("action")
-                    except:
-                        pass
+            trajectory_step = {
+                "action": valid_action,
+                "observation": obs,
+                "reward": reward,
+                "info": info,
+                "reasoning": assistant_reasoning or "",
+                "terminated": terminated,
+                "truncated": truncated,
+            }
+            if "game_trajectory" not in state:
+                state["game_trajectory"] = []
+            state["game_trajectory"].append(trajectory_step)
+
+            history_manager.update_action(valid_action)
+            if isinstance(obs, dict):
+                history_manager.update_observation(obs)
+            else:
+                formatted_obs = {"text": {"long_term_context": str(obs), "short_term_context": ""}}
+                history_manager.update_observation(formatted_obs)
 
             logger.info(
-                f"[DEBUG] Processing tool_call: call_id='{call_id}', action='{action}', reasoning='{assistant_reasoning if assistant_reasoning else None}'"
+                f" BALROG action executed: step={state['step_count']}, reward={reward}, done={done}, return={state['episode_return']}"
             )
+            response_content: str = self.format_balrog_observation(obs, state["environment"], history_manager)
 
-            if call_id is None:
-                continue
+            if done:
+                response_content += f"\n\nEpisode completed! Final score: {state['episode_return']}"
 
-            if action is None:
-                tool_reply = vf.ToolMessage(
-                    tool_call_id=call_id,
-                    content="Error: Invalid or missing action. Please use the take_action function with a valid action from BALROG's action space.",
-                )
-                messages_out.append(tool_reply)
-                continue
+            return [{"role": "user", "content": response_content}]
 
-            try:
-                env = state["env"]
-                history_manager = state["history_manager"]
-
-                logger.info(f"[DEBUG] Executing BALROG action '{action}' in environment")
-
-                if assistant_reasoning:
-                    history_manager.update_reasoning(assistant_reasoning)
-
-                # Use BALROG's action validation
-                valid_action: str = env.check_action_validity(action)
-                obs, reward, terminated, truncated, info = env.step(valid_action)
-                done = bool(terminated or truncated)
-
-                state["observation"] = obs
-                state["step_count"] += 1
-                state["done"] = done
-                state["episode_return"] += float(reward)
-
-                # Add to game trajectory with BALROG format including reasoning
-                # Note: We use a separate "game_trajectory" field because state["trajectory"]
-                # is managed by the verifiers framework and should not be modified directly
-                trajectory_step = {
-                    "action": valid_action,
-                    "observation": obs,
-                    "reward": reward,
-                    "info": info,
-                    "reasoning": assistant_reasoning or "",
-                    "terminated": terminated,
-                    "truncated": truncated,
-                }
-
-                if "game_trajectory" not in state:
-                    state["game_trajectory"] = []
-                state["game_trajectory"].append(trajectory_step)
-
-                history_manager.update_action(valid_action)
-
-                if isinstance(obs, dict):
-                    history_manager.update_observation(obs)
-                else:
-                    formatted_obs = {"text": {"long_term_context": str(obs), "short_term_context": ""}}
-                    history_manager.update_observation(formatted_obs)
-
-                logger.info(
-                    f" BALROG action executed: step={state['step_count']}, reward={reward}, done={done}, return={state['episode_return']}"
-                )
-                response_content: str = self.format_balrog_observation(obs, state["environment"], history_manager)
-
-                if done:
-                    response_content += f"\n\nEpisode completed! Final score: {state['episode_return']}"
-
-                tool_reply = vf.ToolMessage(
-                    tool_call_id=call_id,
-                    content=response_content,
-                )
-
-            except Exception as e:
-                logger.error(f" Exception executing action for call_id {call_id}: {e}")
-                tool_reply = vf.ToolMessage(
-                    tool_call_id=call_id,
-                    content=f"Error executing BALROG action: {str(e)}",
-                )
-
-            messages_out.append(tool_reply)
-
-        return messages_out
+        except Exception as e:
+            logger.error(f" Exception executing action: {e}")
+            return [{"role": "user", "content": f"Error executing BALROG action: {str(e)}"}]
 
     def format_balrog_observation(self, obs: Any, env_name: str, history_manager=None) -> str:
         """Format observation using BALROG's standard formatting with history context."""
