@@ -43,10 +43,15 @@ betas2 = 0.9
 max_norm = 1.0
 
 [orchestrator]
-batch_size = 128
+batch_size = 64
 rollouts_per_example = 8
 oversampling_factor = 1.0
-use_token_client = true
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16
+log_evicted_text = false
 
 [orchestrator.client]
 base_url = ["http://localhost:8000/v1"]
@@ -79,5 +84,3 @@ tp = 1
 
 [inference.vllm_extra]
 async_scheduling = false
-enable_auto_tool_choice = true
-tool_call_parser = "hermes"
