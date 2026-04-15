@@ -144,19 +144,26 @@ def render_padded_prompt(
           the one we trust.
         - `add_special_tokens=False` because the chat template already
           emits any required special tokens.
-        - `add_generation_prompt=True` (default) appends the trailing
-          `<|im_start|>assistant\\n` AFTER the last `<|im_end|>`'s
-          filler run. That region is not padded (see module docstring:
-          in-flight turn is never evictable under turn-mode; it gets
-          re-padded next call once the assistant turn closes).
+        - When `add_generation_prompt=True`, the final block-alignment
+          pad is inserted BEFORE `<|im_start|>assistant\\n`, not after.
+          Putting filler after the generation prefix would prime the
+          model with a run of filler tokens (typically <|endoftext|>)
+          at the exact position where it starts generating, which
+          pushes it off-distribution and causes degenerate output.
+          Inserting the pad before the gen prefix keeps the model's
+          last pre-generation tokens natural (<|im_start|>assistant\\n)
+          while preserving the block-aligned total length the trainer
+          relies on.
     """
-    rendered = tokenizer.apply_chat_template(
+    # Render messages without the generation prompt so we can isolate the
+    # gen-prefix tokens and place the final alignment pad BEFORE them.
+    rendered_msgs = tokenizer.apply_chat_template(
         messages,
         tools=tools,
-        add_generation_prompt=add_generation_prompt,
+        add_generation_prompt=False,
         tokenize=False,
     )
-    raw = tokenizer.encode(rendered, add_special_tokens=False)
+    raw = tokenizer.encode(rendered_msgs, add_special_tokens=False)
     # Defensive: ensure all ints. Some tokenizers return tokens as
     # np.int64 / tensor scalars which downstream serialization over
     # HTTP chokes on.
@@ -166,6 +173,31 @@ def render_padded_prompt(
             f"non-int tokens in tokenizer.encode output: first 5={bad[:5]}"
         )
 
+    # Gen-prefix tokens = the delta when add_generation_prompt=True. We
+    # re-render with the flag set and take the suffix past `raw`. The
+    # prefix-preservation assertion catches chat templates that mutate
+    # the message region when the gen prompt is added (would break the
+    # padding math below).
+    if add_generation_prompt:
+        rendered_full = tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        raw_full = tokenizer.encode(rendered_full, add_special_tokens=False)
+        if raw_full[: len(raw)] != raw:
+            raise RuntimeError(
+                "Chat template is not prefix-preserving when "
+                "add_generation_prompt is toggled. Block-aligned padding "
+                "requires the gen prompt to be a pure suffix extension."
+            )
+        gen_prefix = raw_full[len(raw) :]
+    else:
+        gen_prefix = []
+
+    # Per-turn pad: every <|im_end|> gets filler so the next turn's first
+    # token starts at a block_size-aligned position.
     out: list[int] = []
     pads: list[int] = []
     for tok in raw:
@@ -176,14 +208,17 @@ def render_padded_prompt(
             if n:
                 out.extend([filler_token_id] * n)
             pads.append(n)
-    # Final alignment: the generation prefix (<|im_start|>assistant\n) sits
-    # after the last <|im_end|> filler run and is not itself padded by the
-    # loop above, leaving len(out) = 16k + len(gen_prefix) instead of 16k.
-    # Pad here so len(padded_ids) is always a multiple of block_size, which
-    # guarantees prompt_aligned_len == prompt_len in the trainer (no overflow).
-    remainder = len(out) % block_size
+
+    # Final alignment: insert filler between the message region and the
+    # generation prefix so that `len(out) + len(gen_prefix)` is a multiple
+    # of block_size. With no gen prefix, this pads the tail as before.
+    total_len = len(out) + len(gen_prefix)
+    remainder = total_len % block_size
     if remainder:
         n = block_size - remainder
         out.extend([filler_token_id] * n)
         pads.append(n)
+
+    out.extend(gen_prefix)
+
     return raw, out, pads

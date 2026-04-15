@@ -29,12 +29,14 @@ class _StubTokenizer:
     """Minimal stub: `apply_chat_template` returns a tagged string,
     `encode` parses the tagged string into a fixed id sequence.
 
-    Format: "TOK:<id>,<id>,..." — each comma-separated int is a token.
-    This lets tests craft arbitrary raw-id sequences without needing
-    to know a real chat template.
+    Format: "TOK:<id>,<id>,...|GEN:<id>,<id>,..." — the GEN suffix (if
+    any) appears only when `add_generation_prompt=True`, modeling real
+    chat templates whose with-gen output is a prefix-preserving
+    extension of the without-gen output.
     """
 
     pad_token_id: int | None = FILLER
+    gen_prefix_ids: list[int] = field(default_factory=list)
     _vocab: dict[str, int] = field(
         default_factory=lambda: {"<|im_end|>": IM_END, "<|endoftext|>": 0}
     )
@@ -42,20 +44,30 @@ class _StubTokenizer:
     def apply_chat_template(
         self, messages, tools=None, add_generation_prompt=True, tokenize=False
     ):
-        # In tests we smuggle raw id sequences through the 'content'
-        # field of the first message, pre-serialized as "id,id,id".
-        return f"TOK:{messages[0]['content']}"
+        body = f"TOK:{messages[0]['content']}"
+        if add_generation_prompt and self.gen_prefix_ids:
+            body += "|GEN:" + ",".join(str(i) for i in self.gen_prefix_ids)
+        return body
 
     def encode(self, s, add_special_tokens=False):
         assert s.startswith("TOK:"), s
-        return [int(x) for x in s[len("TOK:") :].split(",") if x]
+        payload = s[len("TOK:") :]
+        msg_part, _, gen_part = payload.partition("|GEN:")
+        tokens = [int(x) for x in msg_part.split(",") if x]
+        if gen_part:
+            tokens.extend(int(x) for x in gen_part.split(",") if x)
+        return tokens
 
     def convert_tokens_to_ids(self, tok):
         return self._vocab.get(tok, -1)
 
 
-def _render(raw_ids: list[int], block_size: int):
-    tok = _StubTokenizer()
+def _render(
+    raw_ids: list[int],
+    block_size: int,
+    gen_prefix_ids: list[int] | None = None,
+):
+    tok = _StubTokenizer(gen_prefix_ids=list(gen_prefix_ids or []))
     messages = [{"role": "user", "content": ",".join(str(i) for i in raw_ids)}]
     return render_padded_prompt(
         tokenizer=tok,
@@ -125,20 +137,38 @@ def test_zero_pad_when_already_aligned():
     assert len(padded) % 8 == 0
 
 
-def test_generation_prompt_suffix_not_padded():
-    # raw_ids has trailing tokens AFTER the last <|im_end|> (simulating
-    # add_generation_prompt appending '<|im_start|>assistant\n').
-    # Fillers ARE inserted after each <|im_end|>, then the trailing
-    # generation-prompt tokens follow immediately (no further padding
-    # before the assistant turn closes with its own <|im_end|>).
-    raw = [1, 2, IM_END, 77, 78, 79]  # 77/78/79 = <|im_start|>\nassistant\n stub
-    _, padded, pads = _render(raw, block_size=4)
-    # One <|im_end|> pad: after appending IM_END, len=3, pad=1.
-    assert pads == [1]
-    assert padded == [1, 2, IM_END, FILLER, 77, 78, 79]
-    # Tail tokens preserved, unaligned on purpose (assistant in-flight).
-    assert padded[-3:] == [77, 78, 79]
+def test_gen_prefix_appears_at_tail_with_pad_inserted_before():
+    # Message tokens end at the last <|im_end|>; gen_prefix_ids=[77,78,79]
+    # models '<|im_start|>assistant\n'. After the fix, the final alignment
+    # pad must sit BEFORE the gen prefix so the model's last
+    # pre-generation tokens are natural (not <|endoftext|>).
+    raw = [1, 2, IM_END]
+    gen = [77, 78, 79]
+    _, padded, pads = _render(raw, block_size=4, gen_prefix_ids=gen)
+
+    # Per-<|im_end|> pad: after appending IM_END, len=3, pad=1 -> len=4.
+    # Then extra pad so total + len(gen) is block-aligned:
+    #   total_before_gen = 4, gen_len = 3 -> need 1 more filler -> len=5.
+    # Then append gen -> len=8 (block-aligned).
+    assert pads == [1, 1]
+    assert padded == [1, 2, IM_END, FILLER, FILLER, 77, 78, 79]
+    # CRITICAL: gen prefix is the tail — model's last tokens before
+    # generation are the natural gen prompt, not filler.
+    assert padded[-len(gen) :] == gen
+    assert len(padded) % 4 == 0
     assert _im_end_positions(padded) == [2]
+
+
+def test_gen_prefix_no_extra_pad_when_total_already_aligned():
+    # Message-region pads already leave total + gen_len on a block
+    # boundary, so no extra filler is inserted before gen_prefix.
+    raw = [1, 2, 3, 4, 5, IM_END]  # len=6 after IM_END, pad=2 -> len=8
+    gen = [77, 78, 79, 80]  # len 4 -> total 12 (block-aligned)
+    _, padded, pads = _render(raw, block_size=4, gen_prefix_ids=gen)
+
+    assert pads == [2]
+    assert padded == [1, 2, 3, 4, 5, IM_END, FILLER, FILLER, 77, 78, 79, 80]
+    assert padded[-len(gen) :] == gen
 
 
 def test_resolve_filler_override():
