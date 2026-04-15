@@ -176,4 +176,14 @@ def render_padded_prompt(
             if n:
                 out.extend([filler_token_id] * n)
             pads.append(n)
+    # Final alignment: the generation prefix (<|im_start|>assistant\n) sits
+    # after the last <|im_end|> filler run and is not itself padded by the
+    # loop above, leaving len(out) = 16k + len(gen_prefix) instead of 16k.
+    # Pad here so len(padded_ids) is always a multiple of block_size, which
+    # guarantees prompt_aligned_len == prompt_len in the trainer (no overflow).
+    remainder = len(out) % block_size
+    if remainder:
+        n = block_size - remainder
+        out.extend([filler_token_id] * n)
+        pads.append(n)
     return raw, out, pads
