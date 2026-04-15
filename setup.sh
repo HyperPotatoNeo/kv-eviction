@@ -64,6 +64,12 @@ uv pip install -e ./prime-rl --no-deps
 echo "=== Step 6: kv-eviction editable ==="
 uv pip install -e .
 
+echo "=== Step 7: textworld-env editable ==="
+# Ships the TextWorld multi-turn env package (a plain vf.MultiTurnEnv
+# subclass) and its textworld>=1.6.0 runtime dep. The kv-eviction
+# compaction monkey-patches automatically apply to it — no env-side code.
+uv pip install -e ./experiments/textworld_env
+
 echo ""
 echo "=== Verification ==="
 python << 'PYEOF'
@@ -81,6 +87,7 @@ from prime_rl.transport.types import TrainingSample
 from prime_rl.trainer.model import forward
 print("prime-rl imports OK")
 import kv_eviction; print("kv_eviction OK")
+import textworld_env; print("textworld_env OK")
 print("\n=== SETUP COMPLETE ===")
 print(f"Activate with: source {'/pscratch/sd/s/siddart2/kv-eviction'}/.venv/bin/activate")
 PYEOF

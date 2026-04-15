@@ -9,7 +9,6 @@ dependencies = [
 
 [dependency-groups]
 balrog = [
-    "textworld>=1.6.0",
     "omegaconf>=2.3.0",
     "gym>=0.23.0",
 ]

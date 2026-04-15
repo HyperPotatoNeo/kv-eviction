@@ -1,0 +1,108 @@
+# compaction_textworld: production RL run with turn-based KV compaction
+# on the hard-mixed TextWorld cooking dataset.
+#
+# Matches the inference-time settings validated in the 100-sample smoke:
+#   turn-based eviction (max_turns=10, stride=3), protected_prefix=-1,
+#   aligned_turn_boundaries=true, block_size=16, client-side padding on.
+#
+# Split-config format (like compaction_rgmix): this file holds the trainer
+# + orchestrator config; inference.toml is a separate file launched on the
+# inference nodes via `uv run inference @ inference.toml`. The two must be
+# kept in sync by hand — the prime-rl cross-validator only runs when the
+# inference block is embedded in rl.toml.
+#
+# Launcher pattern: 3-node 2-1 split (2x inference DP=4, 1x trainer FSDP=4).
+# Before running, `__INFERENCE_NODE_0__`/`__INFERENCE_NODE_1__` and
+# `__TEXTWORLD_DATASET__` are sed-substituted into a resolved copy of this
+# TOML by launch.sh. Do NOT hardcode cluster paths here.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "outputs/compaction_textworld"
+clean_output_dir = true
+
+[ckpt]
+interval = 50
+
+[deployment]
+type = "single_node"
+gpus_per_node = 4
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "compaction-textworld"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+# NOTE: per-block activation checkpointing (`[trainer.model.ac]`) is
+# DISABLED for compaction training. Prime-rl's per-block checkpoint_wrapper
+# re-runs each decoder layer during backward under non-reentrant mode,
+# which doubles a shared DynamicCache and produces a CheckpointError.
+# Rejected at config load when trainer.compaction is set (see
+# prime-rl commit 4c851fc92).
+
+[trainer.compaction]
+# Must mirror inference.toml's [vllm_extra] compaction_* fields exactly.
+# Trainer uses block-FIFO semantics (window/stride/block_size) for the
+# segmented_forward replay path; turn-based eviction is an inference-side
+# concern and is not restated here. protected_prefix_tokens=-1 enables
+# auto-detect from the first <|im_end|> in each sample's prompt.
+window_size = 4096
+stride = 512
+block_size = 16
+bptt_segments = 1
+protected_prefix_tokens = -1
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+# TITO bypasses openai-python's chat.completions.create, which is where
+# the kv_eviction block-aligned padding interceptor lives. With turn-mode
+# eviction + compaction_assume_aligned_turn_boundaries=true, the server
+# REQUIRES client-padded prompts — so TITO must stay off.
+use_token_client = false
+
+[orchestrator.compaction_padding]
+# Client-side block-aligned message padding: renders each request so
+# every <|im_end|> lands on a 16-token PagedAttention block boundary.
+# Required for the inference server's align_up eviction path.
+enabled = true
+block_size = 16
+log_evicted_text = false
+
+[orchestrator.client]
+base_url = [
+  "http://__INFERENCE_NODE_0__:8000/v1",
+  "http://__INFERENCE_NODE_1__:8000/v1",
+]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 12000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "textworld-env"
+args = { dataset_path = "__TEXTWORLD_DATASET__", max_episode_steps = 50, num_train_examples = 4500, num_eval_examples = 500, seed = 42 }
+
+# NO [orchestrator.eval] section — no eval before/between training steps.
+# Reward / seq_len / compaction-event stats are logged from the training
+# rollouts alone. Matches compaction_rgmix convention.

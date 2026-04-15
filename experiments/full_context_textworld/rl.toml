@@ -1,0 +1,85 @@
+# full_context_textworld: production RL run WITHOUT KV compaction on the
+# hard-mixed TextWorld cooking dataset. Apples-to-apples baseline for
+# compaction_textworld/rl.toml — every non-compaction hyperparameter
+# matches that file exactly, so reward / convergence differences
+# attribute cleanly to the eviction policy.
+#
+# Launcher pattern: 3-node 2-1 split (2x inference DP=4, 1x trainer FSDP=4).
+# `__INFERENCE_NODE_0__`/`__INFERENCE_NODE_1__` and `__TEXTWORLD_DATASET__`
+# are sed-substituted by launch.sh.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "outputs/full_context_textworld"
+clean_output_dir = true
+
+[ckpt]
+interval = 50
+
+[deployment]
+type = "single_node"
+gpus_per_node = 4
+num_train_gpus = 4
+num_infer_gpus = 0
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "full-context-textworld"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+# impl="auto" lets prime-rl pick the fastest path since segmented_forward
+# is not used here. Per-block activation checkpointing IS allowed.
+impl = "auto"
+attn = "flash_attention_2"
+
+[trainer.model.ac]
+freq = 1
+
+# NO [trainer.compaction] block. The full-context run disables
+# segmented_forward entirely and uses the standard trainer path.
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+# Kept at false for bit-identical tokenization with the compaction run.
+# Flipping TITO would change the token-render path and introduce a
+# second confounding variable versus the compaction baseline.
+use_token_client = false
+
+[orchestrator.compaction_padding]
+# Kept ENABLED for tokenization parity with compaction_textworld. The
+# padding interceptor is a no-op for the server since the full-context
+# inference.toml has no compaction_* fields, but the resulting padded
+# prompts must match byte-for-byte what the compaction run sends.
+enabled = true
+block_size = 16
+log_evicted_text = false
+
+[orchestrator.client]
+base_url = [
+  "http://__INFERENCE_NODE_0__:8000/v1",
+  "http://__INFERENCE_NODE_1__:8000/v1",
+]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 12000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "textworld-env"
+args = { dataset_path = "__TEXTWORLD_DATASET__", max_episode_steps = 50, num_train_examples = 4500, num_eval_examples = 500, seed = 42 }

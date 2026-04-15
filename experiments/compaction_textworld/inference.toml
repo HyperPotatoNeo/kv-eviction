@@ -1,0 +1,61 @@
+# compaction_textworld: inference-only config for the 100-sample smoke test.
+#
+# Single-node DP=4 (1 x 4xA100-80GB) vLLM server with TURN-BASED KV cache
+# eviction on the hard-mixed TextWorld cooking dataset. Matches the canonical
+# multi-turn reference in experiments/debug_balrog/rl_full.toml.
+#
+# Compaction policy (mirrors mkv-rl rl_m4_prod: window_turns=10, stride_turns=3):
+#   - Evict oldest 3 turns whenever ≥10 live completed turns accumulate.
+#   - Protect the system prompt (auto-detected via first <|im_end|>).
+#   - Assume the client has padded each <|im_end|> to a block boundary so
+#     the scheduler can align_up evict_end and avoid orphan tail tokens.
+#
+# The client side (experiments/textworld_env/eval_textworld.py) enables the
+# kv-eviction block-aligned message padding via KV_EVICTION_PADDING_* env
+# vars before importing kv_eviction, which makes the AsyncCompletions.create
+# interceptor pad each outgoing request and stash the padded ids on the
+# response for the segmented forward to consume.
+
+seed = 0
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+async_scheduling = false
+
+# Block-FIFO compaction fallback: required by the arg_utils validator
+# whenever compaction_max_turns > 0. Fires if a request's KV exceeds
+# window_size before turn-mode has accumulated max_turns completed turns.
+# Values mirror the validated compaction_rgmix smoke (4096/512 at block=16).
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+
+# Protected prefix: -1 = auto-detect the end of the system message from
+# the first <|im_end|> in the token stream. Keeps cooking game system
+# prompt (~500 tokens) intact regardless of rollout length.
+compaction_protected_prefix_tokens = -1
+
+# Turn-mode: evict the 3 oldest completed user+assistant pairs whenever
+# ≥10 completed turns are live. Mirrors mkv-rl rl_m4_prod.toml's
+# mkv_turn_window=10 / mkv_turn_stride=3 settings, so we get an
+# apples-to-apples reward comparison vs the mkv-rl session approach.
+compaction_max_turns = 10
+compaction_eviction_turn_stride = 3
+
+# Client pads each <|im_end|> so the NEXT message's first token lands on a
+# block boundary. Under this invariant the scheduler snaps evict_end UP,
+# eliminating orphan tail tokens from the last evicted turn.
+compaction_assume_aligned_turn_boundaries = true
