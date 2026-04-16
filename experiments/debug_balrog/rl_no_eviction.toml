@@ -26,11 +26,17 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [wandb]
 project = "kv-eviction"
 name = "debug-balrog-no-eviction"
+id = "debug-balrog-no-eviction"
+group = "debug-balrog-no-eviction"
+
+[trainer]
+dist_timeout_seconds = 3600
 
 [trainer.model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 impl = "auto"
 attn = "flash_attention_2"
+ac = { mode = "full" }
 
 [trainer.loss]
 kl_tau = 0.0
@@ -62,7 +68,7 @@ temperature = 1.0
 
 [[orchestrator.train.env]]
 id = "balrog-bench"
-args = { environments = ["babyai"], max_text_history = 16, max_turns = 30 }
+args = { environments = ["babyai"], max_text_history =80, max_turns = 30 }
 
 [inference]
 seed = 0

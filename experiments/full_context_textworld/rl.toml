@@ -28,6 +28,8 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [wandb]
 project = "kv-eviction"
 name = "full-context-textworld"
+id = "full-context-textworld"
+group = "full-context-textworld"
 
 [trainer.model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
@@ -82,4 +84,4 @@ temperature = 1.0
 
 [[orchestrator.train.env]]
 id = "textworld-env"
-args = { dataset_path = "__TEXTWORLD_DATASET__", max_episode_steps = 50, num_train_examples = 4500, num_eval_examples = 500, seed = 42 }
+args = { dataset_path = "__TEXTWORLD_DATASET__", max_episode_steps = 50, num_train_examples = 4500, num_eval_examples = 500, seed = 42, include_initial_obs_in_system = true }

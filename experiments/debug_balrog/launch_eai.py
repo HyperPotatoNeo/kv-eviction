@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Launch a debug_balrog TOML config on EAI with 8 H100-80GB GPUs.
+"""Launch any RL TOML config on EAI with 8 H100-80GB GPUs.
 
     python experiments/debug_balrog/launch_eai.py rl_full.toml
     python experiments/debug_balrog/launch_eai.py rl_no_eviction.toml
     python experiments/debug_balrog/launch_eai.py rl_full.toml --dry-run
     python experiments/debug_balrog/launch_eai.py rl_full.toml --status
+    python experiments/debug_balrog/launch_eai.py experiments/compaction_rgmix/rl.toml
+    python experiments/debug_balrog/launch_eai.py /absolute/path/to/rl.toml
 """
 
 import argparse
@@ -118,8 +120,12 @@ def launch_job(run_name, config_rel, account, dry_run=False):
         "--env", "HOME=/home/toolkit",
         "--env", "PATH=/home/toolkit/.local/bin:/usr/local/bin:/usr/bin:/bin",
         "--env", f"WANDB_API_KEY={wandb_key}",
+        # litellm requires OPENAI_API_KEY to be non-empty even when
+        # talking to a local vLLM (which ignores the value). tau2-bench
+        # user simulator routes through litellm.
+        "--env", f"OPENAI_API_KEY={os.environ.get('OPENAI_API_KEY', 'EMPTY')}",
         "--tag", "kv-eviction",
-        "--tag", "debug-balrog",
+        "--tag", run_name,
         "--workdir", WORKDIR,
         "--field", "id",
         "--no-header",
@@ -151,7 +157,16 @@ def main():
     parser.add_argument("--status", action="store_true", help="Check job status only")
     args = parser.parse_args()
 
-    config_path = SCRIPT_DIR / args.config
+    # Accept absolute paths, repo-relative paths, or bare filenames in SCRIPT_DIR.
+    raw = Path(args.config)
+    if raw.is_absolute():
+        config_path = raw
+    elif (REPO_DIR / raw).exists():
+        config_path = REPO_DIR / raw
+    else:
+        config_path = SCRIPT_DIR / raw
+
+    config_path = config_path.resolve()
     if not config_path.exists():
         print(f"Config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
@@ -160,7 +175,7 @@ def main():
         cfg = tomllib.load(f)
 
     run_name = cfg.get("wandb", {}).get("name") or config_path.stem.replace("_", "-")
-    config_rel = f"experiments/debug_balrog/{args.config}"
+    config_rel = str(config_path.relative_to(REPO_DIR))
 
     account = get_account()
     info = load_job_info(run_name)

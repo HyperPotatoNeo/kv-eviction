@@ -21,6 +21,8 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [wandb]
 project = "kv-eviction"
 name = "debug-balrog-compaction"
+id = "debug-balrog-compaction"
+group = "debug-balrog-compaction"
 
 [trainer.model]
 name = "Qwen/Qwen3-4B-Instruct-2507"

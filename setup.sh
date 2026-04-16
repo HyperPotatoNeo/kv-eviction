@@ -70,6 +70,13 @@ echo "=== Step 7: textworld-env editable ==="
 # compaction monkey-patches automatically apply to it — no env-side code.
 uv pip install -e ./experiments/textworld_env
 
+echo "=== Step 8: tau2-bench-train editable ==="
+# Thin wrapper that turns primeintellect/tau2-bench (eval-only) into a
+# training-capable env by aliasing eval_dataset_source -> dataset_source.
+# Requires `prime env install primeintellect/tau2-bench` to have already
+# installed the upstream tau2-bench package.
+uv pip install -e ./experiments/tau2bench_env
+
 echo ""
 echo "=== Verification ==="
 python << 'PYEOF'

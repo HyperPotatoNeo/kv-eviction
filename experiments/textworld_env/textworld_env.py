@@ -158,7 +158,9 @@ class TextWorldEnv(vf.MultiTurnEnv):
         num_train_examples: Optional[int] = None,
         num_eval_examples: Optional[int] = None,
         seed: int = 42,
+        include_initial_obs_in_system: bool = False,
     ):
+        self._include_initial_obs_in_system = include_initial_obs_in_system
         dataset_path = Path(dataset_path)
 
         # Load pre-generated dataset and metadata
@@ -242,6 +244,26 @@ class TextWorldEnv(vf.MultiTurnEnv):
         state["tw_done"] = False
         state["tw_token_count"] = len(game_state.feedback) // 3
 
+        # Merge the first user message (initial observation) into the system
+        # prompt so it's part of the protected prefix for compaction/truncation.
+        if self._include_initial_obs_in_system:
+            prompt = state["prompt"]
+            if (
+                len(prompt) >= 2
+                and prompt[0].role == "system"
+                and prompt[1].role == "user"
+            ):
+                merged_content = (
+                    prompt[0].content
+                    + "\n\n---\nINITIAL OBSERVATION:\n"
+                    + prompt[1].content
+                )
+                from verifiers.types import SystemMessage, UserMessage
+                state["prompt"] = [
+                    SystemMessage(role="system", content=merged_content),
+                    UserMessage(role="user", content="What do you do?"),
+                ]
+
         return state
 
     async def env_response(self, messages: Messages, state: State) -> Messages:
@@ -323,6 +345,7 @@ def load_environment(
     num_train_examples: Optional[int] = None,
     num_eval_examples: Optional[int] = None,
     seed: int = 42,
+    include_initial_obs_in_system: bool = False,
     **kwargs,
 ) -> vf.Environment:
     """Entry point for `vf.load_environment("textworld-env", ...)`.
@@ -346,4 +369,5 @@ def load_environment(
         num_train_examples=num_train_examples,
         num_eval_examples=num_eval_examples,
         seed=seed,
+        include_initial_obs_in_system=include_initial_obs_in_system,
     )

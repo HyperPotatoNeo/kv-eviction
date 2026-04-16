@@ -1,39 +1,34 @@
 # compaction_rgmix: production RL run with KV compaction on rg-mix.
 #
-# 3-node 2-1 split (see experiments/compaction_rgmix/launch.sh):
-#   Node 0: vLLM inference server DP=4, compaction window=4096 stride=512
-#   Node 1: vLLM inference server DP=4, compaction window=4096 stride=512
-#   Node 2: FSDP2 trainer DP=4
-#
-# Compaction settings must mirror inference.toml exactly. The RL config's
-# cross-validator only runs when inference is co-configured; in this split
-# inference is launched from a separate TOML so sync is manual.
+# Single-node 8-GPU EAI run (4 infer + 4 train).
+# Token-wise compaction: window=4096 stride=512, no turn-based eviction.
 
 max_steps = 500
 seq_len = 16384
 output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/new_runs/rg_mix"
 clean_output_dir = true
 
-# Shared checkpoint block — auto-propagates to trainer.ckpt and
-# orchestrator.ckpt. Saves every 50 steps under output_dir.
 [ckpt]
 interval = 50
+resume_step = -1
 
-# 4-GPU trainer node. Inference runs on two remote nodes via
-# orchestrator.client.base_url. num_infer_gpus=0 because the RL launcher's
-# embedded inference subprocess is not used.
 [deployment]
 type = "single_node"
-gpus_per_node = 4
+gpus_per_node = 8
 num_train_gpus = 4
-num_infer_gpus = 0
+num_infer_gpus = 4
 
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 
 [wandb]
-project = "kv-eviction"
+project = "kv-eviction-rg"
 name = "compaction-rgmix"
+id = "compaction-rgmix"
+group = "compaction-rgmix"
+
+[trainer]
+dist_timeout_seconds = 3600
 
 # Full FT — impl=hf and flash_attention_2 are required for the segmented
 # forward path (the TrainerConfig validator enforces this when
@@ -43,21 +38,15 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 impl = "hf"
 attn = "flash_attention_2"
 
-# NOTE: per-block activation checkpointing (`[trainer.model.ac]`) is
-# DISABLED for compaction training. Prime-rl's per-block checkpoint_wrapper
-# re-runs each decoder layer's forward during backward under non-reentrant
-# mode. When the forward has use_cache=True with a DynamicCache (required
-# for past_key_values to flow between segments), each layer's re-run
-# appends K/V to the same cache object again, doubling the cache length
-# and producing a CheckpointError. See smoke4 rl_smoke4.toml for the full
-# reproduction. Smoke #4 v6 peaked at 45.9 GiB without AC on 4xA100-80GB
-# at batch_size=64 — batch_size=128 here may push higher; budget is ~80GB.
+# NOTE: per-block activation checkpointing is DISABLED for compaction training.
+# See rl_smoke4.toml for the CheckpointError reproduction with DynamicCache.
 
 [trainer.compaction]
 window_size = 4096
 stride = 512
 block_size = 16
 bptt_segments = 1
+protected_prefix_tokens = -1
 
 [trainer.loss]
 kl_tau = 0.0
@@ -73,12 +62,15 @@ max_norm = 1.0
 batch_size = 128
 rollouts_per_example = 8
 oversampling_factor = 1.0
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16
+log_evicted_text = false
 
 [orchestrator.client]
-base_url = [
-  "http://__INFERENCE_NODE_0__:8000/v1",
-  "http://__INFERENCE_NODE_1__:8000/v1",
-]
+base_url = ["http://localhost:8000/v1"]
 
 [orchestrator.train.sampling]
 max_completion_tokens = 15000
@@ -86,8 +78,29 @@ temperature = 1.0
 
 [[orchestrator.train.env]]
 id = "rg-mix-env"
-args = { num_train_examples = 7500, num_eval_examples = 100, seed = 42, dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500" }
+args = { num_train_examples = 7500, num_eval_examples = 100, seed = 42, dataset_path = "/home/toolkit/kv-eviction/rg_mix_7500" }
 
-# NO [orchestrator.eval] section — no eval before train, no eval between
-# training steps. Reward / mismatch KL / entropy / seq_len are logged
-# every step from the training rollouts alone.
+[inference]
+seed = 0
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+compaction_protected_prefix_tokens = -1
+async_scheduling = false

@@ -84,7 +84,7 @@ os.environ.setdefault("VLLM_COMPACTION_DEBUG_TOKENS", "1")
 PAD = os.environ.get("PAD", "1") == "1"
 BLOCK_SIZE = 16
 PAD_FILLER_ID: int | None = None
-MAX_TURNS = int(os.environ.get("MAX_TURNS", "20"))
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "30"))
 TASK = os.environ.get("TASK", "BabyAI-MixedTrainLocal-v0/putnext")
 SEED = int(os.environ.get("SEED", "0"))
 OUT_PATH = os.environ.get(
@@ -108,8 +108,8 @@ llm = LLM(
     compaction_window_size=1024,
     compaction_stride=256,
     compaction_protected_prefix_tokens=0,
-    compaction_max_turns=4,
-    compaction_eviction_turn_stride=2,
+    compaction_max_turns=1,
+    compaction_eviction_turn_stride=1,
     compaction_turn_end_token_id=None,
     # With PAD=True in the chat() helper, every <|im_end|> is padded so
     # that the next message's first token lands on a block boundary.

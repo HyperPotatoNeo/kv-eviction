@@ -29,6 +29,7 @@ from typing import Any
 from verifiers.types import Messages, Response as ModelResponse, State, TrajectoryStep
 
 from kv_eviction.padding import render_padded_prompt
+from kv_eviction.truncation import truncate_messages_to_last_k_turns
 from kv_eviction.types import CompactionEventWire
 
 logger = logging.getLogger(__name__)
@@ -412,6 +413,24 @@ class MessagePaddingConfig:
 _padding_config: MessagePaddingConfig | None = None
 
 
+# Markovian Thinker globals — forward-declared here because
+# `_install_message_padding_interceptor()` below installs a closure
+# (`patched_create`) that reads `_markovian_config` and mutates
+# `_markovian_stats` on every request. If import was interrupted or
+# raced between the installer call and the later module-level
+# definitions, every subsequent rollout raised
+# `NameError: name '_markovian_config' is not defined` (observed on EAI
+# when env.py was written mid-import over NFS). The full config
+# dataclass, constructor, and autoconfigure helper stay at their
+# original location below — only the globals move up. Type is
+# string-forward-referenced to keep the dataclass in its current spot.
+_markovian_config: "MarkovianThinkerRuntimeConfig | None" = None
+_markovian_stats: dict[str, int] = {
+    "n_truncations": 0,
+    "n_messages_dropped": 0,
+}
+
+
 def configure_message_padding(
     *,
     enabled: bool,
@@ -450,13 +469,47 @@ def configure_message_padding(
         )
 
 
+def _stash_prompt_token_ids(response: Any, ids: list[int]) -> None:
+    """Attach ``prompt_token_ids`` to an OpenAI ChatCompletion so Patch #1
+    (``from_native_response``) can forward it to the verifiers Response
+    and Patch #2 (``add_model_response``) can copy it into the trajectory
+    step's extras.
+
+    ``ChatCompletion`` is a pydantic BaseModel with ``extra="allow"``, so
+    setattr writes to ``__pydantic_extra__``. We fall back to writing
+    ``model_extra`` directly when setattr is rejected by unusual pydantic
+    subclasses.
+    """
+    try:
+        setattr(response, "prompt_token_ids", ids)
+    except Exception:
+        if hasattr(response, "model_extra"):
+            if response.model_extra is None:
+                response.__pydantic_extra__ = {}
+            response.model_extra["prompt_token_ids"] = ids
+
+
 def _install_message_padding_interceptor() -> None:
-    """Monkey-patch `AsyncCompletions.create` to pre-pad messages into
-    block-aligned token streams when padding is enabled.
+    """Monkey-patch `AsyncCompletions.create` with two independent branches:
+
+    Branch A — Markovian Thinker client-side truncation: drop all but the
+    last K turn groups from ``messages`` before the request leaves the
+    orchestrator. vLLM runs a normal full-context completion on the
+    truncated message list with no compaction.
+
+    Branch B — block-aligned message padding: pre-tokenize ``messages``
+    into a filler-padded token stream and pass it to vLLM via
+    ``extra_body={"prompt_token_ids": ...}`` so turn-based KV eviction
+    lands on block boundaries.
+
+    The validator in ``prime-rl/src/prime_rl/configs/rl.py`` forbids
+    enabling both simultaneously, so in practice at most one branch fires
+    per request. The branches are independent and compose safely if that
+    changed.
 
     Idempotent — sentinel-attribute guarded so repeated imports / test
-    teardowns don't stack wrappers. No-op passthrough when
-    `_padding_config` is None or disabled.
+    teardowns don't stack wrappers. No-op passthrough when neither config
+    is enabled.
     """
     try:
         from openai.resources.chat.completions.completions import (
@@ -470,6 +523,64 @@ def _install_message_padding_interceptor() -> None:
         return
 
     async def patched_create(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # --- Branch A: Markovian Thinker client-side truncation ---
+        mcfg = _markovian_config
+        if mcfg is not None and mcfg.enabled:
+            messages = kwargs.get("messages")
+            if messages is not None:
+                orig_len = len(messages)
+                truncated = truncate_messages_to_last_k_turns(
+                    messages,
+                    max_turns=mcfg.max_turns,
+                    log_fn=(
+                        (lambda m: logger.info("[MARKOVIAN] %s", m))
+                        if mcfg.log_truncated_messages
+                        else None
+                    ),
+                )
+                kwargs["messages"] = truncated
+
+                # Re-tokenize the truncated messages so the trainer uses
+                # the exact token stream vLLM will run on (see plan:
+                # "The prompt_token_ids divergence"). We render with the
+                # same tokenizer + chat template vLLM uses internally so
+                # tokens are byte-identical.
+                rendered = mcfg.tokenizer.apply_chat_template(
+                    truncated,
+                    tools=kwargs.get("tools"),
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                truncated_ids = mcfg.tokenizer.encode(
+                    rendered, add_special_tokens=False
+                )
+
+                # Forward the pre-tokenized stream to vLLM via extra_body
+                # so vLLM skips its own chat rendering (and the
+                # tool_choice="auto" validation that openai-python
+                # defaults to when `tools` is present — vLLM rejects
+                # that unless launched with --enable-auto-tool-choice,
+                # which BALROG-style envs that parse <tool_call> from
+                # raw text don't want). This also guarantees vLLM sees
+                # the byte-identical token stream the trainer will
+                # forward against.
+                extra_body = dict(kwargs.pop("extra_body", None) or {})
+                extra_body["prompt_token_ids"] = truncated_ids
+                kwargs["extra_body"] = extra_body
+
+                response = await orig_create(self, *args, **kwargs)
+                _stash_prompt_token_ids(response, truncated_ids)
+
+                # Observability counter: only increment when truncation
+                # actually dropped messages (short rollouts are no-ops).
+                if len(truncated) < orig_len:
+                    _markovian_stats["n_truncations"] += 1
+                    _markovian_stats["n_messages_dropped"] += (
+                        orig_len - len(truncated)
+                    )
+                return response
+
+        # --- Branch B: block-aligned message padding ---
         cfg = _padding_config
         if cfg is None or not cfg.enabled:
             return await orig_create(self, *args, **kwargs)
@@ -525,19 +636,7 @@ def _install_message_padding_interceptor() -> None:
         )
 
         response = await orig_create(self, *args, **kwargs)
-
-        # Stash the padded ids on the response so Patch #1 can forward
-        # them to the verifiers Response and Patch #2 can attach them
-        # to the trajectory step's extras. `ChatCompletion` in
-        # openai-python is a pydantic BaseModel with `extra="allow"`,
-        # so setattr writes to __pydantic_extra__.
-        try:
-            setattr(response, "prompt_token_ids", padded)
-        except Exception:
-            if hasattr(response, "model_extra"):
-                if response.model_extra is None:
-                    response.__pydantic_extra__ = {}
-                response.model_extra["prompt_token_ids"] = padded
+        _stash_prompt_token_ids(response, padded)
         return response
 
     patched_create.__kv_eviction_padding_patched__ = True  # type: ignore[attr-defined]
@@ -597,6 +696,124 @@ def _autoconfigure_padding_from_env() -> None:
 
 
 _autoconfigure_padding_from_env()
+
+
+# ─── Markovian Thinker: client-side message truncation ───
+#
+# When enabled by the orchestrator via `configure_markovian_thinker(...)`,
+# the AsyncCompletions.create interceptor (Branch A above) truncates each
+# chat completion request's `messages` to the last K complete turn groups
+# BEFORE the request reaches vLLM. vLLM runs a normal, full-context
+# completion on the truncated prompt — no compaction, no eviction, no
+# `CompactionEvent`s. The orchestrator re-tokenizes the truncated
+# messages and stashes the exact token ids on the response so the
+# trainer forwards against the same tokens vLLM saw (see
+# `plans/markovian_thinker_baseline.md` → "The prompt_token_ids divergence").
+#
+# A validator in prime-rl (`validate_markovian_thinker` on RLConfig)
+# rejects configurations that enable Markovian alongside vLLM or trainer
+# compaction, block-aligned padding, or the TITO token client.
+
+
+@dataclass
+class MarkovianThinkerRuntimeConfig:
+    """Runtime config installed by the orchestrator at startup. Fields
+    come from prime-rl's `orchestrator.markovian_thinker` section."""
+
+    enabled: bool
+    tokenizer: Any
+    max_turns: int
+    log_truncated_messages: bool
+
+
+# `_markovian_config` and `_markovian_stats` are forward-declared above
+# the `_install_message_padding_interceptor()` call — see comment there.
+
+
+def configure_markovian_thinker(
+    *,
+    enabled: bool,
+    tokenizer: Any,
+    max_turns: int,
+    log_truncated_messages: bool = False,
+) -> None:
+    """Install the orchestrator-wide Markovian Thinker config.
+
+    Called once by prime-rl's orchestrator at startup, before any
+    rollouts fire. Idempotent — repeated calls overwrite the previous
+    config.
+    """
+    global _markovian_config
+    _markovian_config = MarkovianThinkerRuntimeConfig(
+        enabled=enabled,
+        tokenizer=tokenizer,
+        max_turns=max_turns,
+        log_truncated_messages=log_truncated_messages,
+    )
+    if enabled:
+        logger.info(
+            "kv_eviction: Markovian Thinker ENABLED (max_turns=%d, log=%s)",
+            max_turns,
+            log_truncated_messages,
+        )
+
+
+def pop_markovian_stats() -> dict[str, int]:
+    """Drain-and-reset the Markovian counters. Called once per
+    orchestrator step to emit `markovian/*` metrics to wandb.
+    """
+    global _markovian_stats
+    out = dict(_markovian_stats)
+    _markovian_stats = {"n_truncations": 0, "n_messages_dropped": 0}
+    return out
+
+
+def _autoconfigure_markovian_from_env() -> None:
+    """Auto-enable Markovian Thinker from environment variables.
+
+    The orchestrator sets these before spawning the verifiers env server
+    subprocess (mp.spawn starts a fresh interpreter that won't inherit
+    the parent's `configure_markovian_thinker(...)` call). The subprocess
+    imports `kv_eviction` via its entrypoint shim, which triggers this
+    function and re-configures truncation from env vars.
+
+    Env var contract:
+      KV_EVICTION_MARKOVIAN_ENABLED    — "1" enables; absence disables.
+      KV_EVICTION_MARKOVIAN_MAX_TURNS  — int.
+      KV_EVICTION_MARKOVIAN_MODEL      — tokenizer name_or_path.
+
+    No-ops if already configured or if env vars are absent.
+    """
+    import os as _os
+
+    global _markovian_config
+    if _markovian_config is not None and _markovian_config.enabled:
+        return
+    if _os.environ.get("KV_EVICTION_MARKOVIAN_ENABLED") != "1":
+        return
+    max_turns_str = _os.environ.get("KV_EVICTION_MARKOVIAN_MAX_TURNS")
+    model_name = _os.environ.get("KV_EVICTION_MARKOVIAN_MODEL")
+    if not max_turns_str or not model_name:
+        logger.warning(
+            "kv_eviction: KV_EVICTION_MARKOVIAN_ENABLED=1 but "
+            "KV_EVICTION_MARKOVIAN_MAX_TURNS / KV_EVICTION_MARKOVIAN_MODEL "
+            "missing; Markovian Thinker NOT enabled in this process"
+        )
+        return
+    max_turns = int(max_turns_str)
+    log_truncated = _os.environ.get("KV_EVICTION_MARKOVIAN_LOG") == "1"
+    from transformers import AutoTokenizer  # local import to keep env.py lean
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    configure_markovian_thinker(
+        enabled=True,
+        tokenizer=tokenizer,
+        max_turns=max_turns,
+        log_truncated_messages=log_truncated,
+    )
+
+
+_autoconfigure_markovian_from_env()
 
 
 def padded_ids_from_step_extras(

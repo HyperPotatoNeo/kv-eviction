@@ -549,6 +549,74 @@ def render_kv_cache_state(
     )
 
 
+def render_tokens_html(input_ids_str: str | list) -> str:
+    """Render raw token IDs as flowing text with per-token hover tooltips.
+
+    Special tokens appear as visible badges; newlines force a line break;
+    regular tokens are shown as the decoded text with alternating faint
+    background so boundaries are visible. Hover over any token to see its ID.
+    """
+    if not input_ids_str:
+        return "<div style='color:#666;font-family:monospace;font-size:12px;'>No input_ids available.</div>"
+    try:
+        ids = json.loads(input_ids_str) if isinstance(input_ids_str, str) else list(input_ids_str)
+    except (json.JSONDecodeError, TypeError):
+        return f"<div style='color:#e74c3c;font-family:monospace;'>Could not parse input_ids: {html.escape(str(input_ids_str)[:200])}</div>"
+
+    tok = get_tokenizer()
+    decoded = [tok.decode([i], skip_special_tokens=False) for i in ids]
+
+    parts = []
+    alt = False  # alternating background for token boundaries
+    for pos, (tid, text) in enumerate(zip(ids, decoded)):
+        title = f"pos={pos} id={tid}"
+        if tid == IM_START_ID:
+            parts.append(
+                f'<br><span style="display:inline-block;margin:2px 1px;padding:1px 6px;'
+                f'border-radius:3px;background:#3a1a4a;color:#c084fc;font-family:monospace;'
+                f'font-size:12px;font-weight:bold;" title="{title}">&lt;|im_start|&gt;</span>'
+            )
+            alt = False
+            continue
+        if tid == IM_END_ID:
+            parts.append(
+                f'<span style="display:inline-block;margin:2px 1px;padding:1px 6px;'
+                f'border-radius:3px;background:#2a0a3a;color:#a855f7;font-family:monospace;'
+                f'font-size:12px;font-weight:bold;" title="{title}">&lt;|im_end|&gt;</span><br>'
+            )
+            alt = False
+            continue
+        if text == "\n":
+            parts.append(f'<span title="{title}" style="color:#444;font-size:11px;">↵</span><br>')
+            alt = False
+            continue
+        if text.strip() == "":
+            # Pure whitespace — show as faint dot so boundary is still visible
+            esc = html.escape(text)
+            parts.append(
+                f'<span style="white-space:pre;color:#444;font-family:monospace;font-size:13px;" '
+                f'title="{title}">{esc}</span>'
+            )
+            continue
+
+        bg = "#1e2a38" if alt else "#141e28"
+        alt = not alt
+        esc = html.escape(text)
+        parts.append(
+            f'<span style="white-space:pre;background:{bg};color:#b0d0f0;font-family:monospace;'
+            f'font-size:13px;border-radius:2px;padding:0 1px;" title="{title}">{esc}</span>'
+        )
+
+    total = len(ids)
+    body = "".join(parts)
+    return (
+        f'<div style="margin-bottom:6px;font-family:monospace;font-size:11px;color:#888;">'
+        f'{total} tokens &nbsp;·&nbsp; hover any token to see its position and ID</div>'
+        f'<div style="max-height:500px;overflow-y:auto;padding:10px;background:#0d1117;'
+        f'border:1px solid #2a2a2a;border-radius:6px;line-height:2;">{body}</div>'
+    )
+
+
 def render_system_prompt_html(system_prompt: str) -> str:
     """Render the system prompt (truncated)."""
     if not system_prompt:
@@ -666,9 +734,12 @@ def build_app(samples: list[dict]) -> gr.Blocks:
         with gr.Accordion("Full conversation (all messages)", open=False):
             full_msgs_html = gr.HTML()
 
+        with gr.Accordion("Raw tokens (input_ids)", open=False):
+            tokens_html = gr.HTML()
+
         def on_rollout(choice):
             if not choice:
-                return gr.update(maximum=0, value=0), "", "", "", "", "", "", "", ""
+                return gr.update(maximum=0, value=0), "", "", "", "", "", "", "", "", ""
             idx = labels.index(choice)
             s = samples[idx]
             turns = s["turns"]
@@ -722,9 +793,12 @@ def build_app(samples: list[dict]) -> gr.Blocks:
             # Full conversation
             full = render_all_messages_html(s["messages_parsed"])
 
+            # Raw tokens
+            tokens = render_tokens_html(s.get("input_ids", ""))
+
             return (
                 gr.update(maximum=max_turn, value=0),
-                bar, cb, kv, obs, resp, tl, sys_html, full,
+                bar, cb, kv, obs, resp, tl, sys_html, full, tokens,
             )
 
         def on_turn(choice, turn):
@@ -751,7 +825,7 @@ def build_app(samples: list[dict]) -> gr.Blocks:
 
         rollout_dd.change(
             on_rollout, [rollout_dd],
-            [turn_sl, ep_bar, compact_html, kv_html, obs_html, resp_html, timeline_html, system_html, full_msgs_html],
+            [turn_sl, ep_bar, compact_html, kv_html, obs_html, resp_html, timeline_html, system_html, full_msgs_html, tokens_html],
         )
         turn_sl.change(
             on_turn, [rollout_dd, turn_sl],
@@ -759,7 +833,7 @@ def build_app(samples: list[dict]) -> gr.Blocks:
         )
         demo.load(
             on_rollout, [rollout_dd],
-            [turn_sl, ep_bar, compact_html, kv_html, obs_html, resp_html, timeline_html, system_html, full_msgs_html],
+            [turn_sl, ep_bar, compact_html, kv_html, obs_html, resp_html, timeline_html, system_html, full_msgs_html, tokens_html],
         )
 
     return demo
