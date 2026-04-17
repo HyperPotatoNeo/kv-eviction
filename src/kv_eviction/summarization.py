@@ -323,12 +323,19 @@ class SummaryTrainSample:
       in generation order. Becomes the trainer's ``old_logprobs``.
     - ``model``: model name used — trainer sanity-checks this matches
       the rollout model to avoid cross-model logprob mixups.
+    - ``compaction_events``: vLLM-side eviction events emitted during
+      the summary call's prefill/decode. Populated in ``mode="eviction"``
+      only. Empty in ``mode="markovian"`` (no vLLM compaction). Stored
+      as plain JSON-serializable dicts to survive the msgspec roundtrip
+      through verifiers' trajectory-state path; converted to
+      ``CompactionEventWire`` in ``_build_summary_sample``.
     """
 
     prompt_token_ids: list[int] = field(default_factory=list)
     completion_token_ids: list[int] = field(default_factory=list)
     completion_logprobs: list[float] = field(default_factory=list)
     model: str = ""
+    compaction_events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -344,4 +351,7 @@ class SummaryTrainSample:
                 float(x) for x in d.get("completion_logprobs", []) or []
             ],
             model=str(d.get("model", "") or ""),
+            compaction_events=[
+                dict(e) for e in (d.get("compaction_events") or []) if isinstance(e, dict)
+            ],
         )

@@ -522,6 +522,36 @@ async def _generate_summary(
         "top_logprobs": 0,
     }
 
+    # Eviction mode + padding enabled: render the summary call's prompt
+    # block-aligned so its ``prompt_token_ids`` land on a block boundary.
+    # Otherwise the trainer's ``prompt_aligned_len = ceil(prompt_len /
+    # block_size) * block_size`` can overshoot ``seq_len`` on short
+    # summaries and trip segmented_forward's invariant assert.
+    pad_cfg = _padding_config
+    if (
+        scfg.mode == "eviction"
+        and pad_cfg is not None
+        and pad_cfg.enabled
+    ):
+        try:
+            _raw, padded_ids, _pads = render_padded_prompt(
+                tokenizer=pad_cfg.tokenizer,
+                messages=summary_messages,
+                tools=outer_kwargs.get("tools"),
+                block_size=pad_cfg.block_size,
+                filler_token_id=pad_cfg.filler_token_id,
+                im_end_token_id=pad_cfg.im_end_token_id,
+            )
+        except Exception:
+            logger.exception(
+                "kv_eviction: summary-call render_padded_prompt failed; "
+                "falling back to server-side rendering"
+            )
+        else:
+            extra_body = dict(summary_kwargs.pop("extra_body", None) or {})
+            extra_body["prompt_token_ids"] = padded_ids
+            summary_kwargs["extra_body"] = extra_body
+
     token = _IN_SUMMARY_CALL.set(True)
     t0 = _time.perf_counter()
     try:
@@ -556,11 +586,19 @@ async def _generate_summary(
     prompt_ids = _summary_extract_prompt_token_ids(resp)
     completion_ids = extract_completion_token_ids(resp)
     completion_logprobs = extract_completion_logprobs(resp)
+    # Eviction mode: capture vLLM-side compaction events that fired
+    # during the summary call's prefill/decode so the trainer treats
+    # the summary sample as a compaction sample (events branch in
+    # train.py's prompt_aligned_len math).
+    summary_events: list[dict] = []
+    if scfg.mode == "eviction":
+        summary_events = list(_extract_compaction_event_dicts(resp) or [])
     sample_dict: dict | None = {
         "prompt_token_ids": prompt_ids,
         "completion_token_ids": completion_ids,
         "completion_logprobs": completion_logprobs,
         "model": outer_kwargs.get("model") or "",
+        "compaction_events": summary_events,
     }
 
     if scfg.log_summaries:
@@ -810,18 +848,51 @@ def _install_message_padding_interceptor() -> None:
 
                 kwargs["messages"] = new_messages
 
-                # Re-tokenize so the trainer uses the exact token stream
-                # vLLM will run on (see `plans/markovian_thinker_baseline.md`
-                # — "The prompt_token_ids divergence").
-                rendered = mcfg.tokenizer.apply_chat_template(
-                    new_messages,
-                    tools=kwargs.get("tools"),
-                    add_generation_prompt=True,
-                    tokenize=False,
+                # Eviction-mode splice + padding enabled: render the
+                # post-summary message list with block-aligned filler
+                # padding so the trainer's ``prompt_aligned_len`` math
+                # is exact (prompt_len already block-aligned → no
+                # rounding overshoot). Otherwise: use the raw
+                # apply_chat_template + encode path, which is what the
+                # pre-summary markovian baseline relies on.
+                pad_cfg_A = _padding_config
+                use_padding_A = (
+                    scfg is not None
+                    and scfg.mode == "eviction"
+                    and pad_cfg_A is not None
+                    and pad_cfg_A.enabled
                 )
-                truncated_ids = mcfg.tokenizer.encode(
-                    rendered, add_special_tokens=False
-                )
+                truncated_ids = None
+                if use_padding_A:
+                    try:
+                        _raw, truncated_ids, _pads = render_padded_prompt(
+                            tokenizer=pad_cfg_A.tokenizer,
+                            messages=new_messages,
+                            tools=kwargs.get("tools"),
+                            block_size=pad_cfg_A.block_size,
+                            filler_token_id=pad_cfg_A.filler_token_id,
+                            im_end_token_id=pad_cfg_A.im_end_token_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "kv_eviction: branch-A eviction-mode "
+                            "render_padded_prompt failed; falling back "
+                            "to raw chat-template encode"
+                        )
+                        truncated_ids = None
+                if truncated_ids is None:
+                    # Re-tokenize so the trainer uses the exact token stream
+                    # vLLM will run on (see `plans/markovian_thinker_baseline.md`
+                    # — "The prompt_token_ids divergence").
+                    rendered = mcfg.tokenizer.apply_chat_template(
+                        new_messages,
+                        tools=kwargs.get("tools"),
+                        add_generation_prompt=True,
+                        tokenize=False,
+                    )
+                    truncated_ids = mcfg.tokenizer.encode(
+                        rendered, add_special_tokens=False
+                    )
 
                 # Forward the pre-tokenized stream to vLLM via extra_body
                 # (see the pre-summary version of this branch for the
