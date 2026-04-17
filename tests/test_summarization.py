@@ -346,7 +346,7 @@ def test_build_post_summary_does_not_mutate_inputs():
 
 
 def test_build_post_summary_markovian_preserves_n_turns():
-    """n_preserved_turns=2: sys + [I, S] + last_2_body_groups + tail."""
+    """n_preserved_turns=2: sys + last_2_body_groups + [I, S] + tail."""
     sys_p = [_sys()]
     body = [list(_turn(1)), list(_turn(2)), list(_turn(3)), list(_turn(4))]
     tail = [_user("pending")]
@@ -361,10 +361,10 @@ def test_build_post_summary_markovian_preserves_n_turns():
     )
     assert out == [
         _sys(),
-        {"role": "user", "content": INSTR},
-        {"role": "assistant", "content": "SUMMARY"},
         *_turn(3),
         *_turn(4),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
         _user("pending"),
     ]
 
@@ -385,9 +385,9 @@ def test_build_post_summary_markovian_preserves_more_than_available():
     )
     assert out == [
         _sys(),
+        *_turn(1),
         {"role": "user", "content": INSTR},
         {"role": "assistant", "content": "SUMMARY"},
-        *_turn(1),
         _user("pending"),
     ]
 

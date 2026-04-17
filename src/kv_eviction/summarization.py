@@ -144,9 +144,11 @@ def build_post_summary_messages(
     """Build the message list spliced with the summary exchange.
 
     - ``mode="markovian"``: partial client-side reset. Drop all but the
-      last ``n_preserved_turns`` body groups; splice ``[I, S]`` between
-      the sys prefix and the kept tail context. Output is
-      ``sys_prefix + [I, S] + last_N_body_groups + tail``. When
+      last ``n_preserved_turns`` body groups; splice ``[I, S]`` AFTER
+      them so the order mirrors the temporal generation sequence (the
+      preserved body happened first, then the summary, then the tail is
+      the current in-flight turn). Output is
+      ``sys_prefix + last_N_body_groups + [I, S] + tail``. When
       ``n_preserved_turns == 0`` (default) this is the strict full-reset
       ``sys_prefix + [I, S] + tail``.
     - ``mode="eviction"``: append-only splice. Keep ``body_groups``.
@@ -164,7 +166,7 @@ def build_post_summary_messages(
         if keep > 0 and body_groups:
             for g in body_groups[-keep:]:
                 preserved.extend(g)
-        return list(sys_prefix) + [I_msg, S_msg] + preserved + list(tail)
+        return list(sys_prefix) + preserved + [I_msg, S_msg] + list(tail)
     if mode == "eviction":
         out: list[dict] = list(sys_prefix)
         for g in body_groups:
