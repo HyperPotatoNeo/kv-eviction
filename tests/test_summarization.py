@@ -14,6 +14,7 @@ import pytest
 from kv_eviction.summarization import (
     SummaryTrainSample,
     build_exchange,
+    build_post_summary_messages,
     content_to_text,
     count_summary_exchanges,
     partition_messages,
@@ -241,6 +242,121 @@ def test_build_exchange_roundtrip_through_partition():
     assert groups[1][0] == I_msg
     assert groups[1][1] == S_msg
     assert count_summary_exchanges(msgs, INSTR) == 1
+
+
+# ─── build_post_summary_messages ───
+
+
+def test_build_post_summary_markovian_drops_body():
+    sys_p = [_sys()]
+    body = [list(_turn(1)), list(_turn(2))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="markovian",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+    )
+    assert out == [
+        _sys(),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+        _user("pending"),
+    ]
+
+
+def test_build_post_summary_eviction_keeps_body():
+    sys_p = [_sys()]
+    body = [list(_turn(1)), list(_turn(2))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="eviction",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+    )
+    assert out == [
+        _sys(),
+        *_turn(1),
+        *_turn(2),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+        _user("pending"),
+    ]
+
+
+def test_build_post_summary_empty_body_groups():
+    # No prior turns (only sys + tail). Markovian output still has [I, S].
+    out = build_post_summary_messages(
+        mode="markovian",
+        sys_prefix=[_sys()],
+        body_groups=[],
+        tail=[],
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+    )
+    assert out == [
+        _sys(),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+    ]
+
+
+def test_build_post_summary_unknown_mode_raises():
+    with pytest.raises(ValueError, match="unknown mode"):
+        build_post_summary_messages(
+            mode="nope",
+            sys_prefix=[_sys()],
+            body_groups=[],
+            tail=[],
+            instruction_text=INSTR,
+            summary_text="s",
+        )
+
+
+def test_build_post_summary_does_not_mutate_inputs():
+    from copy import deepcopy
+
+    sys_p = [_sys()]
+    body = [list(_turn(1))]
+    tail = [_user("pending")]
+    sys_snap = deepcopy(sys_p)
+    body_snap = deepcopy(body)
+    tail_snap = deepcopy(tail)
+    _ = build_post_summary_messages(
+        mode="eviction",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+    )
+    assert sys_p == sys_snap
+    assert body == body_snap
+    assert tail == tail_snap
+
+
+def test_build_post_summary_eviction_roundtrip_through_partition():
+    """Spliced list re-partitions correctly — the summary exchange
+    lands as its own group, body groups remain intact."""
+    msgs_before = [_sys(), *_turn(1), *_turn(2)]
+    _n, sys_p, body, tail = partition_messages(msgs_before)
+    out = build_post_summary_messages(
+        mode="eviction",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+    )
+    n2, _sp2, groups2, _t2 = partition_messages(out)
+    # Original 2 body groups + the new summary exchange group = 3.
+    assert n2 == 3
+    assert count_summary_exchanges(out, INSTR) == 1
 
 
 # ─── sanitize_summary ───

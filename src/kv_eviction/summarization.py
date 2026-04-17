@@ -132,6 +132,40 @@ def build_exchange(
     return I_msg, S_msg
 
 
+def build_post_summary_messages(
+    mode: str,
+    sys_prefix: list[dict],
+    body_groups: list[list[dict]],
+    tail: list[dict],
+    instruction_text: str,
+    summary_text: str,
+) -> list[dict]:
+    """Build the message list spliced with the summary exchange.
+
+    - ``mode="markovian"``: full client-side reset. Drop ``body_groups``.
+      Output is ``sys_prefix + [I, S] + tail``.
+    - ``mode="eviction"``: append-only splice. Keep ``body_groups``.
+      Output is ``sys_prefix + flatten(body_groups) + [I, S] + tail``.
+
+    Raises ``ValueError`` on unknown mode. Pure function — safe to unit
+    test without touching async / tokenizer code.
+    """
+    I_msg, S_msg = build_exchange(instruction_text, summary_text)
+    if mode == "markovian":
+        return list(sys_prefix) + [I_msg, S_msg] + list(tail)
+    if mode == "eviction":
+        out: list[dict] = list(sys_prefix)
+        for g in body_groups:
+            out.extend(g)
+        out.extend([I_msg, S_msg])
+        out.extend(tail)
+        return out
+    raise ValueError(
+        f"build_post_summary_messages: unknown mode={mode!r}; "
+        "expected 'markovian' or 'eviction'"
+    )
+
+
 # ChatML markers that must never appear inside an assistant message
 # body — the chat template will emit its own. Strip them defensively
 # so a hallucinated template token doesn't poison subsequent renders.

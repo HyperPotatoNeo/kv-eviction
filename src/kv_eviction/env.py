@@ -30,6 +30,13 @@ from typing import Any
 from verifiers.types import Messages, Response as ModelResponse, State, TrajectoryStep
 
 from kv_eviction.padding import render_padded_prompt
+from kv_eviction.summarization import (
+    build_exchange,
+    build_post_summary_messages,
+    count_summary_exchanges,
+    partition_messages,
+    sanitize_summary,
+)
 from kv_eviction.truncation import truncate_messages_to_last_k_turns
 from kv_eviction.types import CompactionEventWire
 
@@ -451,6 +458,87 @@ _IN_SUMMARY_CALL: ContextVar[bool] = ContextVar(
 )
 
 
+async def _generate_summary(
+    orig_create,  # callable — the non-patched AsyncCompletions.create
+    self_,  # the AsyncCompletions instance (passed as first positional arg)
+    scfg,  # MarkovianSummaryRuntimeConfig
+    *,
+    outer_kwargs: dict,
+    full_messages: list[dict],
+) -> str | None:
+    """Fire a side-channel summary request against the rollout model.
+
+    Returns the sanitized summary text on success, or ``None`` on
+    failure (empty response, or raised exception when ``on_error="drop"``).
+    The caller decides what to do on ``None`` — typically, plain
+    Markovian truncation fallback.
+
+    ``orig_create`` is passed in explicitly (instead of captured via
+    closure inside ``_install_message_padding_interceptor``) so this
+    function is unit-testable with a mock.
+
+    Recursion guard: ``_IN_SUMMARY_CALL`` is set True for the duration
+    of the inner ``orig_create`` call so any subsequent re-entry into
+    ``patched_create`` short-circuits and leaves the summary request
+    un-intercepted. ``contextvars`` (not ``threading.local``) because
+    the interceptor is async and tasks may migrate between threads.
+    """
+    import time as _time
+
+    I_msg, _ = build_exchange(scfg.instruction_text, "")
+    summary_messages = list(full_messages) + [I_msg]
+
+    summary_kwargs = {
+        "model": outer_kwargs.get("model"),
+        "messages": summary_messages,
+        "max_tokens": scfg.max_len_summary,
+        "temperature": scfg.temperature,
+        "top_p": scfg.top_p,
+        "logprobs": True,
+        "top_logprobs": 0,
+    }
+
+    token = _IN_SUMMARY_CALL.set(True)
+    t0 = _time.perf_counter()
+    try:
+        resp = await orig_create(self_, **summary_kwargs)
+    except Exception:
+        if scfg.on_error == "raise":
+            raise
+        logger.warning(
+            "kv_eviction: Markovian summary request failed; falling back "
+            "to plain truncation",
+            exc_info=True,
+        )
+        _markovian_stats["n_summary_failures"] += 1
+        return None
+    finally:
+        _IN_SUMMARY_CALL.reset(token)
+    latency_ms = int((_time.perf_counter() - t0) * 1000)
+
+    try:
+        raw_text = resp.choices[0].message.content or ""
+    except (AttributeError, IndexError, TypeError):
+        raw_text = ""
+    text, was_sanitized = sanitize_summary(raw_text.strip())
+    if not text:
+        _markovian_stats["n_summary_failures"] += 1
+        return None
+
+    if scfg.log_summaries:
+        logger.info(
+            "[SUMMARY] (%s, %d chars%s) %s",
+            scfg.mode,
+            len(text),
+            ", sanitized" if was_sanitized else "",
+            text[:200],
+        )
+
+    _markovian_stats["n_summaries"] += 1
+    _markovian_stats["summary_latency_ms"] += latency_ms
+    return text
+
+
 def configure_message_padding(
     *,
     enabled: bool,
@@ -543,30 +631,91 @@ def _install_message_padding_interceptor() -> None:
         return
 
     async def patched_create(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # Recursion guard — see `_IN_SUMMARY_CALL` docstring. We do this
+        # first so the side-channel summary request bypasses the entire
+        # interceptor (both branches).
+        if _IN_SUMMARY_CALL.get():
+            return await orig_create(self, *args, **kwargs)
+
         # --- Branch A: Markovian Thinker client-side truncation ---
         mcfg = _markovian_config
         if mcfg is not None and mcfg.enabled:
             messages = kwargs.get("messages")
             if messages is not None:
                 orig_len = len(messages)
-                truncated = truncate_messages_to_last_k_turns(
-                    messages,
-                    max_turns=mcfg.max_turns,
-                    log_fn=(
-                        (lambda m: logger.info("[MARKOVIAN] %s", m))
-                        if mcfg.log_truncated_messages
-                        else None
-                    ),
-                )
-                kwargs["messages"] = truncated
+                scfg = _summary_config
 
-                # Re-tokenize the truncated messages so the trainer uses
-                # the exact token stream vLLM will run on (see plan:
-                # "The prompt_token_ids divergence"). We render with the
-                # same tokenizer + chat template vLLM uses internally so
-                # tokens are byte-identical.
+                summary_fired = False
+                if (
+                    scfg is not None
+                    and scfg.enabled
+                    and scfg.compaction_max_turns > 0
+                    and scfg.instruction_text
+                ):
+                    n_groups, sys_prefix, body_groups, tail = partition_messages(
+                        messages
+                    )
+                    n_real = n_groups - count_summary_exchanges(
+                        messages, scfg.instruction_text
+                    )
+                    if n_real > scfg.compaction_max_turns:
+                        summary_text = await _generate_summary(
+                            orig_create,
+                            self,
+                            scfg,
+                            outer_kwargs=kwargs,
+                            full_messages=messages,
+                        )
+                        if summary_text:
+                            new_messages = build_post_summary_messages(
+                                mode=scfg.mode,
+                                sys_prefix=sys_prefix,
+                                body_groups=body_groups,
+                                tail=tail,
+                                instruction_text=scfg.instruction_text,
+                                summary_text=summary_text,
+                            )
+                            summary_fired = True
+                        else:
+                            # Summary generation failed: fall through to
+                            # plain Markovian truncation.
+                            new_messages = truncate_messages_to_last_k_turns(
+                                messages,
+                                max_turns=mcfg.max_turns,
+                                log_fn=(
+                                    (lambda m: logger.info("[MARKOVIAN] %s", m))
+                                    if mcfg.log_truncated_messages
+                                    else None
+                                ),
+                            )
+                    else:
+                        new_messages = truncate_messages_to_last_k_turns(
+                            messages,
+                            max_turns=mcfg.max_turns,
+                            log_fn=(
+                                (lambda m: logger.info("[MARKOVIAN] %s", m))
+                                if mcfg.log_truncated_messages
+                                else None
+                            ),
+                        )
+                else:
+                    new_messages = truncate_messages_to_last_k_turns(
+                        messages,
+                        max_turns=mcfg.max_turns,
+                        log_fn=(
+                            (lambda m: logger.info("[MARKOVIAN] %s", m))
+                            if mcfg.log_truncated_messages
+                            else None
+                        ),
+                    )
+
+                kwargs["messages"] = new_messages
+
+                # Re-tokenize so the trainer uses the exact token stream
+                # vLLM will run on (see `plans/markovian_thinker_baseline.md`
+                # — "The prompt_token_ids divergence").
                 rendered = mcfg.tokenizer.apply_chat_template(
-                    truncated,
+                    new_messages,
                     tools=kwargs.get("tools"),
                     add_generation_prompt=True,
                     tokenize=False,
@@ -576,14 +725,8 @@ def _install_message_padding_interceptor() -> None:
                 )
 
                 # Forward the pre-tokenized stream to vLLM via extra_body
-                # so vLLM skips its own chat rendering (and the
-                # tool_choice="auto" validation that openai-python
-                # defaults to when `tools` is present — vLLM rejects
-                # that unless launched with --enable-auto-tool-choice,
-                # which BALROG-style envs that parse <tool_call> from
-                # raw text don't want). This also guarantees vLLM sees
-                # the byte-identical token stream the trainer will
-                # forward against.
+                # (see the pre-summary version of this branch for the
+                # long explanation of why).
                 extra_body = dict(kwargs.pop("extra_body", None) or {})
                 extra_body["prompt_token_ids"] = truncated_ids
                 kwargs["extra_body"] = extra_body
@@ -591,12 +734,13 @@ def _install_message_padding_interceptor() -> None:
                 response = await orig_create(self, *args, **kwargs)
                 _stash_prompt_token_ids(response, truncated_ids)
 
-                # Observability counter: only increment when truncation
-                # actually dropped messages (short rollouts are no-ops).
-                if len(truncated) < orig_len:
+                # Observability: truncation counters fire even when the
+                # summary path ran (the interceptor still reduced or
+                # rewrote the message list in some way).
+                if len(new_messages) != orig_len or summary_fired:
                     _markovian_stats["n_truncations"] += 1
-                    _markovian_stats["n_messages_dropped"] += (
-                        orig_len - len(truncated)
+                    _markovian_stats["n_messages_dropped"] += max(
+                        0, orig_len - len(new_messages)
                     )
                 return response
 
