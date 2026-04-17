@@ -666,3 +666,224 @@ def test_attach_summary_trainsample_noop_when_absent():
     step: dict = {"extras": None}
     env.attach_summary_trainsample_from_response(step, resp)  # type: ignore[arg-type]
     assert step["extras"] is None
+
+
+# ─── Eviction-mode padding + compaction_events capture ───
+
+
+def _install_padding(enabled=True, block_size=16):
+    """Install a MessagePaddingConfig. Tokenizer is the stub from above;
+    the real render_padded_prompt is patched per-test so its internals
+    don't care about tokenizer behavior."""
+    env.configure_message_padding(
+        enabled=enabled,
+        tokenizer=_StubTok(),
+        block_size=block_size,
+        filler_token_id=198,
+        im_end_token_id=151645,
+    )
+
+
+def test_eviction_mode_padding_enabled_pads_summary_call():
+    """When scfg.mode=='eviction' and _padding_config is enabled,
+    _generate_summary should render the summary call's prompt via
+    render_padded_prompt and forward the padded ids via
+    extra_body.prompt_token_ids."""
+    _install_mt(max_turns=8)
+    _install_summary(mode="eviction", compaction_max_turns=2)
+    _install_padding(enabled=True, block_size=16)
+
+    calls: list[dict] = []
+
+    async def fake_orig(self, *args, **kwargs):
+        calls.append(dict(kwargs))
+        if kwargs.get("logprobs") is True:
+            return _make_summary_response("S-PAD")
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    padded_summary_ids = list(range(32))  # len=32, multiple of block_size=16
+    padded_outer_ids = list(range(48))  # len=48, multiple of block_size=16
+
+    call_count = {"n": 0}
+
+    def fake_render(*, tokenizer, messages, tools, block_size, filler_token_id, im_end_token_id):
+        call_count["n"] += 1
+        # First call is inside _generate_summary (summary_messages), second
+        # call is in Branch A for the outer rewritten messages.
+        ids = padded_summary_ids if call_count["n"] == 1 else padded_outer_ids
+        return f"rendered-{call_count['n']}", ids, []
+
+    async def factory(patched):
+        return await patched(self=None, model="m", messages=msgs)
+
+    with patch.object(env, "render_padded_prompt", fake_render):
+        _run_with_fake_orig(fake_orig, factory)
+
+    # render_padded_prompt was called twice: once for the summary call,
+    # once for the outer rewrite.
+    assert call_count["n"] == 2
+
+    # Summary call (calls[0]) carries padded prompt_token_ids via extra_body.
+    summary_call = calls[0]
+    assert summary_call["logprobs"] is True
+    assert "extra_body" in summary_call
+    assert summary_call["extra_body"]["prompt_token_ids"] == padded_summary_ids
+    assert len(padded_summary_ids) % 16 == 0
+
+    # Outer call (calls[1]) carries the outer padded ids via extra_body.
+    outer_call = calls[1]
+    assert outer_call["extra_body"]["prompt_token_ids"] == padded_outer_ids
+    assert len(padded_outer_ids) % 16 == 0
+
+
+def test_eviction_mode_padding_disabled_no_padding():
+    """When _padding_config is disabled, even eviction mode falls back to
+    the raw apply_chat_template + encode path — no render_padded_prompt
+    call."""
+    _install_mt(max_turns=8)
+    _install_summary(mode="eviction", compaction_max_turns=2)
+    _install_padding(enabled=False)
+
+    async def fake_orig(self, *args, **kwargs):
+        if kwargs.get("logprobs") is True:
+            return _make_summary_response("S")
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    call_count = {"n": 0}
+
+    def fake_render(**kwargs):
+        call_count["n"] += 1
+        return "rendered", [0], []
+
+    async def factory(patched):
+        return await patched(self=None, model="m", messages=msgs)
+
+    with patch.object(env, "render_padded_prompt", fake_render):
+        _run_with_fake_orig(fake_orig, factory)
+
+    # Padding is disabled: render_padded_prompt never called.
+    assert call_count["n"] == 0
+
+
+def test_markovian_mode_ignores_padding_config():
+    """Markovian mode must be byte-identical regardless of padding
+    config — no render_padded_prompt invocation even when padding is
+    enabled. This is the parity-regression guard."""
+    _install_mt(max_turns=8)
+    _install_summary(mode="markovian", compaction_max_turns=2)
+    _install_padding(enabled=True, block_size=16)
+
+    async def fake_orig(self, *args, **kwargs):
+        if kwargs.get("logprobs") is True:
+            return _make_summary_response("S")
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    call_count = {"n": 0}
+
+    def fake_render(**kwargs):
+        call_count["n"] += 1
+        return "rendered", [0], []
+
+    async def factory(patched):
+        return await patched(self=None, model="m", messages=msgs)
+
+    with patch.object(env, "render_padded_prompt", fake_render):
+        _run_with_fake_orig(fake_orig, factory)
+
+    assert call_count["n"] == 0
+
+
+def test_eviction_mode_captures_compaction_events_on_summary():
+    """In eviction mode, compaction_events emitted by vLLM during the
+    summary call's prefill/decode must land on the
+    summary_trainsample dict. The trainer uses these events to compute
+    prompt_aligned_len correctly."""
+    _install_mt(max_turns=8)
+    _install_summary(mode="eviction", compaction_max_turns=2)
+
+    events = [
+        {
+            "num_output_tokens_at_compaction": 128,
+            "tokens_evicted": 512,
+            "position_offset_after": 4096,
+            "num_prompt_tokens": 2048,
+            "evict_start": 0,
+        },
+    ]
+
+    async def fake_orig(self, *args, **kwargs):
+        if kwargs.get("logprobs") is True:
+            resp = _make_summary_response(
+                "S",
+                prompt_ids=[1, 2, 3],
+                completion_ids=[9, 10],
+                logprobs=[-0.1, -0.2],
+            )
+            resp.compaction_events = events
+            return resp
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    captured = {}
+
+    async def factory(patched):
+        r = await patched(self=None, model="test-model", messages=msgs)
+        captured["response"] = r
+        return r
+
+    _run_with_fake_orig(fake_orig, factory)
+
+    attached = captured["response"].summary_trainsample
+    assert attached["compaction_events"] == events
+
+
+def test_markovian_mode_ignores_compaction_events_on_summary():
+    """Markovian mode must not capture compaction_events even if a test
+    response has them. The summary sample's compaction_events must be
+    an empty list (not None), so the orchestrator sees a no-event
+    sample and builds a plain TrainingSample."""
+    _install_mt(max_turns=8)
+    _install_summary(mode="markovian", compaction_max_turns=2)
+
+    events = [
+        {
+            "num_output_tokens_at_compaction": 64,
+            "tokens_evicted": 256,
+            "position_offset_after": 2048,
+            "num_prompt_tokens": 1024,
+            "evict_start": 0,
+        },
+    ]
+
+    async def fake_orig(self, *args, **kwargs):
+        if kwargs.get("logprobs") is True:
+            resp = _make_summary_response(
+                "S",
+                prompt_ids=[1, 2],
+                completion_ids=[3, 4],
+                logprobs=[-0.1, -0.2],
+            )
+            resp.compaction_events = events
+            return resp
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    captured = {}
+
+    async def factory(patched):
+        r = await patched(self=None, model="test-model", messages=msgs)
+        captured["response"] = r
+        return r
+
+    _run_with_fake_orig(fake_orig, factory)
+
+    attached = captured["response"].summary_trainsample
+    assert attached["compaction_events"] == []

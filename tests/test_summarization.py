@@ -586,6 +586,7 @@ def test_summary_train_sample_defaults():
     assert s.completion_token_ids == []
     assert s.completion_logprobs == []
     assert s.model == ""
+    assert s.compaction_events == []
 
 
 def test_summary_train_sample_roundtrip_lossless():
@@ -601,9 +602,36 @@ def test_summary_train_sample_roundtrip_lossless():
         "completion_token_ids": [4, 5],
         "completion_logprobs": [-0.1, -0.2],
         "model": "Qwen/Qwen2.5-4B",
+        "compaction_events": [],
     }
     s2 = SummaryTrainSample.from_dict(d)
     assert s == s2
+
+
+def test_summary_train_sample_roundtrip_with_events():
+    # Eviction mode: the interceptor stashes vLLM-side compaction events
+    # on the sample dict as plain JSON-serializable dicts. Ensure the
+    # roundtrip preserves them verbatim.
+    events = [
+        {
+            "num_output_tokens_at_compaction": 128,
+            "tokens_evicted": 512,
+            "position_offset_after": 4608,
+            "num_prompt_tokens": 5120,
+            "evict_start": 0,
+        }
+    ]
+    s = SummaryTrainSample(
+        prompt_token_ids=[1, 2],
+        completion_token_ids=[3, 4, 5],
+        completion_logprobs=[-0.1, -0.2, -0.3],
+        model="Qwen/Qwen2.5-4B",
+        compaction_events=events,
+    )
+    d = s.to_dict()
+    assert d["compaction_events"] == events
+    s2 = SummaryTrainSample.from_dict(d)
+    assert s2 == s
 
 
 def test_summary_train_sample_from_dict_defensive():
@@ -613,6 +641,7 @@ def test_summary_train_sample_from_dict_defensive():
     assert s.completion_token_ids == []
     assert s.completion_logprobs == []
     assert s.model == ""
+    assert s.compaction_events == []
 
 
 def test_summary_train_sample_from_dict_none_fields():
@@ -623,12 +652,14 @@ def test_summary_train_sample_from_dict_none_fields():
             "completion_token_ids": None,
             "completion_logprobs": None,
             "model": None,
+            "compaction_events": None,
         }
     )
     assert s.prompt_token_ids == []
     assert s.completion_token_ids == []
     assert s.completion_logprobs == []
     assert s.model == ""
+    assert s.compaction_events == []
 
 
 def test_summary_train_sample_from_dict_coerces_types():
