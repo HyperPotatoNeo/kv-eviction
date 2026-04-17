@@ -768,6 +768,7 @@ def _install_message_padding_interceptor() -> None:
                                 tail=tail,
                                 instruction_text=scfg.instruction_text,
                                 summary_text=summary_text,
+                                n_preserved_turns=(mcfg.stride or 0),
                             )
                             summary_fired = True
                         else:
@@ -776,6 +777,7 @@ def _install_message_padding_interceptor() -> None:
                             new_messages = truncate_messages_to_last_k_turns(
                                 messages,
                                 max_turns=mcfg.max_turns,
+                                stride=mcfg.stride,
                                 log_fn=(
                                     (lambda m: logger.info("[MARKOVIAN] %s", m))
                                     if mcfg.log_truncated_messages
@@ -786,6 +788,7 @@ def _install_message_padding_interceptor() -> None:
                         new_messages = truncate_messages_to_last_k_turns(
                             messages,
                             max_turns=mcfg.max_turns,
+                            stride=mcfg.stride,
                             log_fn=(
                                 (lambda m: logger.info("[MARKOVIAN] %s", m))
                                 if mcfg.log_truncated_messages
@@ -796,6 +799,7 @@ def _install_message_padding_interceptor() -> None:
                     new_messages = truncate_messages_to_last_k_turns(
                         messages,
                         max_turns=mcfg.max_turns,
+                        stride=mcfg.stride,
                         log_fn=(
                             (lambda m: logger.info("[MARKOVIAN] %s", m))
                             if mcfg.log_truncated_messages
@@ -984,6 +988,12 @@ class MarkovianThinkerRuntimeConfig:
     tokenizer: Any
     max_turns: int
     log_truncated_messages: bool
+    # Turn-preserve count applied on truncation triggers. `None` = keep
+    # last max_turns (legacy single-knob behavior). Integer N ≥ 1 = keep
+    # last N (decoupled: max_turns is the trigger, stride is the keep
+    # count). Also used by the markovian-mode summary splice to carry N
+    # real turns after the summary exchange.
+    stride: int | None = None
 
 
 # `_markovian_config` and `_markovian_stats` are forward-declared above
@@ -996,6 +1006,7 @@ def configure_markovian_thinker(
     tokenizer: Any,
     max_turns: int,
     log_truncated_messages: bool = False,
+    stride: int | None = None,
 ) -> None:
     """Install the orchestrator-wide Markovian Thinker config.
 
@@ -1009,11 +1020,13 @@ def configure_markovian_thinker(
         tokenizer=tokenizer,
         max_turns=max_turns,
         log_truncated_messages=log_truncated_messages,
+        stride=stride,
     )
     if enabled:
         logger.info(
-            "kv_eviction: Markovian Thinker ENABLED (max_turns=%d, log=%s)",
+            "kv_eviction: Markovian Thinker ENABLED (max_turns=%d, stride=%s, log=%s)",
             max_turns,
+            stride,
             log_truncated_messages,
         )
 
@@ -1048,8 +1061,10 @@ def _autoconfigure_markovian_from_env() -> None:
 
     Env var contract:
       KV_EVICTION_MARKOVIAN_ENABLED    — "1" enables; absence disables.
-      KV_EVICTION_MARKOVIAN_MAX_TURNS  — int.
+      KV_EVICTION_MARKOVIAN_MAX_TURNS  — int (trigger threshold).
       KV_EVICTION_MARKOVIAN_MODEL      — tokenizer name_or_path.
+      KV_EVICTION_MARKOVIAN_STRIDE     — optional int (post-trigger
+        turn-preserve count). Absent → legacy (keep max_turns).
 
     No-ops if already configured or if env vars are absent.
     """
@@ -1071,6 +1086,8 @@ def _autoconfigure_markovian_from_env() -> None:
         return
     max_turns = int(max_turns_str)
     log_truncated = _os.environ.get("KV_EVICTION_MARKOVIAN_LOG") == "1"
+    stride_str = _os.environ.get("KV_EVICTION_MARKOVIAN_STRIDE")
+    stride = int(stride_str) if stride_str else None
     from transformers import AutoTokenizer  # local import to keep env.py lean
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -1079,6 +1096,7 @@ def _autoconfigure_markovian_from_env() -> None:
         tokenizer=tokenizer,
         max_turns=max_turns,
         log_truncated_messages=log_truncated,
+        stride=stride,
     )
 
 

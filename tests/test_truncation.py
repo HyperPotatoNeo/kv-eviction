@@ -263,3 +263,69 @@ def test_max_turns_less_than_one_is_noop(k):
     msgs = [_sys()] + _turn(1)
     out = truncate_messages_to_last_k_turns(msgs, max_turns=k)
     assert out is msgs
+
+
+# ─── Stride parameter (decoupled keep count) ───
+
+
+def test_stride_none_matches_legacy_behavior():
+    msgs = [_sys()] + [m for i in range(1, 6) for m in _turn(i)]
+    legacy = truncate_messages_to_last_k_turns(msgs, max_turns=2)
+    with_none = truncate_messages_to_last_k_turns(msgs, max_turns=2, stride=None)
+    assert [m["content"] for m in with_none] == [m["content"] for m in legacy]
+
+
+def test_stride_keeps_fewer_than_max_turns():
+    """max_turns=4 (trigger), stride=2 (keep): 5 complete turns + pending user.
+    Trigger fires (5 > 4), keeps last 2 groups instead of last 4."""
+    msgs = (
+        [_sys()]
+        + [m for i in range(1, 6) for m in _turn(i)]
+        + [_user("pending")]
+    )
+    out = truncate_messages_to_last_k_turns(msgs, max_turns=4, stride=2)
+    assert [m["content"] for m in out] == [
+        "sys", "u4", "a4", "u5", "a5", "pending",
+    ]
+
+
+def test_stride_equal_to_max_turns_matches_legacy():
+    msgs = [_sys()] + [m for i in range(1, 6) for m in _turn(i)]
+    legacy = truncate_messages_to_last_k_turns(msgs, max_turns=2)
+    with_stride = truncate_messages_to_last_k_turns(msgs, max_turns=2, stride=2)
+    assert [m["content"] for m in with_stride] == [m["content"] for m in legacy]
+
+
+def test_stride_respects_trigger_threshold():
+    """Even with stride=1, no truncation if n_groups <= max_turns."""
+    msgs = [_sys()] + [m for i in range(1, 4) for m in _turn(i)]
+    out = truncate_messages_to_last_k_turns(msgs, max_turns=4, stride=1)
+    assert out is msgs
+
+
+def test_stride_clamped_below_one():
+    """stride=0 (or negative) is clamped up to 1 — at least one turn is kept."""
+    msgs = [_sys()] + [m for i in range(1, 5) for m in _turn(i)]
+    out = truncate_messages_to_last_k_turns(msgs, max_turns=3, stride=0)
+    # max_turns=3 trigger fires (4 > 3). stride clamped to 1 → keep last turn.
+    assert [m["content"] for m in out] == ["sys", "u4", "a4"]
+
+
+def test_stride_clamped_above_max_turns():
+    """stride > max_turns is clamped down — no nonsense keep-more-than-trigger."""
+    msgs = [_sys()] + [m for i in range(1, 5) for m in _turn(i)]
+    out = truncate_messages_to_last_k_turns(msgs, max_turns=2, stride=99)
+    # Clamped to max_turns=2: keep last 2 turns.
+    assert [m["content"] for m in out] == ["sys", "u3", "a3", "u4", "a4"]
+
+
+def test_stride_preserves_tool_group_atomicity():
+    msgs = [_sys()] + _tool_turn(1) + _turn(2) + _turn(3) + _turn(4)
+    out = truncate_messages_to_last_k_turns(msgs, max_turns=3, stride=1)
+    # Trigger fires (4 > 3), keep only last turn group.
+    roles_and_contents = [(m["role"], m.get("content")) for m in out]
+    assert roles_and_contents == [
+        ("system", "sys"),
+        ("user", "u4"),
+        ("assistant", "a4"),
+    ]

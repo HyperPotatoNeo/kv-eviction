@@ -139,20 +139,32 @@ def build_post_summary_messages(
     tail: list[dict],
     instruction_text: str,
     summary_text: str,
+    n_preserved_turns: int = 0,
 ) -> list[dict]:
     """Build the message list spliced with the summary exchange.
 
-    - ``mode="markovian"``: full client-side reset. Drop ``body_groups``.
-      Output is ``sys_prefix + [I, S] + tail``.
+    - ``mode="markovian"``: partial client-side reset. Drop all but the
+      last ``n_preserved_turns`` body groups; splice ``[I, S]`` between
+      the sys prefix and the kept tail context. Output is
+      ``sys_prefix + [I, S] + last_N_body_groups + tail``. When
+      ``n_preserved_turns == 0`` (default) this is the strict full-reset
+      ``sys_prefix + [I, S] + tail``.
     - ``mode="eviction"``: append-only splice. Keep ``body_groups``.
       Output is ``sys_prefix + flatten(body_groups) + [I, S] + tail``.
+      ``n_preserved_turns`` is ignored in this mode (the full body
+      stays; vLLM-side eviction handles KV compression).
 
     Raises ``ValueError`` on unknown mode. Pure function — safe to unit
     test without touching async / tokenizer code.
     """
     I_msg, S_msg = build_exchange(instruction_text, summary_text)
     if mode == "markovian":
-        return list(sys_prefix) + [I_msg, S_msg] + list(tail)
+        keep = max(0, int(n_preserved_turns))
+        preserved: list[dict] = []
+        if keep > 0 and body_groups:
+            for g in body_groups[-keep:]:
+                preserved.extend(g)
+        return list(sys_prefix) + [I_msg, S_msg] + preserved + list(tail)
     if mode == "eviction":
         out: list[dict] = list(sys_prefix)
         for g in body_groups:

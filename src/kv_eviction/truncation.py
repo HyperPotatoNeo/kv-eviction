@@ -43,9 +43,17 @@ def truncate_messages_to_last_k_turns(
     messages: list[dict],
     *,
     max_turns: int,
+    stride: int | None = None,
     log_fn: Callable[[str], None] | None = None,
 ) -> list[dict]:
-    """Truncate a message list to at most ``max_turns`` recent turn groups.
+    """Truncate a message list at the ``max_turns`` trigger.
+
+    - ``max_turns``: trigger threshold. Truncation fires when the number
+      of complete turn groups exceeds this.
+    - ``stride``: number of recent turn groups to preserve after
+      truncation. When ``None`` (default), keeps ``max_turns`` groups —
+      the original single-knob behavior. When specified, must be in
+      ``[1, max_turns]``; values outside that range are clamped.
 
     Returns the input unchanged (same identity) when no truncation is
     needed. Never mutates the input list or its dicts.
@@ -60,8 +68,18 @@ def truncate_messages_to_last_k_turns(
     if n_groups == 0 or n_groups <= max_turns:
         return messages
 
-    dropped = groups[:-max_turns]
-    kept = groups[-max_turns:]
+    keep = max_turns if stride is None else stride
+    # Clamp into a sane range: at least 1 (keeping zero turns is a
+    # degenerate full-reset that Markovian Summary owns via its own
+    # splice path), at most max_turns (stride > max_turns is nonsense
+    # because we'd never drop anything on the trigger).
+    if keep < 1:
+        keep = 1
+    if keep > max_turns:
+        keep = max_turns
+
+    dropped = groups[:-keep]
+    kept = groups[-keep:]
 
     if log_fn is not None:
         n_dropped_msgs = sum(len(g) for g in dropped)

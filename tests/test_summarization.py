@@ -345,6 +345,100 @@ def test_build_post_summary_does_not_mutate_inputs():
     assert tail == tail_snap
 
 
+def test_build_post_summary_markovian_preserves_n_turns():
+    """n_preserved_turns=2: sys + [I, S] + last_2_body_groups + tail."""
+    sys_p = [_sys()]
+    body = [list(_turn(1)), list(_turn(2)), list(_turn(3)), list(_turn(4))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="markovian",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+        n_preserved_turns=2,
+    )
+    assert out == [
+        _sys(),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+        *_turn(3),
+        *_turn(4),
+        _user("pending"),
+    ]
+
+
+def test_build_post_summary_markovian_preserves_more_than_available():
+    """n_preserved_turns > available: keep all body groups (no error)."""
+    sys_p = [_sys()]
+    body = [list(_turn(1))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="markovian",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+        n_preserved_turns=5,
+    )
+    assert out == [
+        _sys(),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+        *_turn(1),
+        _user("pending"),
+    ]
+
+
+def test_build_post_summary_markovian_preserve_zero_is_full_reset():
+    sys_p = [_sys()]
+    body = [list(_turn(1)), list(_turn(2))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="markovian",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+        n_preserved_turns=0,
+    )
+    assert out == [
+        _sys(),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+        _user("pending"),
+    ]
+
+
+def test_build_post_summary_eviction_ignores_n_preserved_turns():
+    """Eviction mode keeps full body regardless of n_preserved_turns."""
+    sys_p = [_sys()]
+    body = [list(_turn(1)), list(_turn(2)), list(_turn(3))]
+    tail = [_user("pending")]
+    out_0 = build_post_summary_messages(
+        mode="eviction",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="S",
+        n_preserved_turns=0,
+    )
+    out_99 = build_post_summary_messages(
+        mode="eviction",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="S",
+        n_preserved_turns=99,
+    )
+    assert out_0 == out_99
+
+
 def test_build_post_summary_eviction_roundtrip_through_partition():
     """Spliced list re-partitions correctly — the summary exchange
     lands as its own group, body groups remain intact."""
