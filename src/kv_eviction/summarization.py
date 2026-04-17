@@ -1,0 +1,221 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Pure helpers for Markovian summary-based eviction.
+
+Everything here is sync, side-effect free, and tokenizer-free. The
+async orchestration (calling `orig_create` to generate a summary, the
+`ContextVar` recursion guard, response-extras attachment) lives in
+``env.py`` so this module stays testable in isolation.
+
+See ``plans/markovian_summary.md`` for the full design.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+
+
+def partition_messages(
+    messages: list[dict],
+) -> tuple[int, list[dict], list[list[dict]], list[dict]]:
+    """Split a message list into (n_groups, sys_prefix, body_groups, tail).
+
+    - ``sys_prefix``: leading messages before the first ``role == "user"``.
+      Always preserved by downstream consumers.
+    - ``body_groups``: list of complete turn groups. Each group ends at a
+      ``role == "assistant"`` message without ``tool_calls`` (the
+      "terminal assistant" marker). Tool-call chains stay in one group.
+    - ``tail``: trailing messages after the last terminal assistant —
+      the in-flight pending exchange.
+    - ``n_groups`` = ``len(body_groups)``.
+
+    Does not mutate the input. Safe on empty lists and lists without
+    any user message (returns ``(0, messages[:], [], [])``). Matches
+    the semantics of ``truncate_messages_to_last_k_turns``'s internal
+    partitioning; that function is now a thin wrapper over this helper.
+    """
+    if not messages:
+        return 0, [], [], []
+
+    sys_end = 0
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            break
+        sys_end = i + 1
+
+    last_terminal = -1
+    for i in range(len(messages) - 1, sys_end - 1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant" and not m.get("tool_calls"):
+            last_terminal = i
+            break
+
+    sys_prefix = list(messages[:sys_end])
+
+    if last_terminal < sys_end:
+        # No complete turn in the body. Everything after sys_prefix is
+        # "in-flight tail".
+        return 0, sys_prefix, [], list(messages[sys_end:])
+
+    body = messages[sys_end : last_terminal + 1]
+    tail = list(messages[last_terminal + 1 :])
+
+    groups: list[list[dict]] = []
+    group_start = 0
+    for i, m in enumerate(body):
+        if m.get("role") == "assistant" and not m.get("tool_calls"):
+            groups.append(list(body[group_start : i + 1]))
+            group_start = i + 1
+
+    return len(groups), sys_prefix, groups, tail
+
+
+def _content_eq(content: object, instruction_text: str) -> bool:
+    """Message-content comparison that is tolerant of list-shaped
+    multimodal content (``[{"type": "text", "text": "..."}]``).
+
+    Only matches exactly-one text part equal to ``instruction_text``;
+    any other list shape is treated as non-match. This is intentionally
+    strict to avoid false positives on prompts that happen to contain
+    the instruction text as a sub-string.
+    """
+    if isinstance(content, str):
+        return content == instruction_text
+    if isinstance(content, list) and len(content) == 1:
+        part = content[0]
+        if isinstance(part, dict) and part.get("type") == "text":
+            return part.get("text") == instruction_text
+    return False
+
+
+def count_summary_exchanges(
+    messages: list[dict], instruction_text: str
+) -> int:
+    """Count how many prior ``(user=I, assistant=*)`` summary exchanges
+    are present in ``messages``.
+
+    A summary exchange is a ``role="user"`` message whose content is
+    exactly ``instruction_text`` followed immediately by a
+    ``role="assistant"`` message (any content). Used to discount past
+    summary turns from the trigger count in eviction mode, where the
+    client-visible message list grows monotonically across triggers.
+
+    Returns 0 when ``instruction_text`` is empty or no match is found.
+    """
+    if not instruction_text or not messages:
+        return 0
+    n = 0
+    for i in range(len(messages) - 1):
+        cur = messages[i]
+        nxt = messages[i + 1]
+        if (
+            cur.get("role") == "user"
+            and nxt.get("role") == "assistant"
+            and _content_eq(cur.get("content"), instruction_text)
+        ):
+            n += 1
+    return n
+
+
+def build_exchange(
+    instruction_text: str, summary_text: str
+) -> tuple[dict, dict]:
+    """Build the ``(I_msg, S_msg)`` pair that gets spliced into messages.
+
+    ``I_msg`` is a plain-string user message carrying the instruction;
+    ``S_msg`` is a plain-string assistant message carrying the summary.
+    No ``tool_calls`` on ``S_msg`` — it's a terminal assistant, which
+    means subsequent calls to ``partition_messages`` will see it as a
+    new turn group boundary.
+    """
+    I_msg = {"role": "user", "content": instruction_text}
+    S_msg = {"role": "assistant", "content": summary_text}
+    return I_msg, S_msg
+
+
+# ChatML markers that must never appear inside an assistant message
+# body — the chat template will emit its own. Strip them defensively
+# so a hallucinated template token doesn't poison subsequent renders.
+_DEFAULT_BLOCKLIST: tuple[str, ...] = ("<|im_start|>", "<|im_end|>")
+
+
+def sanitize_summary(
+    text: str, blocklist: tuple[str, ...] = _DEFAULT_BLOCKLIST
+) -> tuple[str, bool]:
+    """Remove chat-template tokens from ``text``.
+
+    Returns ``(sanitized, was_modified)``. ``was_modified`` is True iff
+    at least one blocklisted token was found. No regex — plain string
+    replacement over the blocklist in order.
+    """
+    was_modified = False
+    out = text
+    for tok in blocklist:
+        if tok in out:
+            was_modified = True
+            out = out.replace(tok, "")
+    return out, was_modified
+
+
+def content_to_text(content: object) -> str:
+    """Flatten a possibly-multimodal message ``content`` field to plain
+    text for debug logging. List-shaped content with ``type="text"``
+    parts is concatenated; other types are rendered as ``[<type>]``.
+
+    Never raises; unknown shapes fall through to ``str(content)``.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                t = item.get("type")
+                if t == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(f"[{t}]")
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
+
+
+@dataclass
+class SummaryTrainSample:
+    """Training-sample payload carried from the interceptor through the
+    trajectory to the orchestrator, where it becomes a standalone
+    :class:`TrainingSample` in ``interleave_rollout``.
+
+    - ``prompt_token_ids``: the tokens vLLM actually processed for the
+      summary request (sourced from the response's ``prompt_token_ids``
+      field, stashed by the admission-trim patch on the fork).
+    - ``completion_token_ids``: the sampled assistant tokens for the
+      summary response (sourced from ``choices[0].token_ids``).
+    - ``completion_logprobs``: one scalar logprob per completion token,
+      in generation order. Becomes the trainer's ``old_logprobs``.
+    - ``model``: model name used — trainer sanity-checks this matches
+      the rollout model to avoid cross-model logprob mixups.
+    """
+
+    prompt_token_ids: list[int] = field(default_factory=list)
+    completion_token_ids: list[int] = field(default_factory=list)
+    completion_logprobs: list[float] = field(default_factory=list)
+    model: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SummaryTrainSample":
+        return cls(
+            prompt_token_ids=[int(x) for x in d.get("prompt_token_ids", []) or []],
+            completion_token_ids=[
+                int(x) for x in d.get("completion_token_ids", []) or []
+            ],
+            completion_logprobs=[
+                float(x) for x in d.get("completion_logprobs", []) or []
+            ],
+            model=str(d.get("model", "") or ""),
+        )

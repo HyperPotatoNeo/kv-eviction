@@ -27,6 +27,17 @@ is returned unchanged (same identity).
 
 from collections.abc import Callable
 
+from kv_eviction.summarization import (
+    count_summary_exchanges,
+    partition_messages,
+)
+
+__all__ = [
+    "truncate_messages_to_last_k_turns",
+    "partition_messages",
+    "count_summary_exchanges",
+]
+
 
 def truncate_messages_to_last_k_turns(
     messages: list[dict],
@@ -44,37 +55,9 @@ def truncate_messages_to_last_k_turns(
     if not messages or max_turns < 1:
         return messages
 
-    # 1. System prefix = leading messages before the first user message.
-    sys_end = 0
-    for i, m in enumerate(messages):
-        if m.get("role") == "user":
-            break
-        sys_end = i + 1
+    n_groups, sys_prefix, groups, tail = partition_messages(messages)
 
-    # 2. Last terminal assistant (no tool_calls) at position >= sys_end.
-    last_terminal = -1
-    for i in range(len(messages) - 1, sys_end - 1, -1):
-        m = messages[i]
-        if m.get("role") == "assistant" and not m.get("tool_calls"):
-            last_terminal = i
-            break
-
-    if last_terminal < sys_end:
-        # No complete turn in the body — nothing to truncate.
-        return messages
-
-    body = messages[sys_end : last_terminal + 1]
-    tail = messages[last_terminal + 1 :]
-
-    # 3. Segment body into groups by terminal-assistant boundary.
-    groups: list[list[dict]] = []
-    group_start = 0
-    for i, m in enumerate(body):
-        if m.get("role") == "assistant" and not m.get("tool_calls"):
-            groups.append(body[group_start : i + 1])
-            group_start = i + 1
-
-    if len(groups) <= max_turns:
+    if n_groups == 0 or n_groups <= max_turns:
         return messages
 
     dropped = groups[:-max_turns]
@@ -90,7 +73,7 @@ def truncate_messages_to_last_k_turns(
             f"last.role={last.get('role') if last else '?'}"
         )
 
-    result: list[dict] = list(messages[:sys_end])
+    result: list[dict] = list(sys_prefix)
     for g in kept:
         result.extend(g)
     result.extend(tail)
