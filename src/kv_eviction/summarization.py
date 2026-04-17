@@ -216,6 +216,77 @@ def content_to_text(content: object) -> str:
     return str(content)
 
 
+def extract_prompt_token_ids(response: object) -> list[int]:
+    """Pull ``prompt_token_ids`` off a ChatCompletion-ish response.
+
+    Sourced from the admission-trim-KL patch on the vLLM fork, which
+    stashes the post-admission token ids on the response object. Handles
+    both attribute access (pydantic ``extra="allow"``) and
+    ``model_extra`` fallback. Returns [] when absent.
+    """
+    if response is None:
+        return []
+    ids = getattr(response, "prompt_token_ids", None)
+    if ids is None and hasattr(response, "model_extra"):
+        extra = response.model_extra or {}
+        ids = extra.get("prompt_token_ids")
+    if ids is None:
+        return []
+    try:
+        return [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return []
+
+
+def extract_completion_token_ids(response: object) -> list[int]:
+    """Pull the sampled assistant token ids off a ChatCompletion.
+
+    Primary source: ``resp.choices[0].token_ids`` (vLLM fork extension
+    — same field the trainer reads for the rollout's completion tokens).
+    Returns [] when missing/malformed.
+    """
+    try:
+        choice = response.choices[0]  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, TypeError):
+        return []
+    ids = getattr(choice, "token_ids", None)
+    if ids is None and hasattr(choice, "model_extra"):
+        extra = choice.model_extra or {}
+        ids = extra.get("token_ids")
+    if ids is None:
+        return []
+    try:
+        return [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return []
+
+
+def extract_completion_logprobs(response: object) -> list[float]:
+    """Pull one scalar logprob per completion token from an OpenAI
+    ChatCompletion's ``choices[0].logprobs.content``.
+
+    Each content entry is a ``ChatCompletionTokenLogprob`` with a
+    ``.logprob`` attribute. Returns [] when missing or empty.
+    """
+    try:
+        choice = response.choices[0]  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, TypeError):
+        return []
+    lp = getattr(choice, "logprobs", None)
+    if lp is None:
+        return []
+    content = getattr(lp, "content", None)
+    if content is None:
+        return []
+    out: list[float] = []
+    for entry in content:
+        try:
+            out.append(float(entry.logprob))
+        except (AttributeError, TypeError, ValueError):
+            return []
+    return out
+
+
 @dataclass
 class SummaryTrainSample:
     """Training-sample payload carried from the interceptor through the

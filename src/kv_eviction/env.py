@@ -34,6 +34,9 @@ from kv_eviction.summarization import (
     build_exchange,
     build_post_summary_messages,
     count_summary_exchanges,
+    extract_completion_logprobs,
+    extract_completion_token_ids,
+    extract_prompt_token_ids as _summary_extract_prompt_token_ids,
     partition_messages,
     sanitize_summary,
 )
@@ -220,6 +223,7 @@ class CompactionEnvMixin:
             return
         # The base class just appended a step. Attach compaction metadata to it.
         attach_compaction_events_from_response(trajectory[-1], response)
+        attach_summary_trainsample_from_response(trajectory[-1], response)
 
 
 # ─── Module-level monkey-patches ───
@@ -349,6 +353,18 @@ def _install_compaction_event_hooks() -> None:
                 raw_ptids = extra.get("prompt_token_ids")
             _forward_extra(verifiers_response, "prompt_token_ids", raw_ptids)
 
+            # Markovian summary extension: the AsyncCompletions
+            # interceptor stashes a summary_trainsample dict on the
+            # native response whenever a summary exchange was spliced
+            # into the outgoing messages. Forward it so Patch #2 can
+            # attach it to the trajectory step's extras for the
+            # orchestrator to emit as a standalone TrainingSample.
+            raw_summary = getattr(response, "summary_trainsample", None)
+            if raw_summary is None and hasattr(response, "model_extra"):
+                extra = response.model_extra or {}
+                raw_summary = extra.get("summary_trainsample")
+            _forward_extra(verifiers_response, "summary_trainsample", raw_summary)
+
             return verifiers_response
 
         patched_from_native.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
@@ -370,6 +386,7 @@ def _install_compaction_event_hooks() -> None:
             if trajectory:
                 attach_compaction_events_from_response(trajectory[-1], response)
                 attach_prompt_token_ids_from_response(trajectory[-1], response)
+                attach_summary_trainsample_from_response(trajectory[-1], response)
 
         patched_add_model_response.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
         base_env_cls.add_model_response = patched_add_model_response  # type: ignore[assignment]
@@ -465,13 +482,20 @@ async def _generate_summary(
     *,
     outer_kwargs: dict,
     full_messages: list[dict],
-) -> str | None:
+) -> tuple[str | None, dict | None]:
     """Fire a side-channel summary request against the rollout model.
 
-    Returns the sanitized summary text on success, or ``None`` on
-    failure (empty response, or raised exception when ``on_error="drop"``).
-    The caller decides what to do on ``None`` — typically, plain
-    Markovian truncation fallback.
+    Returns ``(text, train_sample_dict)`` on success, or ``(None, None)``
+    on failure (empty response, or raised exception when
+    ``on_error="drop"``). The caller decides what to do on ``None`` —
+    typically, plain Markovian truncation fallback.
+
+    ``train_sample_dict`` is a :class:`SummaryTrainSample`-serialized
+    dict carrying the prompt tokens vLLM processed, the sampled
+    completion tokens, and per-token logprobs. The caller attaches this
+    to the outer response via :func:`_attach_summary_trainsample` so
+    the orchestrator can emit a standalone ``TrainingSample`` from it
+    in ``interleave_rollout``.
 
     ``orig_create`` is passed in explicitly (instead of captured via
     closure inside ``_install_message_padding_interceptor``) so this
@@ -511,7 +535,7 @@ async def _generate_summary(
             exc_info=True,
         )
         _markovian_stats["n_summary_failures"] += 1
-        return None
+        return None, None
     finally:
         _IN_SUMMARY_CALL.reset(token)
     latency_ms = int((_time.perf_counter() - t0) * 1000)
@@ -523,20 +547,89 @@ async def _generate_summary(
     text, was_sanitized = sanitize_summary(raw_text.strip())
     if not text:
         _markovian_stats["n_summary_failures"] += 1
-        return None
+        return None, None
+
+    # Extract training-sample payload. If any extraction returns empty
+    # we still return the text (the summary itself is usable for the
+    # message-list splice); the sample_dict may just lack logprobs or
+    # token ids, in which case interleave_rollout skips the emission.
+    prompt_ids = _summary_extract_prompt_token_ids(resp)
+    completion_ids = extract_completion_token_ids(resp)
+    completion_logprobs = extract_completion_logprobs(resp)
+    sample_dict: dict | None = {
+        "prompt_token_ids": prompt_ids,
+        "completion_token_ids": completion_ids,
+        "completion_logprobs": completion_logprobs,
+        "model": outer_kwargs.get("model") or "",
+    }
 
     if scfg.log_summaries:
         logger.info(
-            "[SUMMARY] (%s, %d chars%s) %s",
+            "[SUMMARY] (%s, %d chars%s, %d prompt / %d completion tokens) %s",
             scfg.mode,
             len(text),
             ", sanitized" if was_sanitized else "",
+            len(prompt_ids),
+            len(completion_ids),
             text[:200],
         )
 
     _markovian_stats["n_summaries"] += 1
+    _markovian_stats["summary_prompt_tokens"] += len(prompt_ids)
+    _markovian_stats["summary_output_tokens"] += len(completion_ids)
     _markovian_stats["summary_latency_ms"] += latency_ms
-    return text
+    return text, sample_dict
+
+
+def _attach_summary_trainsample(response: Any, sample_dict: dict) -> None:
+    """Stash a :class:`SummaryTrainSample` dict on a ChatCompletion so
+    Patch #1 (``from_native_response``) can forward it to the verifiers
+    Response and Patch #2 (``add_model_response``) can copy it into the
+    trajectory step's extras.
+
+    Mirrors :func:`_stash_prompt_token_ids`: writes via ``setattr``,
+    falls back to ``model_extra`` on pydantic subclasses that reject
+    direct attribute writes.
+    """
+    try:
+        setattr(response, "summary_trainsample", sample_dict)
+    except Exception:
+        if hasattr(response, "model_extra"):
+            if response.model_extra is None:
+                response.__pydantic_extra__ = {}
+            response.model_extra["summary_trainsample"] = sample_dict
+
+
+def _extract_summary_trainsample(response: Any) -> dict | None:
+    """Pull a summary_trainsample dict off a response. Returns ``None``
+    when absent. Mirrors :func:`_extract_compaction_event_dicts` —
+    tolerant of both attribute access and ``model_extra``."""
+    if response is None:
+        return None
+    raw = getattr(response, "summary_trainsample", None)
+    if raw is None and hasattr(response, "model_extra"):
+        extra = response.model_extra or {}
+        raw = extra.get("summary_trainsample")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def attach_summary_trainsample_from_response(
+    step: TrajectoryStep,
+    response: ModelResponse,
+) -> None:
+    """Mutate the given TrajectoryStep's extras to include
+    ``summary_trainsample`` — the training payload for the synthesized
+    summary turn. Idempotent; no-op when the response has no summary."""
+    sample = _extract_summary_trainsample(response)
+    if sample is None:
+        return
+    if step.get("extras") is None:
+        step["extras"] = {}
+    step["extras"]["summary_trainsample"] = sample
 
 
 def configure_message_padding(
@@ -646,6 +739,7 @@ def _install_message_padding_interceptor() -> None:
                 scfg = _summary_config
 
                 summary_fired = False
+                summary_sample_dict: dict | None = None
                 if (
                     scfg is not None
                     and scfg.enabled
@@ -659,7 +753,7 @@ def _install_message_padding_interceptor() -> None:
                         messages, scfg.instruction_text
                     )
                     if n_real > scfg.compaction_max_turns:
-                        summary_text = await _generate_summary(
+                        summary_text, summary_sample_dict = await _generate_summary(
                             orig_create,
                             self,
                             scfg,
@@ -733,6 +827,8 @@ def _install_message_padding_interceptor() -> None:
 
                 response = await orig_create(self, *args, **kwargs)
                 _stash_prompt_token_ids(response, truncated_ids)
+                if summary_sample_dict is not None:
+                    _attach_summary_trainsample(response, summary_sample_dict)
 
                 # Observability: truncation counters fire even when the
                 # summary path ran (the interceptor still reduced or

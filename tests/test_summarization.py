@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import pytest
 
+from types import SimpleNamespace
+
 from kv_eviction.summarization import (
     SummaryTrainSample,
     build_exchange,
     build_post_summary_messages,
     content_to_text,
     count_summary_exchanges,
+    extract_completion_logprobs,
+    extract_completion_token_ids,
+    extract_prompt_token_ids,
     partition_messages,
     sanitize_summary,
 )
@@ -495,3 +500,91 @@ def test_summary_train_sample_from_dict_coerces_types():
     assert s.completion_token_ids == [3, 4]
     assert s.completion_logprobs == [pytest.approx(-0.1), pytest.approx(-0.2)]
     assert s.model == "123"
+
+
+# ─── extract_prompt_token_ids / extract_completion_token_ids /
+#     extract_completion_logprobs ───
+
+
+def _fake_response(
+    *,
+    prompt_ids=None,
+    completion_ids=None,
+    logprobs_content=None,
+):
+    lp = None
+    if logprobs_content is not None:
+        lp = SimpleNamespace(content=logprobs_content)
+    choice = SimpleNamespace(token_ids=completion_ids, logprobs=lp)
+    return SimpleNamespace(
+        prompt_token_ids=prompt_ids,
+        choices=[choice],
+    )
+
+
+def test_extract_prompt_token_ids_attribute():
+    resp = _fake_response(prompt_ids=[1, 2, 3])
+    assert extract_prompt_token_ids(resp) == [1, 2, 3]
+
+
+def test_extract_prompt_token_ids_none_returns_empty():
+    resp = _fake_response(prompt_ids=None)
+    assert extract_prompt_token_ids(resp) == []
+
+
+def test_extract_prompt_token_ids_handles_none_response():
+    assert extract_prompt_token_ids(None) == []
+
+
+def test_extract_prompt_token_ids_coerces_from_floats():
+    resp = _fake_response(prompt_ids=[1.0, 2.0])
+    assert extract_prompt_token_ids(resp) == [1, 2]
+
+
+def test_extract_completion_token_ids_attribute():
+    resp = _fake_response(completion_ids=[10, 11, 12])
+    assert extract_completion_token_ids(resp) == [10, 11, 12]
+
+
+def test_extract_completion_token_ids_missing_choices():
+    resp = SimpleNamespace(choices=[])
+    assert extract_completion_token_ids(resp) == []
+
+
+def test_extract_completion_token_ids_no_attribute_on_choice():
+    # A choice object that has no .token_ids attribute returns [].
+    choice = SimpleNamespace(logprobs=None)
+    resp = SimpleNamespace(choices=[choice])
+    assert extract_completion_token_ids(resp) == []
+
+
+def test_extract_completion_logprobs_full_shape():
+    entries = [
+        SimpleNamespace(token="a", logprob=-0.1),
+        SimpleNamespace(token="b", logprob=-0.2),
+    ]
+    resp = _fake_response(logprobs_content=entries)
+    out = extract_completion_logprobs(resp)
+    assert out == [pytest.approx(-0.1), pytest.approx(-0.2)]
+
+
+def test_extract_completion_logprobs_empty_content():
+    resp = _fake_response(logprobs_content=[])
+    assert extract_completion_logprobs(resp) == []
+
+
+def test_extract_completion_logprobs_missing_logprobs():
+    resp = _fake_response(logprobs_content=None)
+    assert extract_completion_logprobs(resp) == []
+
+
+def test_extract_completion_logprobs_bails_on_non_numeric():
+    # If one entry lacks a numeric .logprob, we return [] (partial
+    # extractions are worse than empty — the trainer sanity-checks
+    # lengths).
+    entries = [
+        SimpleNamespace(token="a", logprob=-0.1),
+        SimpleNamespace(token="b"),  # missing logprob
+    ]
+    resp = _fake_response(logprobs_content=entries)
+    assert extract_completion_logprobs(resp) == []

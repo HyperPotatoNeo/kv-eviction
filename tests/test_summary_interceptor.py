@@ -37,12 +37,28 @@ class _StubTok:
         return [1, 2, 3]
 
 
-def _make_summary_response(text="SUMMARY"):
+def _make_summary_response(
+    text="SUMMARY",
+    *,
+    prompt_ids=None,
+    completion_ids=None,
+    logprobs=None,
+):
     """Build a ChatCompletion-ish SimpleNamespace that
-    ``_generate_summary`` can extract a summary from."""
+    ``_generate_summary`` can extract a summary + train-sample payload
+    from. ``logprobs`` is a list of floats; ``None`` means no logprobs
+    at all."""
     msg = SimpleNamespace(content=text)
-    choice = SimpleNamespace(message=msg)
-    return SimpleNamespace(choices=[choice], prompt_token_ids=None)
+    lp = None
+    if logprobs is not None:
+        lp = SimpleNamespace(
+            content=[SimpleNamespace(token=f"t{i}", logprob=x) for i, x in enumerate(logprobs)]
+        )
+    choice = SimpleNamespace(message=msg, token_ids=completion_ids, logprobs=lp)
+    return SimpleNamespace(
+        choices=[choice],
+        prompt_token_ids=prompt_ids,
+    )
 
 
 def _outer_response():
@@ -462,6 +478,82 @@ def test_stats_drain_and_reset():
 # ─── Summary-call kwargs hygiene ───
 
 
+def test_summary_trainsample_attached_to_outer_response():
+    _install_mt(max_turns=8)
+    _install_summary(mode="markovian", compaction_max_turns=2)
+
+    async def fake_orig(self, *args, **kwargs):
+        if kwargs.get("logprobs") is True:
+            return _make_summary_response(
+                "S",
+                prompt_ids=[11, 12, 13],
+                completion_ids=[21, 22],
+                logprobs=[-0.1, -0.2],
+            )
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    captured = {}
+
+    async def factory(patched):
+        r = await patched(self=None, model="test-model", messages=msgs)
+        captured["response"] = r
+        return r
+
+    _run_with_fake_orig(fake_orig, factory)
+
+    attached = captured["response"].summary_trainsample
+    assert attached["prompt_token_ids"] == [11, 12, 13]
+    assert attached["completion_token_ids"] == [21, 22]
+    assert attached["completion_logprobs"] == pytest.approx([-0.1, -0.2])
+    assert attached["model"] == "test-model"
+
+
+def test_no_summary_no_trainsample_attached():
+    _install_mt(max_turns=8)
+    _install_summary(mode="markovian", compaction_max_turns=8)  # below trigger
+
+    async def fake_orig(self, *args, **kwargs):
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), _user("pending")]
+
+    captured = {}
+
+    async def factory(patched):
+        r = await patched(self=None, model="m", messages=msgs)
+        captured["response"] = r
+        return r
+
+    _run_with_fake_orig(fake_orig, factory)
+
+    assert getattr(captured["response"], "summary_trainsample", None) is None
+
+
+def test_summary_failure_does_not_attach_trainsample():
+    _install_mt(max_turns=2)
+    _install_summary(mode="markovian", compaction_max_turns=2, on_error="drop")
+
+    async def fake_orig(self, *args, **kwargs):
+        if kwargs.get("logprobs") is True:
+            raise RuntimeError("summary down")
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    captured = {}
+
+    async def factory(patched):
+        r = await patched(self=None, model="m", messages=msgs)
+        captured["response"] = r
+        return r
+
+    _run_with_fake_orig(fake_orig, factory)
+
+    assert getattr(captured["response"], "summary_trainsample", None) is None
+
+
 def test_summary_call_strips_tools_and_response_format():
     _install_mt(max_turns=8)
     _install_summary(mode="markovian", compaction_max_turns=2)
@@ -497,3 +589,41 @@ def test_summary_call_strips_tools_and_response_format():
     assert "tool_choice" not in summary_call
     assert "response_format" not in summary_call
     assert "extra_body" not in summary_call
+
+
+# ─── _extract_summary_trainsample / attach_summary_trainsample_from_response ───
+
+
+def test_extract_summary_trainsample_attribute():
+    sample = {"prompt_token_ids": [1], "completion_token_ids": [2]}
+    resp = SimpleNamespace(summary_trainsample=sample)
+    assert env._extract_summary_trainsample(resp) == sample
+
+
+def test_extract_summary_trainsample_none_response():
+    assert env._extract_summary_trainsample(None) is None
+
+
+def test_extract_summary_trainsample_absent_field():
+    resp = SimpleNamespace()
+    assert env._extract_summary_trainsample(resp) is None
+
+
+def test_extract_summary_trainsample_non_dict_ignored():
+    resp = SimpleNamespace(summary_trainsample="not a dict")
+    assert env._extract_summary_trainsample(resp) is None
+
+
+def test_attach_summary_trainsample_from_response_roundtrip():
+    sample = {"prompt_token_ids": [1, 2], "completion_token_ids": [3]}
+    resp = SimpleNamespace(summary_trainsample=sample)
+    step: dict = {"extras": None}
+    env.attach_summary_trainsample_from_response(step, resp)  # type: ignore[arg-type]
+    assert step["extras"]["summary_trainsample"] == sample
+
+
+def test_attach_summary_trainsample_noop_when_absent():
+    resp = SimpleNamespace()
+    step: dict = {"extras": None}
+    env.attach_summary_trainsample_from_response(step, resp)  # type: ignore[arg-type]
+    assert step["extras"] is None
