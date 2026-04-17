@@ -23,6 +23,7 @@ before the verifiers env so its `add_model_response` runs first.
 """
 
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -425,10 +426,29 @@ _padding_config: MessagePaddingConfig | None = None
 # original location below — only the globals move up. Type is
 # string-forward-referenced to keep the dataclass in its current spot.
 _markovian_config: "MarkovianThinkerRuntimeConfig | None" = None
+# Forward-declared for the same reason as `_markovian_config`: the
+# patched_create closure captures these at install time. Full dataclass
+# + configure helpers live below, alongside the Markovian equivalents.
+_summary_config: "MarkovianSummaryRuntimeConfig | None" = None
 _markovian_stats: dict[str, int] = {
     "n_truncations": 0,
     "n_messages_dropped": 0,
+    "n_summaries": 0,
+    "n_summary_failures": 0,
+    "summary_prompt_tokens": 0,
+    "summary_output_tokens": 0,
+    "summary_latency_ms": 0,
 }
+
+# Recursion guard: set True inside `_generate_summary` before calling
+# `orig_create` for the side-channel summary request, so the re-entrant
+# invocation of `patched_create` short-circuits and does not try to
+# intercept / re-summarize the summary call. contextvars (not
+# threading.local) so async tasks migrating between threads still see
+# the correct value.
+_IN_SUMMARY_CALL: ContextVar[bool] = ContextVar(
+    "_IN_SUMMARY_CALL", default=False
+)
 
 
 def configure_message_padding(
@@ -760,11 +780,20 @@ def configure_markovian_thinker(
 
 def pop_markovian_stats() -> dict[str, int]:
     """Drain-and-reset the Markovian counters. Called once per
-    orchestrator step to emit `markovian/*` metrics to wandb.
+    orchestrator step to emit `markovian/*` and `markovian_summary/*`
+    metrics to wandb.
     """
     global _markovian_stats
     out = dict(_markovian_stats)
-    _markovian_stats = {"n_truncations": 0, "n_messages_dropped": 0}
+    _markovian_stats = {
+        "n_truncations": 0,
+        "n_messages_dropped": 0,
+        "n_summaries": 0,
+        "n_summary_failures": 0,
+        "summary_prompt_tokens": 0,
+        "summary_output_tokens": 0,
+        "summary_latency_ms": 0,
+    }
     return out
 
 
@@ -814,6 +843,195 @@ def _autoconfigure_markovian_from_env() -> None:
 
 
 _autoconfigure_markovian_from_env()
+
+
+# ─── Markovian Summary: summarization-based eviction ───
+#
+# When enabled by the orchestrator via `configure_markovian_summary(...)`,
+# the AsyncCompletions.create interceptor's Branch A fires a side-channel
+# summary request once the number of real turn groups exceeds
+# `compaction_max_turns`, then splices a `{user: instruction, assistant:
+# summary}` exchange into the outgoing message list. The summary itself
+# is a trainable model turn — its tokens + logprobs are captured on the
+# outer response via `extras["summary_trainsample"]` for the orchestrator
+# to emit as a standalone TrainingSample.
+#
+# Two modes (both ride on the existing Markovian interceptor):
+#   - "markovian": full client-side reset to `sys + [I, S] + tail`.
+#     vLLM-side compaction must be OFF.
+#   - "eviction": append-only `sys + body + [I, S] + tail`.
+#     vLLM-side compaction (block or turn) must be ON.
+#
+# See `plans/markovian_summary.md` for the full design.
+
+
+@dataclass
+class MarkovianSummaryRuntimeConfig:
+    """Runtime config installed by the orchestrator at startup. Fields
+    come from prime-rl's `orchestrator.markovian_thinker.summary` section."""
+
+    enabled: bool
+    mode: str  # "markovian" | "eviction"
+    compaction_max_turns: int
+    max_len_summary: int
+    instruction_text: str
+    temperature: float
+    top_p: float
+    on_error: str  # "drop" | "raise"
+    log_summaries: bool
+
+
+# `_summary_config` is forward-declared above the
+# `_install_message_padding_interceptor()` call, same as `_markovian_config`.
+
+
+def configure_markovian_summary(
+    *,
+    enabled: bool,
+    mode: str,
+    compaction_max_turns: int,
+    max_len_summary: int,
+    instruction_text: str,
+    temperature: float = 0.3,
+    top_p: float = 0.95,
+    on_error: str = "drop",
+    log_summaries: bool = False,
+) -> None:
+    """Install the orchestrator-wide Markovian Summary config.
+
+    Called once by prime-rl's orchestrator at startup, before any
+    rollouts fire. Idempotent — repeated calls overwrite the previous
+    config.
+
+    Validated upstream by `validate_markovian_summary` in
+    prime-rl's `rl.py`. Does minimal sanity checking here.
+    """
+    if mode not in ("markovian", "eviction"):
+        raise ValueError(
+            f"configure_markovian_summary: invalid mode={mode!r}; "
+            "expected 'markovian' or 'eviction'"
+        )
+    if on_error not in ("drop", "raise"):
+        raise ValueError(
+            f"configure_markovian_summary: invalid on_error={on_error!r}; "
+            "expected 'drop' or 'raise'"
+        )
+
+    global _summary_config
+    _summary_config = MarkovianSummaryRuntimeConfig(
+        enabled=enabled,
+        mode=mode,
+        compaction_max_turns=compaction_max_turns,
+        max_len_summary=max_len_summary,
+        instruction_text=instruction_text,
+        temperature=temperature,
+        top_p=top_p,
+        on_error=on_error,
+        log_summaries=log_summaries,
+    )
+    if enabled:
+        logger.info(
+            "kv_eviction: Markovian Summary ENABLED "
+            "(mode=%s, compaction_max_turns=%d, max_len_summary=%d, on_error=%s)",
+            mode,
+            compaction_max_turns,
+            max_len_summary,
+            on_error,
+        )
+
+
+def _autoconfigure_markovian_summary_from_env() -> None:
+    """Auto-enable Markovian Summary from environment variables.
+
+    The orchestrator sets these before spawning the verifiers env server
+    subprocess (mp.spawn starts a fresh interpreter that won't inherit
+    the parent's `configure_markovian_summary(...)` call). The subprocess
+    imports `kv_eviction` via its entrypoint shim, which triggers this
+    function.
+
+    Env var contract (scalars):
+      KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED              — "1" enables.
+      KV_EVICTION_MARKOVIAN_SUMMARY_MODE                 — "markovian" or "eviction"
+      KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS — int
+      KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY      — int
+      KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE          — float
+      KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P                — float
+      KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR             — "drop" | "raise"
+      KV_EVICTION_MARKOVIAN_SUMMARY_LOG                  — "1" enables debug
+
+    Long string (instruction_text) via JSON env var:
+      KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON — {"instruction_text": "..."}
+
+    No-ops if already configured or env vars are absent.
+    """
+    import json as _json
+    import os as _os
+
+    global _summary_config
+    if _summary_config is not None and _summary_config.enabled:
+        return
+    if _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED") != "1":
+        return
+
+    try:
+        mode = _os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MODE"]
+        compaction_max_turns = int(
+            _os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS"]
+        )
+        max_len_summary = int(
+            _os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY"]
+        )
+    except (KeyError, ValueError) as e:
+        logger.warning(
+            "kv_eviction: KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED=1 but "
+            "required scalar env vars missing/invalid (%s); Markovian "
+            "Summary NOT enabled in this process",
+            e,
+        )
+        return
+
+    temperature = float(
+        _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE", "0.3")
+    )
+    top_p = float(_os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P", "0.95"))
+    on_error = _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR", "drop")
+    log_summaries = (
+        _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_LOG", "0") == "1"
+    )
+
+    strings_json = _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON")
+    instruction_text = ""
+    if strings_json:
+        try:
+            parsed = _json.loads(strings_json)
+            instruction_text = str(parsed.get("instruction_text", ""))
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "kv_eviction: KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON "
+                "invalid (%s); using empty instruction_text",
+                e,
+            )
+    if not instruction_text:
+        logger.warning(
+            "kv_eviction: Markovian Summary enabled via env vars but "
+            "instruction_text is empty; summaries will use an empty "
+            "prompt and count_summary_exchanges will disable itself"
+        )
+
+    configure_markovian_summary(
+        enabled=True,
+        mode=mode,
+        compaction_max_turns=compaction_max_turns,
+        max_len_summary=max_len_summary,
+        instruction_text=instruction_text,
+        temperature=temperature,
+        top_p=top_p,
+        on_error=on_error,
+        log_summaries=log_summaries,
+    )
+
+
+_autoconfigure_markovian_summary_from_env()
 
 
 def padded_ids_from_step_extras(
