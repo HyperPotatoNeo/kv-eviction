@@ -99,7 +99,7 @@ dp = 4
 tp = 1
 
 [inference.vllm_extra]
-compaction_window_size = 4096
+compaction_window_size = 2048
 compaction_stride = 512
 block_size = 16
 compaction_protected_prefix_tokens = -1
