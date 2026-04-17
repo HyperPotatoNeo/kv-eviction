@@ -1,0 +1,103 @@
+# compaction_textworld: turn-based KV compaction on TextWorld cooking — EAI single-node.
+#
+# Merged from rl.toml + inference.toml for single-node 8xH100 EAI launch.
+# Set __TEXTWORLD_DATASET__ to the actual dataset path before launching.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/compaction-textworld"
+clean_output_dir = true
+
+[ckpt]
+interval = 50
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "textworld-eviction"
+name = "compaction-textworld"
+id = "compaction-textworld"
+group = "compaction-textworld"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 4096
+stride = 512
+block_size = 16
+bptt_segments = 1
+protected_prefix_tokens = -1
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16
+log_evicted_text = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 12000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "textworld-env"
+args = { dataset_path = "/home/toolkit/kv-eviction/textworld_cooking_mix", max_episode_steps = 50, num_train_examples = 5000, num_eval_examples = 500, seed = 42, include_initial_obs_in_system = true }
+
+[inference]
+seed = 0
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+async_scheduling = false
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+compaction_protected_prefix_tokens = -1
+compaction_max_turns = 10
+compaction_eviction_turn_stride = 3
+compaction_assume_aligned_turn_boundaries = true

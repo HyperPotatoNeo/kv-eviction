@@ -1,0 +1,97 @@
+# compaction_rgmix sweep: window=4096 stride=1024 (trainer AND inference), seed 2.
+
+max_steps = 500
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rg_mix_sweep/w4096_s1024_seed2"
+clean_output_dir = true
+
+[ckpt]
+interval = 50
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction-rg-sweep"
+name = "compaction-rgmix-w4096-s1024-seed2"
+id = "compaction-rgmix-w4096-s1024-seed2"
+group = "compaction-rgmix-sweep"
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 4096
+stride = 1024
+block_size = 16
+bptt_segments = 1
+protected_prefix_tokens = -1
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16
+log_evicted_text = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 15000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "rg-mix-env"
+args = { num_train_examples = 7500, num_eval_examples = 100, seed = 42, dataset_path = "/home/toolkit/kv-eviction/rg_mix_7500" }
+
+[inference]
+seed = 2
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+compaction_window_size = 4096
+compaction_stride = 1024
+block_size = 16
+compaction_protected_prefix_tokens = -1
+async_scheduling = false

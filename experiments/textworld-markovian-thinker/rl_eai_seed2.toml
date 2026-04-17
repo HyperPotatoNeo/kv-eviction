@@ -1,0 +1,111 @@
+# textworld-markovian-thinker: Markovian Thinker baseline on TextWorld cooking — EAI single-node, seed 2.
+#
+# Mirrors experiments/compaction_textworld/rl_eai_seed0.toml but replaces
+# vLLM-side KV cache compaction with client-side message truncation: the
+# orchestrator drops old turn groups from the `messages` list before each
+# chat completion request so vLLM sees a bounded-context prompt every turn
+# with no KV eviction. Training runs the standard full-context forward
+# (no segmented_forward).
+#
+# See `plans/markovian_thinker_baseline.md` for semantics + rationale.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/markovian-textworld-seed2"
+clean_output_dir = false
+
+[ckpt]
+interval = 50
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "textworld-eviction"
+name = "markovian-textworld-seed2-v4"
+id = "markovian-textworld-seed2-v4"
+group = "markovian-textworld"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "auto"
+attn = "flash_attention_2"
+ac = { mode = "full" }
+
+# No [trainer.compaction] — validate_markovian_thinker rejects
+# trainer.compaction.window_size > 0 alongside Markovian.
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+# Required by validate_markovian_thinker: TITO assumes the chat template
+# has the extension property across turns, which truncation breaks.
+use_token_client = false
+
+# Padding is incompatible with Markovian (the validator rejects both-on).
+# Markovian stashes its own prompt_token_ids on the response.
+[orchestrator.compaction_padding]
+enabled = false
+
+[orchestrator.markovian_thinker]
+enabled = true
+max_turns = 4
+stride = 2
+log_truncated_messages = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 512
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "textworld-env"
+args = { dataset_path = "/home/toolkit/kv-eviction/textworld_cooking_mix", max_episode_steps = 50, num_train_examples = 5000, num_eval_examples = 500, seed = 42, include_initial_obs_in_system = true }
+
+[inference]
+seed = 2
+# Each truncation shifts the prefix, so automatic prefix caching misses
+# on nearly every turn past max_turns. Disable to save bookkeeping.
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+# No compaction_* fields in [inference.vllm_extra]; validator rejects
+# vLLM-side compaction alongside Markovian.
+[inference.vllm_extra]
+async_scheduling = false

@@ -1,0 +1,124 @@
+# compaction_taubench_retail: turn-based KV compaction on Sierra's tau-bench
+# (retail domain, 500 train / 115 test) — EAI single-node, seed 2.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/compaction-taubench-retail-seed2"
+clean_output_dir = false
+
+[ckpt]
+interval = 50
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "tau2bench-eviction"
+name = "kv-eviction-taubench-retail-seed2"
+id = "kv-eviction-taubench-retail-seed2"
+group = "compaction-taubench-retail"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 4096
+stride = 512
+block_size = 16
+bptt_segments = 1
+protected_prefix_tokens = -1
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16
+log_evicted_text = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 512
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "tau-bench-train"
+# User simulator points at the local vLLM server (Qwen3-4B) instead of
+# OpenAI. litellm needs the "openai/" prefix to route via OpenAI-compatible
+# API. OPENAI_API_KEY is set to "EMPTY" by the launcher (vLLM accepts any
+# value when started without --api-key). `user_provider="openai"` selects
+# litellm's OpenAI-compatible transport; combined with `api_base` injected
+# by our monkey-patch (from `user_base_url`), requests land at the local
+# vLLM server.
+args = { domain = "retail", user_model = "openai/Qwen/Qwen3-4B-Instruct-2507", user_provider = "openai", user_base_url = "http://localhost:8000/v1", user_api_key_var = "OPENAI_API_KEY", max_num_steps = 30, max_workers = 128, max_turns = -1 }
+
+[orchestrator.eval]
+interval = 50
+
+# Held-out retail test: the 115 tasks the wrapper exposes as `eval_dataset`.
+[[orchestrator.eval.env]]
+id = "tau-bench-train"
+name = "tau-bench-retail"
+args = { domain = "retail", user_model = "openai/Qwen/Qwen3-4B-Instruct-2507", user_provider = "openai", user_base_url = "http://localhost:8000/v1", user_api_key_var = "OPENAI_API_KEY", max_num_steps = 30, max_workers = 128, max_turns = -1 }
+
+# Airline (50 test tasks, no train split upstream) — out-of-distribution
+# generalization check since training is retail-only.
+[[orchestrator.eval.env]]
+id = "tau-bench-train"
+name = "tau-bench-airline"
+args = { domain = "airline", user_model = "openai/Qwen/Qwen3-4B-Instruct-2507", user_provider = "openai", user_base_url = "http://localhost:8000/v1", user_api_key_var = "OPENAI_API_KEY", max_num_steps = 30, max_workers = 128, max_turns = -1 }
+
+[inference]
+seed = 2
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 32768
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+async_scheduling = false
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+compaction_protected_prefix_tokens = -1
+compaction_max_turns = 4
+compaction_eviction_turn_stride = 2
+compaction_assume_aligned_turn_boundaries = true

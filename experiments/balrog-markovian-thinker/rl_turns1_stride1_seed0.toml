@@ -1,0 +1,94 @@
+# balrog-markovian-thinker: BabyAI multi-turn RL — Markovian Thinker, max_turns=1, stride=1, seed 0.
+#
+# Client-side message truncation: the orchestrator drops old turn groups
+# from the `messages` list before each chat completion request so vLLM sees
+# a bounded-context prompt every turn with no KV eviction.
+
+max_steps = 500
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/runs2-markovian-turns1-stride1-seed0"
+clean_output_dir = false
+
+[ckpt]
+interval = 10
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "balrog-markovian-turns1-stride1-seed0"
+id = "balrog-markovian-turns1-stride1-seed0"
+group = "balrog-markovian-turns1-stride1"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "auto"
+attn = "flash_attention_2"
+ac = { mode = "full" }
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 8
+oversampling_factor = 1.0
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = false
+
+[orchestrator.markovian_thinker]
+enabled = true
+max_turns = 1
+log_truncated_messages = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 6000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "balrog-bench"
+args = { environments = ["babyai"], max_text_history = 16, max_turns = 30 }
+
+[inference]
+seed = 0
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+async_scheduling = false

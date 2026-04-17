@@ -1,0 +1,91 @@
+# full_context_textworld (truncated-turns variant): no message eviction, but
+# per-turn generation capped at max_completion_tokens=512 — parallel ablation
+# to the markovian-textworld runs which use the same 512-token cap with
+# message-list truncation. EAI single-node, seed 1.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/full-context-truncated-turns-seed1"
+clean_output_dir = false
+
+[ckpt]
+interval = 50
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "textworld-eviction"
+name = "full-context-truncated-turns-seed1"
+id = "full-context-truncated-turns-seed1"
+group = "full-context-truncated-turns"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "auto"
+attn = "flash_attention_2"
+ac = { mode = "full" }
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+use_token_client = false
+
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16
+log_evicted_text = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 512
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "textworld-env"
+args = { dataset_path = "/home/toolkit/kv-eviction/textworld_cooking_mix", max_episode_steps = 50, num_train_examples = 4500, num_eval_examples = 500, seed = 42, include_initial_obs_in_system = true }
+
+[inference]
+seed = 1
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+block_size = 16
+async_scheduling = false
