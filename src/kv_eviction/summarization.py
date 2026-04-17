@@ -140,21 +140,25 @@ def build_post_summary_messages(
     instruction_text: str,
     summary_text: str,
     n_preserved_turns: int = 0,
+    resume_text: str = "",
 ) -> list[dict]:
     """Build the message list spliced with the summary exchange.
 
     - ``mode="markovian"``: partial client-side reset. Drop all but the
-      last ``n_preserved_turns`` body groups; splice ``[I, S]`` AFTER
-      them so the order mirrors the temporal generation sequence (the
-      preserved body happened first, then the summary, then the tail is
-      the current in-flight turn). Output is
-      ``sys_prefix + last_N_body_groups + [I, S] + tail``. When
-      ``n_preserved_turns == 0`` (default) this is the strict full-reset
-      ``sys_prefix + [I, S] + tail``.
+      last ``n_preserved_turns`` body groups, keep the in-flight tail
+      (the latest observation/tool result), then splice the summary
+      exchange ``[I, S]`` AFTER the tail and append a fresh
+      ``{user: resume_text}`` turn so vLLM has a pending user message to
+      generate an action against. Output is
+      ``sys_prefix + last_N_body_groups + tail + [I, S] + [U_resume]``.
+      When ``resume_text`` is empty the resume message is omitted
+      (strict legacy shape). When ``n_preserved_turns == 0`` this is a
+      strict full reset: ``sys_prefix + tail + [I, S] + [U_resume]``.
     - ``mode="eviction"``: append-only splice. Keep ``body_groups``.
       Output is ``sys_prefix + flatten(body_groups) + [I, S] + tail``.
-      ``n_preserved_turns`` is ignored in this mode (the full body
-      stays; vLLM-side eviction handles KV compression).
+      ``n_preserved_turns`` and ``resume_text`` are ignored in this mode
+      (the full body stays; vLLM-side eviction handles KV compression,
+      and the original tail remains the pending user turn).
 
     Raises ``ValueError`` on unknown mode. Pure function — safe to unit
     test without touching async / tokenizer code.
@@ -166,14 +170,17 @@ def build_post_summary_messages(
         if keep > 0 and body_groups:
             for g in body_groups[-keep:]:
                 preserved.extend(g)
-        return list(sys_prefix) + preserved + [I_msg, S_msg] + list(tail)
-    if mode == "eviction":
-        out: list[dict] = list(sys_prefix)
-        for g in body_groups:
-            out.extend(g)
-        out.extend([I_msg, S_msg])
-        out.extend(tail)
+        out = list(sys_prefix) + preserved + list(tail) + [I_msg, S_msg]
+        if resume_text:
+            out.append({"role": "user", "content": resume_text})
         return out
+    if mode == "eviction":
+        out2: list[dict] = list(sys_prefix)
+        for g in body_groups:
+            out2.extend(g)
+        out2.extend([I_msg, S_msg])
+        out2.extend(tail)
+        return out2
     raise ValueError(
         f"build_post_summary_messages: unknown mode={mode!r}; "
         "expected 'markovian' or 'eviction'"

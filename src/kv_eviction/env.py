@@ -769,6 +769,7 @@ def _install_message_padding_interceptor() -> None:
                                 instruction_text=scfg.instruction_text,
                                 summary_text=summary_text,
                                 n_preserved_turns=(mcfg.stride or 0),
+                                resume_text=scfg.resume_text,
                             )
                             summary_fired = True
                         else:
@@ -1133,6 +1134,7 @@ class MarkovianSummaryRuntimeConfig:
     compaction_max_turns: int
     max_len_summary: int
     instruction_text: str
+    resume_text: str
     temperature: float
     top_p: float
     on_error: str  # "drop" | "raise"
@@ -1150,6 +1152,7 @@ def configure_markovian_summary(
     compaction_max_turns: int,
     max_len_summary: int,
     instruction_text: str,
+    resume_text: str = "",
     temperature: float = 0.3,
     top_p: float = 0.95,
     on_error: str = "drop",
@@ -1182,6 +1185,7 @@ def configure_markovian_summary(
         compaction_max_turns=compaction_max_turns,
         max_len_summary=max_len_summary,
         instruction_text=instruction_text,
+        resume_text=resume_text,
         temperature=temperature,
         top_p=top_p,
         on_error=on_error,
@@ -1217,8 +1221,9 @@ def _autoconfigure_markovian_summary_from_env() -> None:
       KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR             — "drop" | "raise"
       KV_EVICTION_MARKOVIAN_SUMMARY_LOG                  — "1" enables debug
 
-    Long string (instruction_text) via JSON env var:
-      KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON — {"instruction_text": "..."}
+    Long strings (instruction_text, resume_text) via JSON env var:
+      KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON
+          — {"instruction_text": "...", "resume_text": "..."}
 
     No-ops if already configured or env vars are absent.
     """
@@ -1259,14 +1264,16 @@ def _autoconfigure_markovian_summary_from_env() -> None:
 
     strings_json = _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON")
     instruction_text = ""
+    resume_text = ""
     if strings_json:
         try:
             parsed = _json.loads(strings_json)
             instruction_text = str(parsed.get("instruction_text", ""))
+            resume_text = str(parsed.get("resume_text", ""))
         except (ValueError, TypeError) as e:
             logger.warning(
                 "kv_eviction: KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON "
-                "invalid (%s); using empty instruction_text",
+                "invalid (%s); using empty instruction_text/resume_text",
                 e,
             )
     if not instruction_text:
@@ -1282,6 +1289,7 @@ def _autoconfigure_markovian_summary_from_env() -> None:
         compaction_max_turns=compaction_max_turns,
         max_len_summary=max_len_summary,
         instruction_text=instruction_text,
+        resume_text=resume_text,
         temperature=temperature,
         top_p=top_p,
         on_error=on_error,

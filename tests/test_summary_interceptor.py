@@ -116,6 +116,7 @@ def _install_summary(
     max_len_summary=128,
     on_error="drop",
     instruction_text=INSTR,
+    resume_text="",
 ):
     env.configure_markovian_summary(
         enabled=enabled,
@@ -123,6 +124,7 @@ def _install_summary(
         compaction_max_turns=compaction_max_turns,
         max_len_summary=max_len_summary,
         instruction_text=instruction_text,
+        resume_text=resume_text,
         temperature=0.3,
         top_p=0.95,
         on_error=on_error,
@@ -179,13 +181,50 @@ def test_markovian_mode_full_reset_shape():
     assert "tools" not in summary_call
     assert "tool_choice" not in summary_call
 
-    # Outer call: markovian mode = sys + I + S + tail (body dropped).
+    # Outer call: markovian mode = sys + tail + [I, S] (body dropped, no
+    # resume_text configured → no trailing user turn).
     outer_messages = outer_call["messages"]
     assert outer_messages == [
         _sys(),
+        _user("pending"),
         {"role": "user", "content": INSTR},
         {"role": "assistant", "content": "SUMMARY-TEXT"},
+    ]
+
+
+def test_markovian_mode_appends_resume_text_when_set():
+    """When resume_text is configured, the outer call gets a trailing
+    user turn after the summary exchange so vLLM has a pending
+    generation prompt."""
+    _install_mt(max_turns=8)
+    _install_summary(
+        mode="markovian",
+        compaction_max_turns=2,
+        resume_text="Please continue.",
+    )
+
+    calls: list[dict] = []
+
+    async def fake_orig(self, *args, **kwargs):
+        calls.append(dict(kwargs))
+        if "logprobs" in kwargs and kwargs["logprobs"] is True:
+            return _make_summary_response("SUM")
+        return _outer_response()
+
+    msgs = [_sys(), *_turn(1), *_turn(2), *_turn(3), _user("pending")]
+
+    async def factory(patched):
+        return await patched(self=None, model="m", messages=msgs)
+
+    _run_with_fake_orig(fake_orig, factory)
+
+    outer_messages = calls[1]["messages"]
+    assert outer_messages == [
+        _sys(),
         _user("pending"),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUM"},
+        {"role": "user", "content": "Please continue."},
     ]
 
 

@@ -264,11 +264,13 @@ def test_build_post_summary_markovian_drops_body():
         instruction_text=INSTR,
         summary_text="SUMMARY",
     )
+    # Shape: sys + preserved(=empty) + tail + [I, S]. No resume_text → no
+    # trailing user turn.
     assert out == [
         _sys(),
+        _user("pending"),
         {"role": "user", "content": INSTR},
         {"role": "assistant", "content": "SUMMARY"},
-        _user("pending"),
     ]
 
 
@@ -311,6 +313,54 @@ def test_build_post_summary_empty_body_groups():
     ]
 
 
+def test_build_post_summary_markovian_appends_resume_text():
+    """resume_text non-empty: final shape sys + preserved + tail + [I, S, U_resume]."""
+    sys_p = [_sys()]
+    body = [list(_turn(1)), list(_turn(2))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="markovian",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="SUMMARY",
+        n_preserved_turns=1,
+        resume_text="Please continue.",
+    )
+    assert out == [
+        _sys(),
+        *_turn(2),
+        _user("pending"),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "SUMMARY"},
+        {"role": "user", "content": "Please continue."},
+    ]
+
+
+def test_build_post_summary_eviction_ignores_resume_text():
+    """Eviction mode does not append resume_text (tail is already pending)."""
+    sys_p = [_sys()]
+    body = [list(_turn(1))]
+    tail = [_user("pending")]
+    out = build_post_summary_messages(
+        mode="eviction",
+        sys_prefix=sys_p,
+        body_groups=body,
+        tail=tail,
+        instruction_text=INSTR,
+        summary_text="S",
+        resume_text="Please continue.",
+    )
+    assert out == [
+        _sys(),
+        *_turn(1),
+        {"role": "user", "content": INSTR},
+        {"role": "assistant", "content": "S"},
+        _user("pending"),
+    ]
+
+
 def test_build_post_summary_unknown_mode_raises():
     with pytest.raises(ValueError, match="unknown mode"):
         build_post_summary_messages(
@@ -346,7 +396,7 @@ def test_build_post_summary_does_not_mutate_inputs():
 
 
 def test_build_post_summary_markovian_preserves_n_turns():
-    """n_preserved_turns=2: sys + last_2_body_groups + [I, S] + tail."""
+    """n_preserved_turns=2: sys + last_2_body_groups + tail + [I, S]."""
     sys_p = [_sys()]
     body = [list(_turn(1)), list(_turn(2)), list(_turn(3)), list(_turn(4))]
     tail = [_user("pending")]
@@ -363,9 +413,9 @@ def test_build_post_summary_markovian_preserves_n_turns():
         _sys(),
         *_turn(3),
         *_turn(4),
+        _user("pending"),
         {"role": "user", "content": INSTR},
         {"role": "assistant", "content": "SUMMARY"},
-        _user("pending"),
     ]
 
 
@@ -386,9 +436,9 @@ def test_build_post_summary_markovian_preserves_more_than_available():
     assert out == [
         _sys(),
         *_turn(1),
+        _user("pending"),
         {"role": "user", "content": INSTR},
         {"role": "assistant", "content": "SUMMARY"},
-        _user("pending"),
     ]
 
 
@@ -407,9 +457,9 @@ def test_build_post_summary_markovian_preserve_zero_is_full_reset():
     )
     assert out == [
         _sys(),
+        _user("pending"),
         {"role": "user", "content": INSTR},
         {"role": "assistant", "content": "SUMMARY"},
-        _user("pending"),
     ]
 
 
