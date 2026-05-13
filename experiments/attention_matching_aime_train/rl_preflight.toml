@@ -1,0 +1,75 @@
+max_steps = 1
+seq_len = 16384
+output_dir = "outputs/attention_matching_aime_preflight"
+clean_output_dir = true
+
+[deployment]
+type = "single_node"
+num_train_gpus = 2
+num_infer_gpus = 2
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "attention-matching-aime-16k-preflight"
+shared = true
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 1024
+stride = 256
+block_size = 16
+bptt_segments = 1
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 2
+rollouts_per_example = 1
+oversampling_factor = 1.0
+
+[orchestrator.train.sampling]
+temperature = 0.6
+max_completion_tokens = 16384
+
+[[orchestrator.train.env]]
+id = "math-env"
+name = "hendrycks-math"
+args = { dataset_name = "PrimeIntellect/Hendrycks-Math", dataset_subset = "default", math_verify_max_workers = 8, math_verify_timeout = 60 }
+
+[inference]
+enable_prefix_caching = false
+gpu_memory_utilization = 0.7
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = false
+
+[inference.parallel]
+tp = 1
+dp = 2
+
+[inference.vllm_extra]
+block_size = 16
+async_scheduling = false
+attention_backend = "FLEX_ATTENTION"
+compaction_strategy = "attention_matching"
+compaction_window_size = 1024
+compaction_stride = 256
+attention_matching_max_queries_per_kv_head = 32
+attention_matching_query_source = "recent_cache_keys"

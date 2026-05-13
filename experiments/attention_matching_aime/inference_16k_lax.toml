@@ -1,0 +1,45 @@
+# attention_matching_aime: relaxed 16k inference config for testing whether AM
+# works when compaction is intentionally mild rather than maximally stressed.
+#
+# This keeps the same single-worker forked-vLLM AM path, but makes two changes:
+# - compaction is less frequent
+# - each compaction is less severe
+#
+# With window=4096 and stride=1024:
+# - the target cache after compaction is 1024 synthetic + 2048 exact = 3072
+# - the next compaction does not trigger until the request grows past 4096 again
+# - the oldest history is summarized less aggressively than the 1024/256 stress
+#   setup, which was recursively compacting a tiny synthetic prefix many times
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = false
+
+[parallel]
+dp = 1
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false
+compaction_window_size = 4096
+compaction_stride = 1024
+compaction_strategy = "attention_matching"
+attention_backend = "FLEX_ATTENTION"
+# Use a somewhat larger deterministic query set so the milder compaction still
+# has enough signal from the recent exact region without changing the algorithm.
+attention_matching_max_queries_per_kv_head = 64
+attention_matching_query_source = "random_queries"
+attention_matching_protect_user_prompts = "first_user"
+# Keep enough KV pressure to exercise AM, but do not force the extremely tight
+# stress regime used by the aggressive baseline config.
+gpu_memory_utilization = 0.4

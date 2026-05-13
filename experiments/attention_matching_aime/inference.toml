@@ -1,0 +1,40 @@
+# attention_matching_aime: aggressive 16k inference config for exercising the
+# attention-matching baseline on AIME through the live server path.
+#
+# This is intentionally single-GPU so preemption/restore happen on one worker,
+# matching the current same-worker AM snapshot design.
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = false
+
+[parallel]
+dp = 1
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false
+# This is the strict stress configuration: very small window/stride so AM
+# compaction triggers early and repeatedly under AIME continuous batching.
+compaction_window_size = 1024
+compaction_stride = 256
+compaction_strategy = "attention_matching"
+attention_backend = "FLEX_ATTENTION"
+# Keep the live AM batch compaction tractable under AIME continuous batching.
+# This still samples queries from the recent exact region; it just uses a
+# smaller deterministic subset per KV head.
+attention_matching_max_queries_per_kv_head = 32
+attention_matching_query_source = "random_queries"
+attention_matching_protect_user_prompts = "first_user"
+# Keep KV capacity tight so concurrent AIME requests force compaction/preemption.
+gpu_memory_utilization = 0.14

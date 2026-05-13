@@ -257,7 +257,7 @@ def segmented_forward(
     position_ids: Tensor,  # [1, seq_len]
     segment_boundaries: list[int],  # cumulative completion token counts
     prompt_len: int,  # raw prompt length
-    prompt_aligned_len: int,  # block-aligned eviction boundary
+    prompt_aligned_len: int,  # ceil(prompt_len / block_size) * block_size
     stride: int,  # tokens to drop per eviction (= stride_blocks * block_size)
     temperature: Tensor,  # [1, seq_len] per-token temperatures
     max_forward_passes: int | None = None,  # FSDP synchronization padding
@@ -282,14 +282,13 @@ def segmented_forward(
             list is empty.
         prompt_len: Number of prompt tokens (the offset into input_ids where
             completion tokens begin).
-        prompt_aligned_len: Block-aligned eviction boundary. Without
-            protected prefix: ceil(prompt_len / block_size) * block_size.
-            With protected prefix: ceil(min(protected_prefix, prompt_len)
-            / block_size) * block_size — can be LESS than prompt_len
-            because old conversation turns between the protected prefix
-            and the prompt end are evictable. The trainer-side drop must
-            match the inference-side boundary exactly or train/inference
-            KL explodes.
+        prompt_aligned_len: ceil(prompt_len / block_size) * block_size. The
+            physical eviction boundary used by CompactingKVCacheManager —
+            block-aligned, not token-aligned. When prompt_len is not a
+            multiple of block_size, the first (prompt_aligned_len -
+            prompt_len) completion tokens live in the tail of the last
+            prompt block and are never evicted. The trainer-side drop must
+            match this exactly or train/inference KL explodes.
         stride: Number of tokens evicted per compaction event. In the vLLM
             config this is compaction_stride, a multiple of block_size.
         temperature: Per-token temperatures [1, seq_len] used at generation
@@ -359,12 +358,9 @@ def segmented_forward(
     # covering the whole [prompt + completion] sequence, numerically
     # equivalent to calling model(input_ids, position_ids) directly
     # under flash_attention_2. See plans/phase3_training_integration.md.
-    assert prompt_aligned_len > 0, (
-        f"prompt_aligned_len must be positive, got {prompt_aligned_len}"
-    )
-    assert prompt_aligned_len <= input_ids.shape[1], (
-        f"prompt_aligned_len ({prompt_aligned_len}) exceeds seq_len "
-        f"({input_ids.shape[1]})"
+    assert prompt_aligned_len >= prompt_len, (
+        f"prompt_aligned_len ({prompt_aligned_len}) must be >= prompt_len "
+        f"({prompt_len})"
     )
     assert stride > 0, f"stride must be positive, got {stride}"
     assert not (activation_checkpointing and loss_fn is not None), (

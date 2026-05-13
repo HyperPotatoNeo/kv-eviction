@@ -1,0 +1,38 @@
+# attention_matching_aime: relaxed 16k AM config with multi-GPU DP and
+# non-eager runtime enabled.
+#
+# This keeps the relaxed AM compaction policy unchanged while switching the
+# execution topology to the safest faster path:
+# - data parallel replicas across 4 GPUs
+# - tensor parallel remains 1, so per-request AM math is unchanged
+# - enforce_eager is disabled so vLLM can use its normal compiled/cudagraph
+#   fast paths if the fork supports them for this workload
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = false
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false
+compaction_window_size = 4096
+compaction_stride = 1024
+compaction_strategy = "attention_matching"
+attention_backend = "FLEX_ATTENTION"
+attention_matching_max_queries_per_kv_head = 64
+attention_matching_query_source = "random_queries"
+attention_matching_protect_user_prompts = "first_user"
+gpu_memory_utilization = 0.4

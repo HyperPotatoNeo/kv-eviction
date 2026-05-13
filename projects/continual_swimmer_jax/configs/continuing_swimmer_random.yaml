@@ -1,0 +1,59 @@
+project_name: continuing-swimmer-random
+output_dir: artifacts/continual_swimmer_jax/continuing_swimmer_random
+
+algorithm:
+  name: random
+  uses_deviation_correction: false
+
+benchmark:
+  name: continuing_swimmer_mjx
+  mjcf_path: projects/continual_swimmer_jax/assets/continuing_swimmer.xml
+  total_steps: 5000000
+  seeds: [0, 1, 2, 3, 4]
+  checkpoint_interval: 500000
+  evaluation_interval: 500000
+  frame_skip: 4
+  reset_noise_scale: 0.1
+  forward_reward_weight: 1.0
+  ctrl_cost_weight: 0.0001
+  exclude_current_positions_from_observation: true
+  solver_iterations: 1
+  solver_ls_iterations: 4
+  jacobian: dense
+
+random_policy:
+  num_envs: 4096
+  rollout_length: 64
+  evaluation_episodes: 128
+  continuous_low: -1.0
+  continuous_high: 1.0
+  discrete_sampling: uniform
+
+correction:
+  enabled: false
+
+representation:
+  metrics: []
+  probe_targets: []
+  compare_windows: []
+  ridge_alpha: 0.0001
+
+variation_budget:
+  enabled: false
+  anchor_observation_count: 4096
+  reduction: max
+  include_policy_budget: false
+  include_reward_budget: true
+  include_kernel_budget: false
+  policy_metric: action_l2
+  accumulate: false
+
+runtime:
+  platform: gpu
+  require_gpu: true
+  dtype: bfloat16
+  enable_x64: false
+  xla_flags:
+    - --xla_gpu_triton_gemm_any=true
+  preallocate: false
+  jax_debug_nans: false

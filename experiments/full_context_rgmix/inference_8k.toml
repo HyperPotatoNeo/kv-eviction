@@ -1,0 +1,24 @@
+# full_context_rgmix: 8k inference-side vLLM config for a matched
+# non-compaction AIME baseline against attention_matching_aime/inference_8k.toml.
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 8192
+enforce_eager = false
+
+[parallel]
+dp = 1
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false
+gpu_memory_utilization = 0.4

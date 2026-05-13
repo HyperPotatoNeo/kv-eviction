@@ -1,0 +1,76 @@
+project_name: continuing-swimmer-temporal-deviation
+output_dir: artifacts/continual_swimmer
+
+benchmark:
+  name: continuing_swimmer
+  env_id: Swimmer-v5
+  total_steps: 50000000
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  checkpoint_interval: 500000
+  evaluation_interval: 1000000
+  max_episode_steps: null
+  env_kwargs: {}
+  representation_samples: 4096
+  metrics:
+    - online_return
+    - time_to_collapse
+    - end_vs_peak_ratio
+    - deviation_regret
+    - representation_cka
+    - probe_r2
+
+ppo:
+  rollout_length: 2048
+  epochs: 4
+  minibatch_size: 64
+  gae_lambda: 0.95
+  gamma: 0.99
+  clip_range: 0.2
+  input_normalization: true
+  advantage_normalization: true
+  value_loss_clipping: true
+  max_grad_norm: 0.5
+  optimizer: adam
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  optimizer_eps: 0.00001
+
+correction:
+  enabled: true
+  penalty_weight: 0.5
+  margin: 0.0
+  max_lookback: 5
+  include_best_so_far: true
+  predicted_future_steps: 1
+  positive_regret_power: 1.0
+  kl_floor: 0.00000001
+
+representation:
+  layers:
+    - policy_backbone
+    - value_backbone
+  metrics:
+    - linear_cka
+    - cosine_drift
+    - ridge_probe_r2
+  probe_targets:
+    - forward_velocity
+    - joint_phase
+    - action_norm
+    - return_to_go
+  compare_windows:
+    - early
+    - peak
+    - post_collapse
+  ridge_alpha: 0.0001
+
+runtime:
+  device: auto
+  dtype: bfloat16
+  amp_enabled: true
+  torch_compile: false
+  torch_compile_mode: default
+  allow_tf32: true
+  cudnn_benchmark: true
+  pin_memory: true
+  dataloader_workers: 4

@@ -1,0 +1,30 @@
+# AIME KV-corruption experiment: full-context non-AM with 50% chunk shuffle.
+#
+# This is the matching non-compaction control for the AM p50 shuffle run.
+
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = false
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false
+attention_backend = "FLEX_ATTENTION"
+attention_matching_protect_user_prompts = "first_user"
+shuffle_control_chunk_size = 512
+shuffle_control_probability = 0.50
+shuffle_control_seed = 0
+gpu_memory_utilization = 0.4

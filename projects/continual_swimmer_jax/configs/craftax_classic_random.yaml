@@ -1,0 +1,54 @@
+project_name: craftax-classic-random
+output_dir: artifacts/continual_swimmer_jax/craftax_classic_random
+
+algorithm:
+  name: random
+  uses_deviation_correction: false
+
+benchmark:
+  name: craftax_classic_jax
+  total_steps: 10000000
+  seeds: [0, 1, 2, 3, 4]
+  checkpoint_interval: 250000
+  evaluation_interval: 250000
+  env_kwargs:
+    use_classic: true
+    auto_reset: false
+    map_size: 64
+
+random_policy:
+  num_envs: 8192
+  rollout_length: 64
+  evaluation_episodes: 128
+  continuous_low: -1.0
+  continuous_high: 1.0
+  discrete_sampling: uniform
+
+correction:
+  enabled: false
+
+representation:
+  metrics: []
+  probe_targets: []
+  compare_windows: []
+  ridge_alpha: 0.0001
+
+variation_budget:
+  enabled: false
+  anchor_observation_count: 4096
+  reduction: max
+  include_policy_budget: false
+  include_reward_budget: true
+  include_kernel_budget: false
+  policy_metric: categorical_tv
+  accumulate: false
+
+runtime:
+  platform: gpu
+  require_gpu: true
+  dtype: bfloat16
+  enable_x64: false
+  xla_flags:
+    - --xla_gpu_triton_gemm_any=true
+  preallocate: false
+  jax_debug_nans: false

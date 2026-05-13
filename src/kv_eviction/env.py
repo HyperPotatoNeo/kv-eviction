@@ -23,24 +23,12 @@ before the verifiers env so its `add_model_response` runs first.
 """
 
 import logging
-from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
 from verifiers.types import Messages, Response as ModelResponse, State, TrajectoryStep
 
 from kv_eviction.padding import render_padded_prompt
-from kv_eviction.summarization import (
-    build_exchange,
-    build_post_summary_messages,
-    count_summary_exchanges,
-    extract_completion_logprobs,
-    extract_completion_token_ids,
-    extract_prompt_token_ids as _summary_extract_prompt_token_ids,
-    partition_messages,
-    sanitize_summary,
-)
-from kv_eviction.truncation import truncate_messages_to_last_k_turns
 from kv_eviction.types import CompactionEventWire
 
 logger = logging.getLogger(__name__)
@@ -223,7 +211,6 @@ class CompactionEnvMixin:
             return
         # The base class just appended a step. Attach compaction metadata to it.
         attach_compaction_events_from_response(trajectory[-1], response)
-        attach_summary_trainsample_from_response(trajectory[-1], response)
 
 
 # ─── Module-level monkey-patches ───
@@ -353,18 +340,6 @@ def _install_compaction_event_hooks() -> None:
                 raw_ptids = extra.get("prompt_token_ids")
             _forward_extra(verifiers_response, "prompt_token_ids", raw_ptids)
 
-            # Markovian summary extension: the AsyncCompletions
-            # interceptor stashes a summary_trainsample dict on the
-            # native response whenever a summary exchange was spliced
-            # into the outgoing messages. Forward it so Patch #2 can
-            # attach it to the trajectory step's extras for the
-            # orchestrator to emit as a standalone TrainingSample.
-            raw_summary = getattr(response, "summary_trainsample", None)
-            if raw_summary is None and hasattr(response, "model_extra"):
-                extra = response.model_extra or {}
-                raw_summary = extra.get("summary_trainsample")
-            _forward_extra(verifiers_response, "summary_trainsample", raw_summary)
-
             return verifiers_response
 
         patched_from_native.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
@@ -386,7 +361,6 @@ def _install_compaction_event_hooks() -> None:
             if trajectory:
                 attach_compaction_events_from_response(trajectory[-1], response)
                 attach_prompt_token_ids_from_response(trajectory[-1], response)
-                attach_summary_trainsample_from_response(trajectory[-1], response)
 
         patched_add_model_response.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
         base_env_cls.add_model_response = patched_add_model_response  # type: ignore[assignment]
@@ -438,238 +412,6 @@ class MessagePaddingConfig:
 _padding_config: MessagePaddingConfig | None = None
 
 
-# Markovian Thinker globals — forward-declared here because
-# `_install_message_padding_interceptor()` below installs a closure
-# (`patched_create`) that reads `_markovian_config` and mutates
-# `_markovian_stats` on every request. If import was interrupted or
-# raced between the installer call and the later module-level
-# definitions, every subsequent rollout raised
-# `NameError: name '_markovian_config' is not defined` (observed on EAI
-# when env.py was written mid-import over NFS). The full config
-# dataclass, constructor, and autoconfigure helper stay at their
-# original location below — only the globals move up. Type is
-# string-forward-referenced to keep the dataclass in its current spot.
-_markovian_config: "MarkovianThinkerRuntimeConfig | None" = None
-# Forward-declared for the same reason as `_markovian_config`: the
-# patched_create closure captures these at install time. Full dataclass
-# + configure helpers live below, alongside the Markovian equivalents.
-_summary_config: "MarkovianSummaryRuntimeConfig | None" = None
-_markovian_stats: dict[str, int] = {
-    "n_truncations": 0,
-    "n_messages_dropped": 0,
-    "n_summaries": 0,
-    "n_summary_failures": 0,
-    "summary_prompt_tokens": 0,
-    "summary_output_tokens": 0,
-    "summary_latency_ms": 0,
-}
-
-# Recursion guard: set True inside `_generate_summary` before calling
-# `orig_create` for the side-channel summary request, so the re-entrant
-# invocation of `patched_create` short-circuits and does not try to
-# intercept / re-summarize the summary call. contextvars (not
-# threading.local) so async tasks migrating between threads still see
-# the correct value.
-_IN_SUMMARY_CALL: ContextVar[bool] = ContextVar(
-    "_IN_SUMMARY_CALL", default=False
-)
-
-
-async def _generate_summary(
-    orig_create,  # callable — the non-patched AsyncCompletions.create
-    self_,  # the AsyncCompletions instance (passed as first positional arg)
-    scfg,  # MarkovianSummaryRuntimeConfig
-    *,
-    outer_kwargs: dict,
-    full_messages: list[dict],
-) -> tuple[str | None, dict | None]:
-    """Fire a side-channel summary request against the rollout model.
-
-    Returns ``(text, train_sample_dict)`` on success, or ``(None, None)``
-    on failure (empty response, or raised exception when
-    ``on_error="drop"``). The caller decides what to do on ``None`` —
-    typically, plain Markovian truncation fallback.
-
-    ``train_sample_dict`` is a :class:`SummaryTrainSample`-serialized
-    dict carrying the prompt tokens vLLM processed, the sampled
-    completion tokens, and per-token logprobs. The caller attaches this
-    to the outer response via :func:`_attach_summary_trainsample` so
-    the orchestrator can emit a standalone ``TrainingSample`` from it
-    in ``interleave_rollout``.
-
-    ``orig_create`` is passed in explicitly (instead of captured via
-    closure inside ``_install_message_padding_interceptor``) so this
-    function is unit-testable with a mock.
-
-    Recursion guard: ``_IN_SUMMARY_CALL`` is set True for the duration
-    of the inner ``orig_create`` call so any subsequent re-entry into
-    ``patched_create`` short-circuits and leaves the summary request
-    un-intercepted. ``contextvars`` (not ``threading.local``) because
-    the interceptor is async and tasks may migrate between threads.
-    """
-    import time as _time
-
-    I_msg, _ = build_exchange(scfg.instruction_text, "")
-    summary_messages = list(full_messages) + [I_msg]
-
-    summary_kwargs = {
-        "model": outer_kwargs.get("model"),
-        "messages": summary_messages,
-        "max_tokens": scfg.max_len_summary,
-        "temperature": scfg.temperature,
-        "top_p": scfg.top_p,
-        "logprobs": True,
-        "top_logprobs": 0,
-    }
-
-    # Eviction mode + padding enabled: render the summary call's prompt
-    # block-aligned so its ``prompt_token_ids`` land on a block boundary.
-    # Otherwise the trainer's ``prompt_aligned_len = ceil(prompt_len /
-    # block_size) * block_size`` can overshoot ``seq_len`` on short
-    # summaries and trip segmented_forward's invariant assert.
-    pad_cfg = _padding_config
-    if (
-        scfg.mode == "eviction"
-        and pad_cfg is not None
-        and pad_cfg.enabled
-    ):
-        try:
-            _raw, padded_ids, _pads = render_padded_prompt(
-                tokenizer=pad_cfg.tokenizer,
-                messages=summary_messages,
-                tools=outer_kwargs.get("tools"),
-                block_size=pad_cfg.block_size,
-                filler_token_id=pad_cfg.filler_token_id,
-                im_end_token_id=pad_cfg.im_end_token_id,
-            )
-        except Exception:
-            logger.exception(
-                "kv_eviction: summary-call render_padded_prompt failed; "
-                "falling back to server-side rendering"
-            )
-        else:
-            extra_body = dict(summary_kwargs.pop("extra_body", None) or {})
-            extra_body["prompt_token_ids"] = padded_ids
-            summary_kwargs["extra_body"] = extra_body
-
-    token = _IN_SUMMARY_CALL.set(True)
-    t0 = _time.perf_counter()
-    try:
-        resp = await orig_create(self_, **summary_kwargs)
-    except Exception:
-        if scfg.on_error == "raise":
-            raise
-        logger.warning(
-            "kv_eviction: Markovian summary request failed; falling back "
-            "to plain truncation",
-            exc_info=True,
-        )
-        _markovian_stats["n_summary_failures"] += 1
-        return None, None
-    finally:
-        _IN_SUMMARY_CALL.reset(token)
-    latency_ms = int((_time.perf_counter() - t0) * 1000)
-
-    try:
-        raw_text = resp.choices[0].message.content or ""
-    except (AttributeError, IndexError, TypeError):
-        raw_text = ""
-    text, was_sanitized = sanitize_summary(raw_text.strip())
-    if not text:
-        _markovian_stats["n_summary_failures"] += 1
-        return None, None
-
-    # Extract training-sample payload. If any extraction returns empty
-    # we still return the text (the summary itself is usable for the
-    # message-list splice); the sample_dict may just lack logprobs or
-    # token ids, in which case interleave_rollout skips the emission.
-    prompt_ids = _summary_extract_prompt_token_ids(resp)
-    completion_ids = extract_completion_token_ids(resp)
-    completion_logprobs = extract_completion_logprobs(resp)
-    # Eviction mode: capture vLLM-side compaction events that fired
-    # during the summary call's prefill/decode so the trainer treats
-    # the summary sample as a compaction sample (events branch in
-    # train.py's prompt_aligned_len math).
-    summary_events: list[dict] = []
-    if scfg.mode == "eviction":
-        summary_events = list(_extract_compaction_event_dicts(resp) or [])
-    sample_dict: dict | None = {
-        "prompt_token_ids": prompt_ids,
-        "completion_token_ids": completion_ids,
-        "completion_logprobs": completion_logprobs,
-        "model": outer_kwargs.get("model") or "",
-        "compaction_events": summary_events,
-    }
-
-    if scfg.log_summaries:
-        logger.info(
-            "[SUMMARY] (%s, %d chars%s, %d prompt / %d completion tokens) %s",
-            scfg.mode,
-            len(text),
-            ", sanitized" if was_sanitized else "",
-            len(prompt_ids),
-            len(completion_ids),
-            text[:200],
-        )
-
-    _markovian_stats["n_summaries"] += 1
-    _markovian_stats["summary_prompt_tokens"] += len(prompt_ids)
-    _markovian_stats["summary_output_tokens"] += len(completion_ids)
-    _markovian_stats["summary_latency_ms"] += latency_ms
-    return text, sample_dict
-
-
-def _attach_summary_trainsample(response: Any, sample_dict: dict) -> None:
-    """Stash a :class:`SummaryTrainSample` dict on a ChatCompletion so
-    Patch #1 (``from_native_response``) can forward it to the verifiers
-    Response and Patch #2 (``add_model_response``) can copy it into the
-    trajectory step's extras.
-
-    Mirrors :func:`_stash_prompt_token_ids`: writes via ``setattr``,
-    falls back to ``model_extra`` on pydantic subclasses that reject
-    direct attribute writes.
-    """
-    try:
-        setattr(response, "summary_trainsample", sample_dict)
-    except Exception:
-        if hasattr(response, "model_extra"):
-            if response.model_extra is None:
-                response.__pydantic_extra__ = {}
-            response.model_extra["summary_trainsample"] = sample_dict
-
-
-def _extract_summary_trainsample(response: Any) -> dict | None:
-    """Pull a summary_trainsample dict off a response. Returns ``None``
-    when absent. Mirrors :func:`_extract_compaction_event_dicts` —
-    tolerant of both attribute access and ``model_extra``."""
-    if response is None:
-        return None
-    raw = getattr(response, "summary_trainsample", None)
-    if raw is None and hasattr(response, "model_extra"):
-        extra = response.model_extra or {}
-        raw = extra.get("summary_trainsample")
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        return None
-    return raw
-
-
-def attach_summary_trainsample_from_response(
-    step: TrajectoryStep,
-    response: ModelResponse,
-) -> None:
-    """Mutate the given TrajectoryStep's extras to include
-    ``summary_trainsample`` — the training payload for the synthesized
-    summary turn. Idempotent; no-op when the response has no summary."""
-    sample = _extract_summary_trainsample(response)
-    if sample is None:
-        return
-    if step.get("extras") is None:
-        step["extras"] = {}
-    step["extras"]["summary_trainsample"] = sample
-
-
 def configure_message_padding(
     *,
     enabled: bool,
@@ -708,47 +450,13 @@ def configure_message_padding(
         )
 
 
-def _stash_prompt_token_ids(response: Any, ids: list[int]) -> None:
-    """Attach ``prompt_token_ids`` to an OpenAI ChatCompletion so Patch #1
-    (``from_native_response``) can forward it to the verifiers Response
-    and Patch #2 (``add_model_response``) can copy it into the trajectory
-    step's extras.
-
-    ``ChatCompletion`` is a pydantic BaseModel with ``extra="allow"``, so
-    setattr writes to ``__pydantic_extra__``. We fall back to writing
-    ``model_extra`` directly when setattr is rejected by unusual pydantic
-    subclasses.
-    """
-    try:
-        setattr(response, "prompt_token_ids", ids)
-    except Exception:
-        if hasattr(response, "model_extra"):
-            if response.model_extra is None:
-                response.__pydantic_extra__ = {}
-            response.model_extra["prompt_token_ids"] = ids
-
-
 def _install_message_padding_interceptor() -> None:
-    """Monkey-patch `AsyncCompletions.create` with two independent branches:
-
-    Branch A — Markovian Thinker client-side truncation: drop all but the
-    last K turn groups from ``messages`` before the request leaves the
-    orchestrator. vLLM runs a normal full-context completion on the
-    truncated message list with no compaction.
-
-    Branch B — block-aligned message padding: pre-tokenize ``messages``
-    into a filler-padded token stream and pass it to vLLM via
-    ``extra_body={"prompt_token_ids": ...}`` so turn-based KV eviction
-    lands on block boundaries.
-
-    The validator in ``prime-rl/src/prime_rl/configs/rl.py`` forbids
-    enabling both simultaneously, so in practice at most one branch fires
-    per request. The branches are independent and compose safely if that
-    changed.
+    """Monkey-patch `AsyncCompletions.create` to pre-pad messages into
+    block-aligned token streams when padding is enabled.
 
     Idempotent — sentinel-attribute guarded so repeated imports / test
-    teardowns don't stack wrappers. No-op passthrough when neither config
-    is enabled.
+    teardowns don't stack wrappers. No-op passthrough when
+    `_padding_config` is None or disabled.
     """
     try:
         from openai.resources.chat.completions.completions import (
@@ -762,161 +470,6 @@ def _install_message_padding_interceptor() -> None:
         return
 
     async def patched_create(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        # Recursion guard — see `_IN_SUMMARY_CALL` docstring. We do this
-        # first so the side-channel summary request bypasses the entire
-        # interceptor (both branches).
-        if _IN_SUMMARY_CALL.get():
-            return await orig_create(self, *args, **kwargs)
-
-        # --- Branch A: Markovian Thinker client-side truncation ---
-        mcfg = _markovian_config
-        if mcfg is not None and mcfg.enabled:
-            messages = kwargs.get("messages")
-            if messages is not None:
-                orig_len = len(messages)
-                scfg = _summary_config
-
-                summary_fired = False
-                summary_sample_dict: dict | None = None
-                if (
-                    scfg is not None
-                    and scfg.enabled
-                    and scfg.compaction_max_turns > 0
-                    and scfg.instruction_text
-                ):
-                    n_groups, sys_prefix, body_groups, tail = partition_messages(
-                        messages
-                    )
-                    n_real = n_groups - count_summary_exchanges(
-                        messages, scfg.instruction_text
-                    )
-                    if n_real > scfg.compaction_max_turns:
-                        summary_text, summary_sample_dict = await _generate_summary(
-                            orig_create,
-                            self,
-                            scfg,
-                            outer_kwargs=kwargs,
-                            full_messages=messages,
-                        )
-                        if summary_text:
-                            new_messages = build_post_summary_messages(
-                                mode=scfg.mode,
-                                sys_prefix=sys_prefix,
-                                body_groups=body_groups,
-                                tail=tail,
-                                instruction_text=scfg.instruction_text,
-                                summary_text=summary_text,
-                                n_preserved_turns=(mcfg.stride or 0),
-                                resume_text=scfg.resume_text,
-                            )
-                            summary_fired = True
-                        else:
-                            # Summary generation failed: fall through to
-                            # plain Markovian truncation.
-                            new_messages = truncate_messages_to_last_k_turns(
-                                messages,
-                                max_turns=mcfg.max_turns,
-                                stride=mcfg.stride,
-                                log_fn=(
-                                    (lambda m: logger.info("[MARKOVIAN] %s", m))
-                                    if mcfg.log_truncated_messages
-                                    else None
-                                ),
-                            )
-                    else:
-                        new_messages = truncate_messages_to_last_k_turns(
-                            messages,
-                            max_turns=mcfg.max_turns,
-                            stride=mcfg.stride,
-                            log_fn=(
-                                (lambda m: logger.info("[MARKOVIAN] %s", m))
-                                if mcfg.log_truncated_messages
-                                else None
-                            ),
-                        )
-                else:
-                    new_messages = truncate_messages_to_last_k_turns(
-                        messages,
-                        max_turns=mcfg.max_turns,
-                        stride=mcfg.stride,
-                        log_fn=(
-                            (lambda m: logger.info("[MARKOVIAN] %s", m))
-                            if mcfg.log_truncated_messages
-                            else None
-                        ),
-                    )
-
-                kwargs["messages"] = new_messages
-
-                # Eviction-mode splice + padding enabled: render the
-                # post-summary message list with block-aligned filler
-                # padding so the trainer's ``prompt_aligned_len`` math
-                # is exact (prompt_len already block-aligned → no
-                # rounding overshoot). Otherwise: use the raw
-                # apply_chat_template + encode path, which is what the
-                # pre-summary markovian baseline relies on.
-                pad_cfg_A = _padding_config
-                use_padding_A = (
-                    scfg is not None
-                    and scfg.mode == "eviction"
-                    and pad_cfg_A is not None
-                    and pad_cfg_A.enabled
-                )
-                truncated_ids = None
-                if use_padding_A:
-                    try:
-                        _raw, truncated_ids, _pads = render_padded_prompt(
-                            tokenizer=pad_cfg_A.tokenizer,
-                            messages=new_messages,
-                            tools=kwargs.get("tools"),
-                            block_size=pad_cfg_A.block_size,
-                            filler_token_id=pad_cfg_A.filler_token_id,
-                            im_end_token_id=pad_cfg_A.im_end_token_id,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "kv_eviction: branch-A eviction-mode "
-                            "render_padded_prompt failed; falling back "
-                            "to raw chat-template encode"
-                        )
-                        truncated_ids = None
-                if truncated_ids is None:
-                    # Re-tokenize so the trainer uses the exact token stream
-                    # vLLM will run on (see `plans/markovian_thinker_baseline.md`
-                    # — "The prompt_token_ids divergence").
-                    rendered = mcfg.tokenizer.apply_chat_template(
-                        new_messages,
-                        tools=kwargs.get("tools"),
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
-                    truncated_ids = mcfg.tokenizer.encode(
-                        rendered, add_special_tokens=False
-                    )
-
-                # Forward the pre-tokenized stream to vLLM via extra_body
-                # (see the pre-summary version of this branch for the
-                # long explanation of why).
-                extra_body = dict(kwargs.pop("extra_body", None) or {})
-                extra_body["prompt_token_ids"] = truncated_ids
-                kwargs["extra_body"] = extra_body
-
-                response = await orig_create(self, *args, **kwargs)
-                _stash_prompt_token_ids(response, truncated_ids)
-                if summary_sample_dict is not None:
-                    _attach_summary_trainsample(response, summary_sample_dict)
-
-                # Observability: truncation counters fire even when the
-                # summary path ran (the interceptor still reduced or
-                # rewrote the message list in some way).
-                if len(new_messages) != orig_len or summary_fired:
-                    _markovian_stats["n_truncations"] += 1
-                    _markovian_stats["n_messages_dropped"] += max(
-                        0, orig_len - len(new_messages)
-                    )
-                return response
-
-        # --- Branch B: block-aligned message padding ---
         cfg = _padding_config
         if cfg is None or not cfg.enabled:
             return await orig_create(self, *args, **kwargs)
@@ -972,7 +525,19 @@ def _install_message_padding_interceptor() -> None:
         )
 
         response = await orig_create(self, *args, **kwargs)
-        _stash_prompt_token_ids(response, padded)
+
+        # Stash the padded ids on the response so Patch #1 can forward
+        # them to the verifiers Response and Patch #2 can attach them
+        # to the trajectory step's extras. `ChatCompletion` in
+        # openai-python is a pydantic BaseModel with `extra="allow"`,
+        # so setattr writes to __pydantic_extra__.
+        try:
+            setattr(response, "prompt_token_ids", padded)
+        except Exception:
+            if hasattr(response, "model_extra"):
+                if response.model_extra is None:
+                    response.__pydantic_extra__ = {}
+                response.model_extra["prompt_token_ids"] = padded
         return response
 
     patched_create.__kv_eviction_padding_patched__ = True  # type: ignore[attr-defined]
@@ -1032,343 +597,6 @@ def _autoconfigure_padding_from_env() -> None:
 
 
 _autoconfigure_padding_from_env()
-
-
-# ─── Markovian Thinker: client-side message truncation ───
-#
-# When enabled by the orchestrator via `configure_markovian_thinker(...)`,
-# the AsyncCompletions.create interceptor (Branch A above) truncates each
-# chat completion request's `messages` to the last K complete turn groups
-# BEFORE the request reaches vLLM. vLLM runs a normal, full-context
-# completion on the truncated prompt — no compaction, no eviction, no
-# `CompactionEvent`s. The orchestrator re-tokenizes the truncated
-# messages and stashes the exact token ids on the response so the
-# trainer forwards against the same tokens vLLM saw (see
-# `plans/markovian_thinker_baseline.md` → "The prompt_token_ids divergence").
-#
-# A validator in prime-rl (`validate_markovian_thinker` on RLConfig)
-# rejects configurations that enable Markovian alongside vLLM or trainer
-# compaction, block-aligned padding, or the TITO token client.
-
-
-@dataclass
-class MarkovianThinkerRuntimeConfig:
-    """Runtime config installed by the orchestrator at startup. Fields
-    come from prime-rl's `orchestrator.markovian_thinker` section."""
-
-    enabled: bool
-    tokenizer: Any
-    max_turns: int
-    log_truncated_messages: bool
-    # Turn-preserve count applied on truncation triggers. `None` = keep
-    # last max_turns (legacy single-knob behavior). Integer N ≥ 1 = keep
-    # last N (decoupled: max_turns is the trigger, stride is the keep
-    # count). Also used by the markovian-mode summary splice to carry N
-    # real turns after the summary exchange.
-    stride: int | None = None
-
-
-# `_markovian_config` and `_markovian_stats` are forward-declared above
-# the `_install_message_padding_interceptor()` call — see comment there.
-
-
-def configure_markovian_thinker(
-    *,
-    enabled: bool,
-    tokenizer: Any,
-    max_turns: int,
-    log_truncated_messages: bool = False,
-    stride: int | None = None,
-) -> None:
-    """Install the orchestrator-wide Markovian Thinker config.
-
-    Called once by prime-rl's orchestrator at startup, before any
-    rollouts fire. Idempotent — repeated calls overwrite the previous
-    config.
-    """
-    global _markovian_config
-    _markovian_config = MarkovianThinkerRuntimeConfig(
-        enabled=enabled,
-        tokenizer=tokenizer,
-        max_turns=max_turns,
-        log_truncated_messages=log_truncated_messages,
-        stride=stride,
-    )
-    if enabled:
-        logger.info(
-            "kv_eviction: Markovian Thinker ENABLED (max_turns=%d, stride=%s, log=%s)",
-            max_turns,
-            stride,
-            log_truncated_messages,
-        )
-
-
-def pop_markovian_stats() -> dict[str, int]:
-    """Drain-and-reset the Markovian counters. Called once per
-    orchestrator step to emit `markovian/*` and `markovian_summary/*`
-    metrics to wandb.
-    """
-    global _markovian_stats
-    out = dict(_markovian_stats)
-    _markovian_stats = {
-        "n_truncations": 0,
-        "n_messages_dropped": 0,
-        "n_summaries": 0,
-        "n_summary_failures": 0,
-        "summary_prompt_tokens": 0,
-        "summary_output_tokens": 0,
-        "summary_latency_ms": 0,
-    }
-    return out
-
-
-def _autoconfigure_markovian_from_env() -> None:
-    """Auto-enable Markovian Thinker from environment variables.
-
-    The orchestrator sets these before spawning the verifiers env server
-    subprocess (mp.spawn starts a fresh interpreter that won't inherit
-    the parent's `configure_markovian_thinker(...)` call). The subprocess
-    imports `kv_eviction` via its entrypoint shim, which triggers this
-    function and re-configures truncation from env vars.
-
-    Env var contract:
-      KV_EVICTION_MARKOVIAN_ENABLED    — "1" enables; absence disables.
-      KV_EVICTION_MARKOVIAN_MAX_TURNS  — int (trigger threshold).
-      KV_EVICTION_MARKOVIAN_MODEL      — tokenizer name_or_path.
-      KV_EVICTION_MARKOVIAN_STRIDE     — optional int (post-trigger
-        turn-preserve count). Absent → legacy (keep max_turns).
-
-    No-ops if already configured or if env vars are absent.
-    """
-    import os as _os
-
-    global _markovian_config
-    if _markovian_config is not None and _markovian_config.enabled:
-        return
-    if _os.environ.get("KV_EVICTION_MARKOVIAN_ENABLED") != "1":
-        return
-    max_turns_str = _os.environ.get("KV_EVICTION_MARKOVIAN_MAX_TURNS")
-    model_name = _os.environ.get("KV_EVICTION_MARKOVIAN_MODEL")
-    if not max_turns_str or not model_name:
-        logger.warning(
-            "kv_eviction: KV_EVICTION_MARKOVIAN_ENABLED=1 but "
-            "KV_EVICTION_MARKOVIAN_MAX_TURNS / KV_EVICTION_MARKOVIAN_MODEL "
-            "missing; Markovian Thinker NOT enabled in this process"
-        )
-        return
-    max_turns = int(max_turns_str)
-    log_truncated = _os.environ.get("KV_EVICTION_MARKOVIAN_LOG") == "1"
-    stride_str = _os.environ.get("KV_EVICTION_MARKOVIAN_STRIDE")
-    stride = int(stride_str) if stride_str else None
-    from transformers import AutoTokenizer  # local import to keep env.py lean
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    configure_markovian_thinker(
-        enabled=True,
-        tokenizer=tokenizer,
-        max_turns=max_turns,
-        log_truncated_messages=log_truncated,
-        stride=stride,
-    )
-
-
-_autoconfigure_markovian_from_env()
-
-
-# ─── Markovian Summary: summarization-based eviction ───
-#
-# When enabled by the orchestrator via `configure_markovian_summary(...)`,
-# the AsyncCompletions.create interceptor's Branch A fires a side-channel
-# summary request once the number of real turn groups exceeds
-# `compaction_max_turns`, then splices a `{user: instruction, assistant:
-# summary}` exchange into the outgoing message list. The summary itself
-# is a trainable model turn — its tokens + logprobs are captured on the
-# outer response via `extras["summary_trainsample"]` for the orchestrator
-# to emit as a standalone TrainingSample.
-#
-# Two modes (both ride on the existing Markovian interceptor):
-#   - "markovian": full client-side reset to `sys + [I, S] + tail`.
-#     vLLM-side compaction must be OFF.
-#   - "eviction": append-only `sys + body + [I, S] + tail`.
-#     vLLM-side compaction (block or turn) must be ON.
-#
-# See `plans/markovian_summary.md` for the full design.
-
-
-@dataclass
-class MarkovianSummaryRuntimeConfig:
-    """Runtime config installed by the orchestrator at startup. Fields
-    come from prime-rl's `orchestrator.markovian_thinker.summary` section."""
-
-    enabled: bool
-    mode: str  # "markovian" | "eviction"
-    compaction_max_turns: int
-    max_len_summary: int
-    instruction_text: str
-    resume_text: str
-    temperature: float
-    top_p: float
-    on_error: str  # "drop" | "raise"
-    log_summaries: bool
-
-
-# `_summary_config` is forward-declared above the
-# `_install_message_padding_interceptor()` call, same as `_markovian_config`.
-
-
-def configure_markovian_summary(
-    *,
-    enabled: bool,
-    mode: str,
-    compaction_max_turns: int,
-    max_len_summary: int,
-    instruction_text: str,
-    resume_text: str = "",
-    temperature: float = 0.3,
-    top_p: float = 0.95,
-    on_error: str = "drop",
-    log_summaries: bool = False,
-) -> None:
-    """Install the orchestrator-wide Markovian Summary config.
-
-    Called once by prime-rl's orchestrator at startup, before any
-    rollouts fire. Idempotent — repeated calls overwrite the previous
-    config.
-
-    Validated upstream by `validate_markovian_summary` in
-    prime-rl's `rl.py`. Does minimal sanity checking here.
-    """
-    if mode not in ("markovian", "eviction"):
-        raise ValueError(
-            f"configure_markovian_summary: invalid mode={mode!r}; "
-            "expected 'markovian' or 'eviction'"
-        )
-    if on_error not in ("drop", "raise"):
-        raise ValueError(
-            f"configure_markovian_summary: invalid on_error={on_error!r}; "
-            "expected 'drop' or 'raise'"
-        )
-
-    global _summary_config
-    _summary_config = MarkovianSummaryRuntimeConfig(
-        enabled=enabled,
-        mode=mode,
-        compaction_max_turns=compaction_max_turns,
-        max_len_summary=max_len_summary,
-        instruction_text=instruction_text,
-        resume_text=resume_text,
-        temperature=temperature,
-        top_p=top_p,
-        on_error=on_error,
-        log_summaries=log_summaries,
-    )
-    if enabled:
-        logger.info(
-            "kv_eviction: Markovian Summary ENABLED "
-            "(mode=%s, compaction_max_turns=%d, max_len_summary=%d, on_error=%s)",
-            mode,
-            compaction_max_turns,
-            max_len_summary,
-            on_error,
-        )
-
-
-def _autoconfigure_markovian_summary_from_env() -> None:
-    """Auto-enable Markovian Summary from environment variables.
-
-    The orchestrator sets these before spawning the verifiers env server
-    subprocess (mp.spawn starts a fresh interpreter that won't inherit
-    the parent's `configure_markovian_summary(...)` call). The subprocess
-    imports `kv_eviction` via its entrypoint shim, which triggers this
-    function.
-
-    Env var contract (scalars):
-      KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED              — "1" enables.
-      KV_EVICTION_MARKOVIAN_SUMMARY_MODE                 — "markovian" or "eviction"
-      KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS — int
-      KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY      — int
-      KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE          — float
-      KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P                — float
-      KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR             — "drop" | "raise"
-      KV_EVICTION_MARKOVIAN_SUMMARY_LOG                  — "1" enables debug
-
-    Long strings (instruction_text, resume_text) via JSON env var:
-      KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON
-          — {"instruction_text": "...", "resume_text": "..."}
-
-    No-ops if already configured or env vars are absent.
-    """
-    import json as _json
-    import os as _os
-
-    global _summary_config
-    if _summary_config is not None and _summary_config.enabled:
-        return
-    if _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED") != "1":
-        return
-
-    try:
-        mode = _os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MODE"]
-        compaction_max_turns = int(
-            _os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS"]
-        )
-        max_len_summary = int(
-            _os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY"]
-        )
-    except (KeyError, ValueError) as e:
-        logger.warning(
-            "kv_eviction: KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED=1 but "
-            "required scalar env vars missing/invalid (%s); Markovian "
-            "Summary NOT enabled in this process",
-            e,
-        )
-        return
-
-    temperature = float(
-        _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE", "0.3")
-    )
-    top_p = float(_os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P", "0.95"))
-    on_error = _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR", "drop")
-    log_summaries = (
-        _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_LOG", "0") == "1"
-    )
-
-    strings_json = _os.environ.get("KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON")
-    instruction_text = ""
-    resume_text = ""
-    if strings_json:
-        try:
-            parsed = _json.loads(strings_json)
-            instruction_text = str(parsed.get("instruction_text", ""))
-            resume_text = str(parsed.get("resume_text", ""))
-        except (ValueError, TypeError) as e:
-            logger.warning(
-                "kv_eviction: KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON "
-                "invalid (%s); using empty instruction_text/resume_text",
-                e,
-            )
-    if not instruction_text:
-        logger.warning(
-            "kv_eviction: Markovian Summary enabled via env vars but "
-            "instruction_text is empty; summaries will use an empty "
-            "prompt and count_summary_exchanges will disable itself"
-        )
-
-    configure_markovian_summary(
-        enabled=True,
-        mode=mode,
-        compaction_max_turns=compaction_max_turns,
-        max_len_summary=max_len_summary,
-        instruction_text=instruction_text,
-        resume_text=resume_text,
-        temperature=temperature,
-        top_p=top_p,
-        on_error=on_error,
-        log_summaries=log_summaries,
-    )
-
-
-_autoconfigure_markovian_summary_from_env()
 
 
 def padded_ids_from_step_extras(

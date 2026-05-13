@@ -1,0 +1,31 @@
+seed = 0
+
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = false
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false
+attention_backend = "FLEX_ATTENTION"
+attention_matching_protect_user_prompts = "first_user"
+noise_control_chunk_size = 512
+noise_control_probability = 1.00
+noise_control_std = 0.01
+noise_control_seed = 0
+noise_control_target = "keys"
+noise_control_region = "old_context_only"
+noise_control_keep_recent_tokens = 4096
+noise_control_protect_synthetic = true
+gpu_memory_utilization = 0.4

@@ -1,0 +1,77 @@
+project_name: craftax-classic-ppo-deviation
+output_dir: artifacts/continual_swimmer_jax/craftax_classic_ppo_deviation
+
+algorithm:
+  name: ppo
+  uses_deviation_correction: true
+
+benchmark:
+  name: craftax_classic_jax
+  total_steps: 100000000
+  seeds: [0, 1, 2, 3, 4]
+  checkpoint_interval: 250000
+  evaluation_interval: 500000
+  env_kwargs:
+    use_classic: true
+    auto_reset: false
+    map_size: 64
+
+ppo:
+  num_envs: 8192
+  rollout_length: 64
+  num_minibatches: 64
+  update_epochs: 2
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  max_grad_norm: 0.5
+
+correction:
+  enabled: true
+  penalty_weight: 0.25
+  margin: 0.0
+  max_lookback: 8
+  include_best_so_far: true
+  predicted_future_steps: 1
+  positive_regret_power: 1.0
+  kl_floor: 0.00000001
+
+representation:
+  metrics:
+    - linear_cka
+    - cosine_drift
+    - ridge_probe_r2
+  probe_targets:
+    - health
+    - inventory_mass
+    - action_margin
+    - return_to_go
+  compare_windows:
+    - early
+    - peak
+    - post_collapse
+  ridge_alpha: 0.0001
+
+variation_budget:
+  enabled: true
+  anchor_observation_count: 4096
+  reduction: max
+  include_policy_budget: true
+  include_reward_budget: true
+  include_kernel_budget: false
+  policy_metric: categorical_tv
+  accumulate: true
+
+runtime:
+  platform: gpu
+  require_gpu: true
+  dtype: bfloat16
+  enable_x64: false
+  xla_flags:
+    - --xla_gpu_triton_gemm_any=true
+  preallocate: false
+  jax_debug_nans: false

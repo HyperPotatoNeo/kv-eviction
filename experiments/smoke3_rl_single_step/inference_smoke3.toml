@@ -21,7 +21,7 @@ port = 8000
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 max_model_len = 16384
-enforce_eager = true
+enforce_eager = false
 
 [parallel]
 dp = 4

@@ -1,0 +1,77 @@
+project_name: continual-world-ac-pqn-deviation
+output_dir: artifacts/continual_swimmer_jax/continual_world_ac_pqn_deviation
+
+algorithm:
+  name: ac_pqn
+  uses_deviation_correction: true
+
+benchmark:
+  name: continual_world
+  total_steps: 30000000
+  seeds: [0, 1, 2, 3, 4]
+  checkpoint_interval: 250000
+  evaluation_interval: 500000
+  env_kwargs:
+    task_suite: cw10
+    cycle_tasks: true
+    task_change_interval: 1000000
+
+ac_pqn:
+  num_envs: 2048
+  rollout_length: 32
+  batch_size: 1024
+  gamma: 0.99
+  q_lambda: 0.95
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  tau: 0.005
+  actor_update_interval: 2
+  action_noise_std: 0.1
+  max_grad_norm: 0.5
+  normalization: layernorm
+
+correction:
+  enabled: true
+  penalty_weight: 0.5
+  margin: 0.0
+  max_lookback: 5
+  include_best_so_far: true
+  predicted_future_steps: 1
+  positive_regret_power: 1.0
+  kl_floor: 0.00000001
+
+representation:
+  metrics:
+    - linear_cka
+    - cosine_drift
+    - ridge_probe_r2
+  probe_targets:
+    - goal_distance
+    - end_effector_position
+    - action_norm
+    - return_to_go
+  compare_windows:
+    - early
+    - peak
+    - post_collapse
+  ridge_alpha: 0.0001
+
+variation_budget:
+  enabled: true
+  anchor_observation_count: 4096
+  reduction: max
+  include_policy_budget: true
+  include_reward_budget: true
+  include_kernel_budget: false
+  policy_metric: action_l2
+  accumulate: true
+
+runtime:
+  platform: gpu
+  require_gpu: true
+  dtype: bfloat16
+  enable_x64: false
+  xla_flags:
+    - --xla_gpu_triton_gemm_any=true
+  preallocate: false
+  jax_debug_nans: false
