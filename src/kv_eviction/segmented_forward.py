@@ -63,9 +63,18 @@ import logging
 from typing import Callable
 
 import torch
+import torch._functorch.config  # noqa: F401  load submodule so the assignment below resolves
 import torch.utils.checkpoint
 from torch import Tensor
 from transformers import DynamicCache
+
+# FSDP2's AOT autograd donates intermediate buffers between forward and
+# backward, which forbids retain_graph=True. The legacy segmented_forward
+# loss_fn=None mode runs one backward across all retained-KV segments
+# and needs retain_graph; keep donated buffers off so that path stays
+# working. The per-call persistent-cache path doesn't need this (the
+# cache is detached between calls) but the setting is harmless there.
+torch._functorch.config.donated_buffer = False  # type: ignore[attr-defined]
 
 logger = logging.getLogger(__name__)
 
@@ -880,3 +889,368 @@ def _pad_with_dummy_passes(
             d_logits = d_logits["logits"]
         dummy_sum = dummy_sum + d_logits.float().mean()
     return logits + (dummy_sum * 0).to(logits.dtype)
+
+
+# ─── Per-call segmented forward ───────────────────────────────────────
+#
+# Mirrors vLLM's per-call independence: each chat() call in a rollout is
+# treated as an atomic forward unit. We maintain a persistent
+# `DynamicCache` across calls within a sample, detaching it between
+# calls so the per-segment backward (M3 / bptt_segments=1) memory bound
+# is preserved.
+#
+# Each call's forward processes ONLY the new tokens this call
+# contributes to the merged frame, reading prior K/V from the persistent
+# cache — structurally identical to vLLM's prefix-cache + single
+# kernel-forward-per-call admission path.
+#
+# Admission events affect position_ids only: tokens in the kept portion
+# of an admission call rotate at their pre-eviction logical positions
+# (matching what vLLM's K writes were rotated at), and we accumulate
+# total_evicted as a running `cum_position_offset` for subsequent
+# tokens. No explicit cache splice is needed — the evicted tokens are
+# absent from merged_input_ids (the orchestrator's _apply_admission_trim
+# already removed them) and the causal mask + RoPE relative positions
+# handle the rest.
+
+
+def _call_has_admission(call) -> bool:
+    """A CallWire has admission iff any of its compaction_events has
+    num_output_tokens_at_compaction == 0."""
+    events = getattr(call, "compaction_events", None) or []
+    for e in events:
+        if int(getattr(e, "num_output_tokens_at_compaction", 0)) == 0:
+            return True
+    return False
+
+
+def compute_num_per_call_forwards(calls) -> int:
+    """How many forward passes per_call_segmented_forward will run for
+    this list of calls. Used to all-reduce-MAX across DP ranks so FSDP2
+    all-gathers stay synchronized.
+
+    One forward per call regardless of admission status — admission is
+    handled inline via eviction-aware position_ids on a single forward
+    over the post-trim sequence.
+    """
+    if not calls:
+        return 1
+    return max(len(calls), 1)
+
+
+def _aggregate_admission_descriptor(call) -> dict:
+    """Reduce a CallWire's admission events to one (evict_start, evict_end,
+    total_evicted, new_user_fragment_len) descriptor.
+
+    vLLM may emit multiple admission events per call (one per iteration of
+    its eviction loop). We collapse them into one descriptor used to
+    construct eviction-aware position_ids for the trainer's single
+    forward over the post-trim sequence:
+
+      - evict_start: the FIRST event's evict_start (in turn-mode admission,
+        all iterations evict from a contiguous range starting at the same
+        position = end of protected prefix).
+      - total_evicted: sum of all admission events' tokens_evicted.
+      - new_user_fragment_len: from the LAST admission event (constant
+        across iterations).
+
+    Asserts evict_start >= 1 so the protected prefix is non-empty.
+    """
+    admission_events = [
+        e for e in (call.compaction_events or [])
+        if int(getattr(e, "num_output_tokens_at_compaction", 0)) == 0
+    ]
+    if not admission_events:
+        raise ValueError(
+            "_aggregate_admission_descriptor called on a call without "
+            "admission events"
+        )
+    evict_start = int(admission_events[0].evict_start)
+    total_evicted = sum(int(e.tokens_evicted) for e in admission_events)
+    nuf_len = int(admission_events[-1].new_user_fragment_len)
+    if evict_start < 1:
+        raise NotImplementedError(
+            f"Per-call admission requires evict_start >= 1 (protected "
+            f"prefix must include at least position 0). Got "
+            f"evict_start={evict_start}. Configure "
+            "protected_prefix_tokens > 0 on the inference engine."
+        )
+    if nuf_len <= 0:
+        raise ValueError(
+            f"new_user_fragment_len must be > 0 for admission events "
+            f"(got {nuf_len}); the vLLM HTTP wire dropped it."
+        )
+    return {
+        "evict_start": evict_start,
+        "evict_end": evict_start + total_evicted,
+        "total_evicted": total_evicted,
+        "new_user_fragment_len": nuf_len,
+    }
+
+
+def _detach_dynamic_cache(cache: DynamicCache) -> DynamicCache:
+    """Return a fresh DynamicCache whose K/V tensors are detached from
+    the autograd graph. Called between per-call forwards in
+    `per_call_segmented_forward` so each call's backward stops at the
+    cache boundary, preserving bptt_segments=1 / M3 semantics."""
+    detached = DynamicCache()
+    n_layers = len(cache)
+    for layer_idx in range(n_layers):
+        if hasattr(cache, "layers"):
+            k = cache.layers[layer_idx].keys
+            v = cache.layers[layer_idx].values
+        else:
+            k = cache.key_cache[layer_idx]
+            v = cache.value_cache[layer_idx]
+        detached.update(k.detach(), v.detach(), layer_idx)
+    return detached
+
+
+def _splice_dynamic_cache(
+    cache: DynamicCache,
+    evict_start: int,
+    evict_end: int,
+) -> DynamicCache:
+    """Drop K/V slices [evict_start, evict_end) from every layer of a
+    DynamicCache. Mirrors compaction_debug.py / diagnostic_kl_dummy.py's
+    H2 oracle splice (lines 254-271).
+
+    Per-layer K/V shape is [1, n_heads, seq, head_dim]. We slice along
+    dim=2. Returns a fresh DynamicCache with the spliced K/V uploaded.
+    """
+    spliced = DynamicCache()
+    n_layers = len(cache)
+    for layer_idx in range(n_layers):
+        if hasattr(cache, "layers"):
+            k = cache.layers[layer_idx].keys
+            v = cache.layers[layer_idx].values
+        else:
+            k = cache.key_cache[layer_idx]
+            v = cache.value_cache[layer_idx]
+        # [1, n_heads, seq, head_dim]; drop along dim=2.
+        new_k = torch.cat(
+            [k[:, :, :evict_start, :], k[:, :, evict_end:, :]], dim=2,
+        ).contiguous()
+        new_v = torch.cat(
+            [v[:, :, :evict_start, :], v[:, :, evict_end:, :]], dim=2,
+        ).contiguous()
+        spliced.update(new_k, new_v, layer_idx)
+    return spliced
+
+
+def per_call_segmented_forward(
+    model: torch.nn.Module,
+    calls: list,  # list[CallWire]
+    merged_input_ids: Tensor,  # [1, full_seq_len], the merged sample
+    merged_position_ids: Tensor,  # [1, full_seq_len] (used only for dummy passes)
+    loss_fn: SegmentLossFn,
+    *,
+    max_forward_passes: int,
+    device: torch.device,
+) -> dict:
+    """Persistent-cache per-call forward — single HF forward per call.
+
+    Mirrors vLLM's prefix-cache + single-kernel-forward-per-admission
+    pattern (see plans/single_forward_pre_eviction.md, Phase 5).
+
+    Each call processes ONLY the new tokens it contributes to the merged
+    frame against a `DynamicCache` carried across calls. The cache is
+    detached between calls so per-segment backward (M3 / bptt_segments=1)
+    memory semantics are preserved.
+
+    Position-ids handling:
+      - Tokens before any admission event use post-trim positions
+        (= their merged_index).
+      - After an admission event with total_evicted=E, all subsequent
+        tokens' positions are bumped by E. This mirrors vLLM's
+        `position_offset` and ensures Q/K RoPE rotations match exactly
+        what inference produced.
+      - The evicted tokens are NOT present in `merged_input_ids` (the
+        orchestrator's _apply_admission_trim already removed them).
+        Causal mask + RoPE relative positions over the kept tokens
+        reproduce the post-eviction K/V state without any explicit
+        cache splice.
+
+    Args:
+        model: HF transformer (FSDP2-wrapped in production).
+        calls: list of CallWire, in rollout order.
+        merged_input_ids: [1, L] merged sample's token ids (post-trim).
+        merged_position_ids: [1, L] passed through for dummy passes
+            only; per-call position_ids are constructed from cum_offset
+            + accumulated eviction offset.
+        loss_fn: per-call loss callback (one invocation per call).
+        max_forward_passes: padding target for FSDP2 sync; dummy
+            forwards fill the gap on ranks with fewer calls.
+        device: torch device for the loss accumulator.
+    """
+    if not calls:
+        raise ValueError("per_call_segmented_forward requires non-empty calls list")
+
+    full_seq_len = int(merged_input_ids.shape[1])
+    cum_offset = 0  # running merged-frame index = start of current call's contribution
+    cum_position_offset = 0  # accumulated total_evicted across prior admission events
+    n_forwards_run = 0
+    accumulated_loss = 0.0
+    persistent_cache: DynamicCache = DynamicCache()
+
+    for call_idx, call in enumerate(calls):
+        # Compute this call's contribution to the merged frame and the
+        # per-token position_ids that match what vLLM rotated at.
+        if _call_has_admission(call):
+            desc = _aggregate_admission_descriptor(call)
+            sub_len = len(call.submitted_prompt_ids)
+            comp_len = len(call.completion_ids)
+            nuf_len = desc["new_user_fragment_len"]
+            total_evicted = desc["total_evicted"]
+            evict_start = desc["evict_start"]
+            evict_end = desc["evict_end"]
+            phase1_token_count = sub_len - nuf_len
+            if phase1_token_count <= 0:
+                raise ValueError(
+                    f"Invalid call: phase1_token_count={phase1_token_count} "
+                    f"(sub_len={sub_len}, new_user_fragment_len={nuf_len})"
+                )
+            if evict_end > phase1_token_count:
+                raise ValueError(
+                    f"Invalid call: evict_end={evict_end} > phase1_token_count="
+                    f"{phase1_token_count}. The evicted range must lie within "
+                    "the kept prompt (before the new_user_fragment)."
+                )
+            # Kept prompt tokens split into three contiguous merged-frame
+            # ranges with two logical-position regimes:
+            #   [0, evict_start)              → logical [0, evict_start)
+            #   [evict_start, L1_kept)        → logical [evict_end, phase1_token_count)
+            #   [L1_kept, L1_kept + P2)       → logical [phase1, phase1 + P2)
+            # vLLM's K-write side rotates new tokens at logical positions
+            # = physical + position_offset where position_offset is the
+            # accumulated total_evicted. Mirror that here:
+            #   protected_positions = arange(evict_start) + base_offset
+            #   kept_middle_positions = arange(kept_middle_len) + evict_end + base_offset
+            #   post_positions = arange(P2) + phase1_token_count + base_offset
+            # where base_offset = cum_offset + cum_position_offset shifts
+            # everything into the merged sample's running absolute frame.
+            kept_middle_len = phase1_token_count - evict_end
+            L1_kept = evict_start + kept_middle_len  # = phase1_token_count - total_evicted
+            P2 = nuf_len + comp_len
+            call_merged_len = L1_kept + P2
+            base_offset = cum_offset + cum_position_offset
+            protected_positions = (
+                torch.arange(evict_start, device=device, dtype=torch.long)
+                + base_offset
+            )
+            kept_middle_positions = (
+                torch.arange(kept_middle_len, device=device, dtype=torch.long)
+                + evict_end + base_offset
+            )
+            post_positions = (
+                torch.arange(P2, device=device, dtype=torch.long)
+                + phase1_token_count + base_offset
+            )
+            import os as _os
+            if _os.environ.get("KVE_DISABLE_EVICTION_AWARE_POSITIONS", "0") == "1":
+                # Fallback: plain arange (does NOT match vLLM's RoPE frame).
+                call_position_ids = (
+                    torch.arange(call_merged_len, device=device, dtype=torch.long)
+                    + cum_offset + cum_position_offset
+                ).unsqueeze(0)
+            else:
+                call_position_ids = torch.cat(
+                    [protected_positions, kept_middle_positions, post_positions]
+                ).unsqueeze(0)
+            new_position_offset = cum_position_offset + total_evicted
+            if _os.environ.get("KVE_DEBUG_PERCALL", "0") == "1":
+                logger.warning(
+                    "[PERCALL-DEBUG] admission call %d: sub_len=%d nuf=%d "
+                    "evict=[%d,%d) phase1=%d L1_kept=%d P2=%d "
+                    "cum_offset=%d cum_pos_off=%d positions[:5]=%s positions[-8:]=%s",
+                    call_idx, sub_len, nuf_len, evict_start, evict_end,
+                    phase1_token_count, L1_kept, P2,
+                    cum_offset, cum_position_offset,
+                    call_position_ids[0, :5].tolist(),
+                    call_position_ids[0, -8:].tolist(),
+                )
+        else:
+            # Extension call: submitted_prompt_ids is a strict prefix of the
+            # merged frame, completion_ids extends it. call_input_len equals
+            # the merged-frame end of this call's contribution.
+            call_input_len = len(call.submitted_prompt_ids) + len(call.completion_ids)
+            call_end_merged = call_input_len
+            call_merged_len = call_end_merged - cum_offset
+            if call_merged_len < 0:
+                raise ValueError(
+                    f"per_call_segmented_forward: call {call_idx} end "
+                    f"({call_end_merged}) < previous end ({cum_offset})."
+                )
+            if call_merged_len == 0:
+                continue
+            call_position_ids = (
+                torch.arange(call_merged_len, device=device, dtype=torch.long)
+                + cum_offset + cum_position_offset
+            ).unsqueeze(0)
+            new_position_offset = cum_position_offset
+
+        owned_end = min(cum_offset + call_merged_len, full_seq_len)
+        actual_new_len = owned_end - cum_offset
+        if actual_new_len <= 0:
+            continue
+        if actual_new_len < call_merged_len:
+            # Truncation chopped off the tail of this call.
+            call_position_ids = call_position_ids[:, :actual_new_len]
+
+        new_tokens = merged_input_ids[:, cum_offset:owned_end]
+        import os as _os
+        if _os.environ.get("KVE_DEBUG_PERCALL", "0") == "1" and _call_has_admission(call):
+            logger.warning(
+                "[PERCALL-DEBUG] forward call %d: shape=%s tokens[60:76]=%s positions[60:76]=%s",
+                call_idx,
+                tuple(new_tokens.shape),
+                new_tokens[0, 60:76].tolist() if new_tokens.shape[1] >= 76 else new_tokens[0].tolist(),
+                call_position_ids[0, 60:76].tolist() if call_position_ids.shape[1] >= 76 else call_position_ids[0].tolist(),
+            )
+        # Avoid passing an empty cache on the first call; some HF code
+        # paths behave differently with vs without past_key_values.
+        is_cache_empty = (
+            not hasattr(persistent_cache, "layers")
+            or not persistent_cache.layers
+            or persistent_cache.layers[0].keys.shape[2] == 0
+        ) if call_idx == 0 else False
+        out = model(
+            input_ids=new_tokens,
+            position_ids=call_position_ids,
+            past_key_values=None if is_cache_empty else persistent_cache,
+            use_cache=True,
+        )
+        # If we passed None, the model returned a fresh cache in `out`;
+        # capture it as our persistent_cache for the next iteration.
+        if is_cache_empty:
+            out_cache = out.get("past_key_values") if isinstance(out, dict) else getattr(out, "past_key_values", None)
+            if out_cache is not None:
+                persistent_cache = out_cache
+        logits = out["logits"] if isinstance(out, dict) else out.logits
+        if isinstance(logits, dict):
+            logits = logits["logits"]
+
+        loss_val = loss_fn(logits, cum_offset, owned_end)
+        loss_val.backward()
+        accumulated_loss += float(loss_val.detach().item())
+
+        cum_offset = owned_end
+        cum_position_offset = new_position_offset
+        n_forwards_run += 1
+        # Detach the cache so the next call's backward stops at this
+        # call's boundary (matches bptt_segments=1 / M3 semantics).
+        persistent_cache = _detach_dynamic_cache(persistent_cache)
+
+    n_dummy = max(0, max_forward_passes - n_forwards_run)
+    if n_dummy > 0:
+        _run_dummy_passes_with_backward(
+            model,
+            merged_input_ids,
+            merged_position_ids,
+            num_dummy=n_dummy,
+        )
+
+    return {
+        "loss": torch.tensor(accumulated_loss, device=device),
+        "n_segments": n_forwards_run,
+    }
