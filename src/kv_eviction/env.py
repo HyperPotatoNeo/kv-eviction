@@ -36,6 +36,7 @@ from kv_eviction.summarization import (
     count_summary_exchanges,
     extract_completion_logprobs,
     extract_completion_token_ids,
+    extract_completion_token_ids as _extract_completion_token_ids_for_phase4,
     extract_prompt_token_ids as _summary_extract_prompt_token_ids,
     partition_messages,
     sanitize_summary,
@@ -93,6 +94,21 @@ def _extract_compaction_event_dicts(
                         "position_offset_after": int(e["position_offset_after"]),
                         "num_prompt_tokens": int(e.get("num_prompt_tokens", 0)),
                         "evict_start": int(e.get("evict_start", 0)),
+                        "new_user_fragment_len": int(
+                            e.get("new_user_fragment_len", 0)
+                        ),
+                        "kept_indices": [
+                            int(x) for x in (e.get("kept_indices") or [])
+                        ],
+                        "kept_token_ids": [
+                            int(x) for x in (e.get("kept_token_ids") or [])
+                        ],
+                        "last_turn_evicted": int(
+                            e.get("last_turn_evicted", -1)
+                        ),
+                        "num_turns_evicted_after": int(
+                            e.get("num_turns_evicted_after", 0)
+                        ),
                     }
                 )
             except (KeyError, TypeError, ValueError):
@@ -106,6 +122,13 @@ def _extract_compaction_event_dicts(
                     "position_offset_after": e.position_offset_after,
                     "num_prompt_tokens": e.num_prompt_tokens,
                     "evict_start": e.evict_start,
+                    "new_user_fragment_len": getattr(e, "new_user_fragment_len", 0),
+                    "kept_indices": list(getattr(e, "kept_indices", []) or []),
+                    "kept_token_ids": list(getattr(e, "kept_token_ids", []) or []),
+                    "last_turn_evicted": getattr(e, "last_turn_evicted", -1),
+                    "num_turns_evicted_after": getattr(
+                        e, "num_turns_evicted_after", 0
+                    ),
                 }
             )
         else:
@@ -126,6 +149,21 @@ def _extract_compaction_event_dicts(
                             getattr(e, "num_prompt_tokens", 0)
                         ),
                         "evict_start": int(getattr(e, "evict_start", 0)),
+                        "new_user_fragment_len": int(
+                            getattr(e, "new_user_fragment_len", 0)
+                        ),
+                        "kept_indices": [
+                            int(x) for x in (getattr(e, "kept_indices", []) or [])
+                        ],
+                        "kept_token_ids": [
+                            int(x) for x in (getattr(e, "kept_token_ids", []) or [])
+                        ],
+                        "last_turn_evicted": int(
+                            getattr(e, "last_turn_evicted", -1)
+                        ),
+                        "num_turns_evicted_after": int(
+                            getattr(e, "num_turns_evicted_after", 0)
+                        ),
                     }
                 )
             except (AttributeError, TypeError, ValueError):
@@ -197,6 +235,46 @@ def attach_prompt_token_ids_from_response(
     step["extras"]["prompt_token_ids"] = ids
 
 
+def _extract_padding_token_ids(response: ModelResponse) -> list[int] | None:
+    """Pull `padding_token_ids` off a response object.
+
+    vLLM's auto-pad-on-finish surfaces these on ChatCompletionResponse
+    (see vllm/entrypoints/openai/chat_completion/protocol.py). When
+    auto-pad fires for a request, these are the filler tokens vLLM
+    appended to the KV cache after the final completion token so the
+    trailing block lands in the prefix cache. Empty/None when auto-pad
+    is disabled or did not fire."""
+    if response is None:
+        return None
+    ids = getattr(response, "padding_token_ids", None)
+    if ids is None and hasattr(response, "model_extra"):
+        extras = response.model_extra or {}
+        ids = extras.get("padding_token_ids")
+    if not ids:
+        return None
+    try:
+        return [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return None
+
+
+def attach_padding_token_ids_from_response(
+    step: TrajectoryStep,
+    response: ModelResponse,
+) -> None:
+    """Mutate the given TrajectoryStep's extras to include vLLM's auto-pad
+    `padding_token_ids` for this turn.
+
+    Idempotent. No-op when the response has no padding_token_ids
+    (auto-pad disabled or this turn didn't trigger it)."""
+    ids = _extract_padding_token_ids(response)
+    if ids is None:
+        return
+    if step.get("extras") is None:
+        step["extras"] = {}
+    step["extras"]["padding_token_ids"] = ids
+
+
 class CompactionEnvMixin:
     """Cooperative mixin: pulls compaction_events off each vllm response and
     attaches them to the trajectory step's extras dict.
@@ -223,6 +301,7 @@ class CompactionEnvMixin:
             return
         # The base class just appended a step. Attach compaction metadata to it.
         attach_compaction_events_from_response(trajectory[-1], response)
+        attach_padding_token_ids_from_response(trajectory[-1], response)
         attach_summary_trainsample_from_response(trajectory[-1], response)
 
 
@@ -365,6 +444,17 @@ def _install_compaction_event_hooks() -> None:
                 raw_summary = extra.get("summary_trainsample")
             _forward_extra(verifiers_response, "summary_trainsample", raw_summary)
 
+            # Auto-pad extension: vLLM emits `padding_token_ids` on the
+            # native ChatCompletionResponse whenever the auto-pad-on-
+            # finish path appended filler tokens to land the trailing
+            # block in the prefix cache. Forward to the verifiers
+            # Response so Patch #2 can attach to the step's extras.
+            raw_pad = getattr(response, "padding_token_ids", None)
+            if raw_pad is None and hasattr(response, "model_extra"):
+                extra = response.model_extra or {}
+                raw_pad = extra.get("padding_token_ids")
+            _forward_extra(verifiers_response, "padding_token_ids", raw_pad)
+
             return verifiers_response
 
         patched_from_native.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
@@ -386,6 +476,7 @@ def _install_compaction_event_hooks() -> None:
             if trajectory:
                 attach_compaction_events_from_response(trajectory[-1], response)
                 attach_prompt_token_ids_from_response(trajectory[-1], response)
+                attach_padding_token_ids_from_response(trajectory[-1], response)
                 attach_summary_trainsample_from_response(trajectory[-1], response)
 
         patched_add_model_response.__kv_eviction_patched__ = True  # type: ignore[attr-defined]
@@ -433,6 +524,13 @@ class MessagePaddingConfig:
     block_size: int
     filler_token_id: int
     im_end_token_id: int
+    # Phase4 incremental prompt assembly. When True, after the first call
+    # in a rollout (asyncio task), subsequent calls submit only
+    # `prev_kept_state + new_user_fragment + fillers` instead of the
+    # re-rendered full chat history. Requires the vLLM server to run with
+    # `enable_prefix_caching=True` to actually realize the cache hit on
+    # the prev_kept portion. Mirrors compaction_debug.py's PHASE4 path.
+    phase4_enabled: bool = False
 
 
 _padding_config: MessagePaddingConfig | None = None
@@ -677,6 +775,7 @@ def configure_message_padding(
     block_size: int,
     filler_token_id: int,
     im_end_token_id: int,
+    phase4_enabled: bool = False,
 ) -> None:
     """Install the orchestrator-wide message-padding config.
 
@@ -697,14 +796,17 @@ def configure_message_padding(
         block_size=block_size,
         filler_token_id=filler_token_id,
         im_end_token_id=im_end_token_id,
+        phase4_enabled=phase4_enabled,
     )
     if enabled:
         logger.info(
             "kv_eviction: block-aligned message padding ENABLED "
-            "(block_size=%d, filler_token_id=%d, im_end_token_id=%d)",
+            "(block_size=%d, filler_token_id=%d, im_end_token_id=%d, "
+            "phase4_enabled=%s)",
             block_size,
             filler_token_id,
             im_end_token_id,
+            phase4_enabled,
         )
 
 
@@ -726,6 +828,183 @@ def _stash_prompt_token_ids(response: Any, ids: list[int]) -> None:
             if response.model_extra is None:
                 response.__pydantic_extra__ = {}
             response.model_extra["prompt_token_ids"] = ids
+
+
+# ─── Phase4 incremental prompt assembly ───
+#
+# Mirrors `experiments/textworld_env/compaction_debug.py`'s chat_phase4 +
+# derive_next_prev_state helpers (lines 281-368). For multi-turn rollouts
+# with vLLM prefix caching enabled, each turn submits
+#
+#     prev_kept_state + [<|im_start|>user\n{obs}<|im_end|>\n<|im_start|>assistant\n]
+#     + block-aligning fillers
+#
+# instead of re-rendering the full chat history every turn. `prev_kept_state`
+# is the vLLM-authoritative survivors after the previous turn's eviction
+# (or the previous turn's full submitted ids when no compaction fired),
+# plus the previous turn's asst output + inter-message separator + filler.
+#
+# Per-rollout state is stashed on the asyncio task object — when the
+# rollout coroutine finishes, the state is GC'd automatically. No
+# cross-rollout contamination: each rollout runs in its own task.
+
+
+def _get_phase4_state() -> dict | None:
+    """Return the Phase4 state dict for the current async task, or None."""
+    import asyncio
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return None
+    if task is None:
+        return None
+    return getattr(task, "_kv_eviction_phase4_state", None)
+
+
+def _set_phase4_prev_state(prev_state_tokens: list[int]) -> None:
+    """Stash the post-call KV state token sequence on the current async
+    task so the NEXT chat() call in this rollout can build its prompt
+    incrementally. No-op if not in an async task."""
+    import asyncio
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return
+    if task is None:
+        return
+    state = getattr(task, "_kv_eviction_phase4_state", None)
+    if state is None:
+        state = {}
+        try:
+            setattr(task, "_kv_eviction_phase4_state", state)
+        except (AttributeError, TypeError):
+            return
+    state["prev_state_tokens"] = list(prev_state_tokens)
+
+
+def _pad_tokens_after_im_end(
+    tokens: list[int],
+    start_offset: int,
+    im_end_id: int,
+    block_size: int,
+    filler_id: int,
+) -> tuple[list[int], int]:
+    """Append tokens onto start_offset, inserting block-aligning fillers
+    after each <|im_end|>. Mirrors compaction_debug.py:_pad_after_im_end."""
+    out: list[int] = []
+    running = start_offset
+    total_pad = 0
+    for tok in tokens:
+        out.append(tok)
+        running += 1
+        if tok == im_end_id:
+            remainder = running % block_size
+            n = (block_size - remainder) % block_size
+            if n:
+                out.extend([filler_id] * n)
+                running += n
+                total_pad += n
+    return out, total_pad
+
+
+def _build_phase4_incremental_prompt(
+    messages: list[dict],
+    cfg: MessagePaddingConfig,
+) -> list[int] | None:
+    """Build the Phase4 incremental prompt: prev_state + padded new_user_fragment.
+
+    Returns None when no prior state exists yet (first call), the last
+    message isn't a plain-string user message, or any other condition
+    that should fall back to full-history rendering.
+    """
+    state = _get_phase4_state()
+    if state is None:
+        return None
+    prev_state = state.get("prev_state_tokens")
+    if not prev_state:
+        return None
+
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    content = messages[-1].get("content")
+    if not isinstance(content, str):
+        # Multimodal / tool-result content — fall back.
+        return None
+
+    # _NEW_USER_FRAGMENT template from compaction_debug.py:255. Renders
+    # exactly the suffix Qwen3's chat template would have appended for
+    # one new user message + asst generation prompt.
+    fragment_text = (
+        f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+    )
+    fragment_ids = cfg.tokenizer.encode(
+        fragment_text, add_special_tokens=False
+    )
+    padded_fragment, _ = _pad_tokens_after_im_end(
+        fragment_ids,
+        len(prev_state),
+        cfg.im_end_token_id,
+        cfg.block_size,
+        cfg.filler_token_id,
+    )
+    return list(prev_state) + padded_fragment
+
+
+def _extract_kept_token_ids_last_event(response: Any) -> list[int] | None:
+    """Read kept_token_ids off the LAST compaction event in the response.
+    Returns None when no events fired or the field is empty / missing."""
+    raw = getattr(response, "compaction_events", None)
+    if raw is None and hasattr(response, "model_extra"):
+        raw = (response.model_extra or {}).get("compaction_events")
+    if not raw:
+        return None
+    last = raw[-1]
+    if isinstance(last, dict):
+        kept = last.get("kept_token_ids")
+    else:
+        kept = getattr(last, "kept_token_ids", None)
+    if not kept:
+        return None
+    try:
+        return [int(x) for x in kept]
+    except (TypeError, ValueError):
+        return None
+
+
+def _update_phase4_state_from_response(
+    response: Any,
+    submitted_ids: list[int],
+    cfg: MessagePaddingConfig,
+) -> None:
+    """Compute prev_state for the NEXT call in this rollout, mirroring
+    V's auto-pad layout (just filler, no separator) so the orchestrator's
+    incremental prompt matches V's actual cache content row-for-row.
+
+    prev_state = kept_token_ids (if compaction fired, last event) OR
+    full submitted prompt (otherwise) + asst output tokens + filler to
+    block-align the next <|im_start|>user.
+
+    Note: the prior implementation inserted a "\\n" separator before
+    the filler to match Qwen3's chat-template-rendered form. But V's
+    auto-pad (vllm/v1/core/sched/scheduler.py: auto_pad branch) emits
+    only filler — no "\\n". The mismatch caused a 1-token drift per
+    turn boundary between the trainer's persistent_cache layout and
+    V's HBM cache layout. By turn 5 this accumulated to a 13-slot
+    misalignment, which produced 4.5+ nat L1 K divergence on admission
+    calls and ~0.05 production Mismatch KL. Removing the sep insertion
+    restores layout parity (verified empirically: testbed admission KL
+    0.039 -> 0.002, max 39.4 -> 0.285).
+    """
+    kept = _extract_kept_token_ids_last_event(response)
+    if kept is None:
+        kept = list(submitted_ids)
+    asst = _extract_completion_token_ids_for_phase4(response)
+    state = list(kept) + list(asst)
+    remainder = len(state) % cfg.block_size
+    n = (cfg.block_size - remainder) % cfg.block_size
+    if n:
+        state.extend([cfg.filler_token_id] * n)
+    _set_phase4_prev_state(state)
 
 
 def _install_message_padding_interceptor() -> None:
@@ -935,25 +1214,57 @@ def _install_message_padding_interceptor() -> None:
             # (streaming edge cases, non-chat paths). Don't touch it.
             return await orig_create(self, *args, **kwargs)
 
-        try:
-            _raw, padded, _pads = render_padded_prompt(
-                tokenizer=cfg.tokenizer,
-                messages=messages,
-                tools=tools,
-                block_size=cfg.block_size,
-                filler_token_id=cfg.filler_token_id,
-                im_end_token_id=cfg.im_end_token_id,
+        # Phase4 incremental mode: on calls AFTER the first one in a
+        # rollout (asyncio task), build prev_state + padded new user
+        # fragment instead of re-rendering the full chat history.
+        # Requires the vLLM server to run with enable_prefix_caching=True
+        # so the prev_state portion hits the prefix cache. Falls back to
+        # full-history render on first call / tools / non-string content.
+        padded: list[int] | None = None
+        used_phase4 = False
+        if cfg.phase4_enabled and tools is None:
+            try:
+                padded = _build_phase4_incremental_prompt(messages, cfg)
+            except Exception:
+                logger.exception(
+                    "kv_eviction: phase4 incremental build failed; "
+                    "falling back to full-history render"
+                )
+                padded = None
+            if padded is not None:
+                used_phase4 = True
+                logger.debug(
+                    "[PHASE4] incremental: prev_state+fragment len=%d",
+                    len(padded),
+                )
+
+        if padded is None:
+            try:
+                _raw, padded, _pads = render_padded_prompt(
+                    tokenizer=cfg.tokenizer,
+                    messages=messages,
+                    tools=tools,
+                    block_size=cfg.block_size,
+                    filler_token_id=cfg.filler_token_id,
+                    im_end_token_id=cfg.im_end_token_id,
+                )
+            except Exception:
+                # If padding fails (unusual chat template, bad messages),
+                # log and fall back to the unpadded path rather than
+                # breaking the rollout. The trainer's padding-mode assertion
+                # will fail-loud if this drift silently propagates.
+                logger.exception(
+                    "kv_eviction: render_padded_prompt failed; falling back to "
+                    "unpadded chat template"
+                )
+                return await orig_create(self, *args, **kwargs)
+
+            logger.debug(
+                "[PAD-TRACE] padded: raw->padded len %d->%d fillers_inserted=%d",
+                len(_raw),
+                len(padded),
+                sum(_pads),
             )
-        except Exception:
-            # If padding fails (unusual chat template, bad messages),
-            # log and fall back to the unpadded path rather than
-            # breaking the rollout. The trainer's padding-mode assertion
-            # will fail-loud if this drift silently propagates.
-            logger.exception(
-                "kv_eviction: render_padded_prompt failed; falling back to "
-                "unpadded chat template"
-            )
-            return await orig_create(self, *args, **kwargs)
 
         # Merge into extra_body. `extra_body` is an officially-supported
         # passthrough kwarg on openai-python's create(); its contents go
@@ -964,15 +1275,140 @@ def _install_message_padding_interceptor() -> None:
         extra_body["prompt_token_ids"] = padded
         kwargs["extra_body"] = extra_body
 
-        logger.debug(
-            "[PAD-TRACE] padded: raw->padded len %d->%d fillers_inserted=%d",
-            len(_raw),
-            len(padded),
-            sum(_pads),
+        # Force logprobs to be requested. Some upstream callers
+        # (verifiers' env wrappers under certain code paths) skip the
+        # logprobs flag, and vLLM defaults to NOT returning logprobs
+        # → trainer.inference_logprobs ends up all-zeros → Mismatch KL
+        # of ~0.67. Setting setdefault here is a no-op when the caller
+        # already passes logprobs=True.
+        kwargs.setdefault("logprobs", True)
+        kwargs.setdefault("top_logprobs", 0)
+
+        # [DEBUG-KWARGS] log what we're SENDING to vLLM. Grep
+        # "[DEBUG-KWARGS]" in orchestrator.log.
+        logger.warning(
+            "[DEBUG-KWARGS] sending to vLLM: logprobs=%s top_logprobs=%s "
+            "extra_body_keys=%s",
+            kwargs.get("logprobs"),
+            kwargs.get("top_logprobs"),
+            list(kwargs.get("extra_body", {}).keys()),
         )
 
         response = await orig_create(self, *args, **kwargs)
         _stash_prompt_token_ids(response, padded)
+
+        # [DEBUG-VLLM] log what vLLM returned: the submitted prompt, the
+        # sampled tokens, the FIRST few logprobs, and any compaction
+        # events. Grep "[DEBUG-VLLM]" in orchestrator.log to see this.
+        try:
+            _resp_extra = getattr(response, "model_extra", None) or {}
+            _comp_events = (
+                getattr(response, "compaction_events", None)
+                or _resp_extra.get("compaction_events")
+                or []
+            )
+            _choice = response.choices[0]
+            # Where did vLLM put token_ids? Verifiers ONLY checks choice.token_ids
+            # (not choice.message.token_ids), so the location matters.
+            _tk_on_choice = getattr(_choice, "token_ids", "MISSING")
+            _msg = getattr(_choice, "message", None)
+            _tk_on_msg = getattr(_msg, "token_ids", "MISSING") if _msg is not None else "no_message"
+            _completion_ids = (
+                (None if _tk_on_choice == "MISSING" else _tk_on_choice)
+                or (None if _tk_on_msg == "MISSING" else _tk_on_msg)
+                or []
+            )
+            logger.warning(
+                "[DEBUG-VLLM-LOC] token_ids: on_choice=%s on_msg=%s | prompt_token_ids on response=%s",
+                "MISSING" if _tk_on_choice == "MISSING" else (
+                    f"list[{len(_tk_on_choice) if _tk_on_choice else 0}]"
+                ),
+                "MISSING" if _tk_on_msg == "MISSING" else (
+                    f"list[{len(_tk_on_msg) if _tk_on_msg else 0}]"
+                ),
+                "yes" if hasattr(response, "prompt_token_ids") else "MISSING",
+            )
+            # Distinguish: choice missing logprobs attr / logprobs=None /
+            # logprobs.content=None / logprobs.content=[] / logprobs.content=[…]
+            _MISSING = object()
+            _lp = getattr(_choice, "logprobs", _MISSING)
+            if _lp is _MISSING:
+                _lp_state = "MISSING_ATTR"
+                _first_lp = None
+            elif _lp is None:
+                _lp_state = "lp_None"
+                _first_lp = None
+            else:
+                _lp_type = type(_lp).__name__
+                _lp_attrs = sorted([a for a in dir(_lp) if not a.startswith("_")])[:15]
+                # Try to dump the model if it's a Pydantic object
+                try:
+                    _lp_dump = (
+                        _lp.model_dump() if hasattr(_lp, "model_dump") else dict(_lp)
+                    )
+                    _lp_dump_keys = list(_lp_dump.keys())[:10]
+                except Exception:
+                    _lp_dump = None
+                    _lp_dump_keys = None
+                _lp_content = getattr(_lp, "content", _MISSING)
+                if _lp_content is _MISSING:
+                    # Show what's actually on the object
+                    _lp_state = f"content_MISSING_ATTR type={_lp_type} attrs={_lp_attrs} dump_keys={_lp_dump_keys}"
+                    if _lp_dump:
+                        logger.warning(
+                            "[DEBUG-VLLM-LP-DUMP] %s", str(_lp_dump)[:500]
+                        )
+                    _first_lp = None
+                elif _lp_content is None:
+                    _lp_state = "content_None"
+                    _first_lp = None
+                elif len(_lp_content) == 0:
+                    _lp_state = "content_EMPTY_LIST"
+                    _first_lp = None
+                else:
+                    _lp_state = f"content_len={len(_lp_content)}"
+                    _first_lp = [(c.token, c.logprob) for c in _lp_content[:5]]
+            _fr = getattr(_choice, "finish_reason", "?")
+            logger.warning(
+                "[DEBUG-VLLM] used_phase4=%s submitted_len=%d "
+                "completion_len=%d n_events=%d finish=%s lp_state=%s first_lps=%s",
+                used_phase4,
+                len(padded),
+                len(_completion_ids),
+                len(_comp_events),
+                _fr,
+                _lp_state,
+                _first_lp,
+            )
+            for _i, _e in enumerate(_comp_events):
+                _get = (lambda k, default=0: _e.get(k, default)) if isinstance(_e, dict) else (lambda k, default=0: getattr(_e, k, default))
+                logger.warning(
+                    "[DEBUG-VLLM]   event %d: evict_start=%s tokens_evicted=%s "
+                    "new_user_fragment_len=%s num_prompt_tokens=%s "
+                    "position_offset_after=%s num_output_tokens=%s",
+                    _i,
+                    _get("evict_start"),
+                    _get("tokens_evicted"),
+                    _get("new_user_fragment_len"),
+                    _get("num_prompt_tokens"),
+                    _get("position_offset_after"),
+                    _get("num_output_tokens_at_compaction"),
+                )
+        except Exception:
+            logger.exception("[DEBUG-VLLM] log failed")
+
+        # Phase4: derive prev_state for the NEXT call in this rollout.
+        # We update state even on the first call (when used_phase4 is
+        # False) so subsequent calls have prev_state available.
+        if cfg.phase4_enabled:
+            try:
+                _update_phase4_state_from_response(response, padded, cfg)
+            except Exception:
+                logger.exception(
+                    "kv_eviction: phase4 state update failed; next call "
+                    "will fall back to full-history render"
+                )
+        del used_phase4  # placeholder for future stats
         return response
 
     patched_create.__kv_eviction_padding_patched__ = True  # type: ignore[attr-defined]
@@ -996,6 +1432,8 @@ def _autoconfigure_padding_from_env() -> None:
       KV_EVICTION_PADDING_BLOCK_SIZE     — int, must match inference/trainer
       KV_EVICTION_PADDING_FILLER_ID      — int, already-resolved filler id
       KV_EVICTION_PADDING_IM_END_ID      — int, already-resolved im_end id
+      KV_EVICTION_PADDING_PHASE4         — optional "1" to enable Phase4
+                                            incremental prompt assembly
 
     No-ops if already configured (idempotent) or if env vars are absent.
     """
@@ -1019,6 +1457,7 @@ def _autoconfigure_padding_from_env() -> None:
             e,
         )
         return
+    phase4_enabled = _os.environ.get("KV_EVICTION_PADDING_PHASE4", "0") == "1"
     from transformers import AutoTokenizer  # local import to keep env.py lean
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -1028,6 +1467,7 @@ def _autoconfigure_padding_from_env() -> None:
         block_size=block_size,
         filler_token_id=filler_id,
         im_end_token_id=im_end_id,
+        phase4_enabled=phase4_enabled,
     )
 
 
