@@ -841,7 +841,21 @@ def test_eviction_mode_captures_compaction_events_on_summary():
     _run_with_fake_orig(fake_orig, factory)
 
     attached = captured["response"].summary_trainsample
-    assert attached["compaction_events"] == events
+    # The env.py extractor adds defaults for the Phase A fields
+    # (new_user_fragment_len, kept_indices, kept_token_ids,
+    # last_turn_evicted, num_turns_evicted_after) when the response
+    # doesn't carry them. The original 5 fields must still match.
+    expected = [
+        {
+            **events[0],
+            "new_user_fragment_len": 0,
+            "kept_indices": [],
+            "kept_token_ids": [],
+            "last_turn_evicted": -1,
+            "num_turns_evicted_after": 0,
+        },
+    ]
+    assert attached["compaction_events"] == expected
 
 
 def test_markovian_mode_ignores_compaction_events_on_summary():
