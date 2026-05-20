@@ -60,12 +60,23 @@ Not attempted here; we ship M3 first.
 """
 
 import logging
+import math
+import os
 from typing import Callable
 
 import torch
+import torch._functorch.config  # noqa: F401  load submodule so the assignment below resolves
 import torch.utils.checkpoint
 from torch import Tensor
 from transformers import DynamicCache
+
+# FSDP2's AOT autograd donates intermediate buffers between forward and
+# backward, which forbids retain_graph=True. The legacy segmented_forward
+# loss_fn=None mode runs one backward across all retained-KV segments
+# and needs retain_graph; keep donated buffers off so that path stays
+# working. The per-call persistent-cache path doesn't need this (the
+# cache is detached between calls) but the setting is harmless there.
+torch._functorch.config.donated_buffer = False  # type: ignore[attr-defined]
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +94,13 @@ logger = logging.getLogger(__name__)
 # callback typically slices advantages / old_logprobs / loss_mask at
 # positions [full_logit_start + 1, full_logit_end + 1).
 SegmentLossFn = Callable[[Tensor, int, int], Tensor]
+
+
+def _normalize_bptt_segments(bptt_segments: int | None) -> int | None:
+    """Map the config-facing -1 sentinel to full-chain BPTT."""
+    if bptt_segments == -1:
+        return None
+    return bptt_segments
 
 
 def compute_num_segments(
@@ -257,7 +275,7 @@ def segmented_forward(
     position_ids: Tensor,  # [1, seq_len]
     segment_boundaries: list[int],  # cumulative completion token counts
     prompt_len: int,  # raw prompt length
-    prompt_aligned_len: int,  # ceil(prompt_len / block_size) * block_size
+    prompt_aligned_len: int,  # block-aligned eviction boundary
     stride: int,  # tokens to drop per eviction (= stride_blocks * block_size)
     temperature: Tensor,  # [1, seq_len] per-token temperatures
     max_forward_passes: int | None = None,  # FSDP synchronization padding
@@ -282,13 +300,14 @@ def segmented_forward(
             list is empty.
         prompt_len: Number of prompt tokens (the offset into input_ids where
             completion tokens begin).
-        prompt_aligned_len: ceil(prompt_len / block_size) * block_size. The
-            physical eviction boundary used by CompactingKVCacheManager —
-            block-aligned, not token-aligned. When prompt_len is not a
-            multiple of block_size, the first (prompt_aligned_len -
-            prompt_len) completion tokens live in the tail of the last
-            prompt block and are never evicted. The trainer-side drop must
-            match this exactly or train/inference KL explodes.
+        prompt_aligned_len: Block-aligned eviction boundary. Without
+            protected prefix: ceil(prompt_len / block_size) * block_size.
+            With protected prefix: ceil(min(protected_prefix, prompt_len)
+            / block_size) * block_size — can be LESS than prompt_len
+            because old conversation turns between the protected prefix
+            and the prompt end are evictable. The trainer-side drop must
+            match the inference-side boundary exactly or train/inference
+            KL explodes.
         stride: Number of tokens evicted per compaction event. In the vLLM
             config this is compaction_stride, a multiple of block_size.
         temperature: Per-token temperatures [1, seq_len] used at generation
@@ -349,6 +368,7 @@ def segmented_forward(
             model.parameters().grad). Loss is detached so the caller
             can log/reduce it without re-entering the graph.
     """
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
     assert input_ids.shape[0] == 1, "segmented_forward requires batch_size=1"
     # Empty segment_boundaries is a legal no-event sample: the trainer's
     # unified compaction dispatch (D5 fix) routes every sample through
@@ -358,9 +378,12 @@ def segmented_forward(
     # covering the whole [prompt + completion] sequence, numerically
     # equivalent to calling model(input_ids, position_ids) directly
     # under flash_attention_2. See plans/phase3_training_integration.md.
-    assert prompt_aligned_len >= prompt_len, (
-        f"prompt_aligned_len ({prompt_aligned_len}) must be >= prompt_len "
-        f"({prompt_len})"
+    assert prompt_aligned_len > 0, (
+        f"prompt_aligned_len must be positive, got {prompt_aligned_len}"
+    )
+    assert prompt_aligned_len <= input_ids.shape[1], (
+        f"prompt_aligned_len ({prompt_aligned_len}) exceeds seq_len "
+        f"({input_ids.shape[1]})"
     )
     assert stride > 0, f"stride must be positive, got {stride}"
     assert not (activation_checkpointing and loss_fn is not None), (
@@ -809,6 +832,23 @@ def segmented_forward(
     return {"logits": full_logits}
 
 
+def _dummy_forward_loss(
+    model: torch.nn.Module,
+    input_ids: Tensor,
+    position_ids: Tensor,
+) -> Tensor:
+    d_out = model(
+        input_ids=input_ids[:, :1],
+        position_ids=position_ids[:, :1],
+    )
+    d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
+    if isinstance(d_logits, dict):
+        d_logits = d_logits["logits"]
+    # float().mean() first to avoid bf16 sum overflow producing Inf
+    # (Inf * 0 = NaN, which would corrupt gradients).
+    return d_logits.float().mean() * 0.0
+
+
 def _run_dummy_passes_with_backward(
     model: torch.nn.Module,
     input_ids: Tensor,
@@ -830,17 +870,7 @@ def _run_dummy_passes_with_backward(
       3. Calls .backward() to trigger FSDP2's reduce-scatter.
     """
     for _ in range(num_dummy):
-        d_out = model(
-            input_ids=input_ids[:, :1],
-            position_ids=position_ids[:, :1],
-        )
-        d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
-        if isinstance(d_logits, dict):
-            d_logits = d_logits["logits"]
-        # float().mean() first to avoid bf16 sum overflow producing Inf
-        # (Inf * 0 = NaN, which would corrupt gradients).
-        dummy_loss = d_logits.float().mean() * 0.0
-        dummy_loss.backward()
+        _dummy_forward_loss(model, input_ids, position_ids).backward()
 
 
 def _pad_with_dummy_passes(
@@ -876,3 +906,2383 @@ def _pad_with_dummy_passes(
             d_logits = d_logits["logits"]
         dummy_sum = dummy_sum + d_logits.float().mean()
     return logits + (dummy_sum * 0).to(logits.dtype)
+
+
+# ─── Per-call segmented forward ───────────────────────────────────────
+#
+# Mirrors vLLM's per-call independence: each chat() call in a rollout is
+# treated as an atomic forward unit. We maintain a persistent
+# `DynamicCache` across calls within a sample, detaching it between
+# calls so the per-segment backward (M3 / bptt_segments=1) memory bound
+# is preserved.
+#
+# Each call's forward processes ONLY the new tokens this call
+# contributes to the merged frame, reading prior K/V from the persistent
+# cache — structurally identical to vLLM's prefix-cache + single
+# kernel-forward-per-call admission path.
+#
+# Admission events affect position_ids only: tokens in the kept portion
+# of an admission call rotate at their pre-eviction logical positions
+# (matching what vLLM's K writes were rotated at), and we accumulate
+# total_evicted as a running `cum_position_offset` for subsequent
+# tokens. No explicit cache splice is needed — the evicted tokens are
+# absent from merged_input_ids (the orchestrator's _apply_admission_trim
+# already removed them) and the causal mask + RoPE relative positions
+# handle the rest.
+
+
+def _call_has_admission(call) -> bool:
+    """A CallWire has admission iff any of its compaction_events has
+    num_output_tokens_at_compaction == 0."""
+    events = getattr(call, "compaction_events", None) or []
+    for e in events:
+        if int(getattr(e, "num_output_tokens_at_compaction", 0)) == 0:
+            return True
+    return False
+
+
+def _regular_split_prompt_tail_enabled() -> bool:
+    """Default trainer execution shape for per-call compaction.
+
+    The regular segmented path prefills newly submitted prompt tokens
+    separately from completion/pad writes. This keeps cache semantics close to
+    vLLM without enabling the token-by-token mirror-decode diagnostic.
+    """
+    return os.environ.get("KVE_TRAINER_SPLIT_PROMPT_TAIL", "1") != "0"
+
+
+def _split_final_pad_enabled() -> bool:
+    return os.environ.get("KVE_TRAINER_SPLIT_FINAL_PAD", "0") == "1"
+
+
+def _count_tail_forwards(
+    *,
+    seq_len: int,
+    prompt_len: int,
+    pad_len: int,
+    mirror_decode: bool,
+) -> int:
+    """Number of model forwards used by _forward_with_optional_decode_mirror."""
+    if seq_len <= 0:
+        return 0
+
+    keep_len = seq_len - int(pad_len)
+    if keep_len < 0:
+        raise ValueError(
+            f"pad_len={pad_len} exceeds forwarded seq_len={seq_len}"
+        )
+    prompt_len = max(0, min(int(prompt_len), keep_len))
+
+    if not mirror_decode:
+        if (
+            _regular_split_prompt_tail_enabled()
+            and 0 < prompt_len < seq_len
+        ):
+            n = 1  # prompt/new-user prefill
+            if _split_final_pad_enabled() and pad_len > 0:
+                final_pad_start = max(prompt_len, keep_len - 1)
+                if final_pad_start > prompt_len:
+                    n += 1
+                if seq_len > final_pad_start:
+                    n += 1
+            else:
+                n += 1  # completion plus any trailing pad
+            return n
+
+        if _split_final_pad_enabled() and pad_len > 0:
+            tail_start = max(0, keep_len - 1)
+            n = 0
+            if tail_start > 0:
+                n += 1
+            if seq_len > tail_start:
+                n += 1
+            return max(n, 1)
+
+        return 1
+
+    if os.environ.get("KVE_TRAINER_MIRROR_PROMPT_DECODE", "0") == "1":
+        prompt_len = 0
+
+    n = 0
+    if prompt_len > 0:
+        n += 1
+    if keep_len > prompt_len:
+        n += max(0, keep_len - 1 - prompt_len)
+        n += 1
+    elif keep_len < seq_len:
+        n += 1
+    return max(n, 1)
+
+
+def compute_per_call_forward_counts(calls) -> list[int]:
+    """Forward-pass count for each non-empty call in per-call dispatch.
+
+    Counts the regular segmented default by replaying the same per-call plan:
+    old survivor K/V stays in the persistent cache, new prompt tokens prefill
+    as one chunk, and completion/pad writes run as the tail chunk. The
+    token-by-token mirror-decode diagnostic is still accounted for when its
+    env gate is explicitly enabled.
+    """
+    if not calls:
+        return []
+    plans, _ = _build_pre_trim_plan(calls)
+    mirror_decode = os.environ.get("KVE_TRAINER_MIRROR_VLLM_DECODE", "0") == "1"
+    mirror_decode_filter_env = os.environ.get(
+        "KVE_TRAINER_MIRROR_DECODE_CALL_IDX", ""
+    )
+    mirror_decode_call_filter = None
+    if mirror_decode_filter_env:
+        mirror_decode_call_filter = {
+            int(x.strip())
+            for x in mirror_decode_filter_env.split(",")
+            if x.strip()
+        }
+    mirror_decode_last_n = int(
+        os.environ.get("KVE_TRAINER_MIRROR_DECODE_LAST_N", "0") or "0"
+    )
+    b2b_warmup_splice = (
+        os.environ.get("KVE_TRAINER_B2B_WARMUP_SPLICE", "0") == "1"
+    )
+
+    counts: list[int] = []
+    for plan in plans:
+        call_idx = plan["call_idx"]
+        cps = plan["call_pre_start"]
+        cpe = plan["call_pre_end"]
+        has_admission = plan["has_admission"]
+        sub_end_pre = plan.get("sub_end_pre", plan["inherited_end_pre"])
+        pad_len = plan.get("pad_len", 0)
+        mirror_decode_has_filter = (
+            mirror_decode_call_filter is not None or mirror_decode_last_n > 0
+        )
+        mirror_decode_this_call = mirror_decode and (
+            not mirror_decode_has_filter
+            or (
+                mirror_decode_call_filter is not None
+                and call_idx in mirror_decode_call_filter
+            )
+            or (
+                mirror_decode_last_n > 0
+                and call_idx >= max(0, len(plans) - mirror_decode_last_n)
+            )
+        )
+
+        if cpe <= cps:
+            continue
+
+        n = 0
+        if has_admission and cps > 0:
+            if b2b_warmup_splice:
+                warm_end = sub_end_pre
+                if warm_end > cps:
+                    n += 1
+                main_start = warm_end
+                n += _count_tail_forwards(
+                    seq_len=cpe - main_start,
+                    prompt_len=0,
+                    pad_len=pad_len,
+                    mirror_decode=mirror_decode_this_call,
+                )
+            else:
+                main_prompt_len = max(0, min(sub_end_pre, cpe) - cps)
+                n += _count_tail_forwards(
+                    seq_len=cpe - cps,
+                    prompt_len=main_prompt_len,
+                    pad_len=pad_len,
+                    mirror_decode=mirror_decode_this_call,
+                )
+            counts.append(n)
+            continue
+
+        if has_admission:
+            warm_end = sub_end_pre
+            if warm_end > cps:
+                n += 1
+            main_start = sub_end_pre
+            n += _count_tail_forwards(
+                seq_len=cpe - main_start,
+                prompt_len=0,
+                pad_len=pad_len,
+                mirror_decode=mirror_decode_this_call,
+            )
+            counts.append(n)
+            continue
+
+        new_prompt_len = max(0, min(sub_end_pre, cpe) - cps)
+        n += _count_tail_forwards(
+            seq_len=cpe - cps,
+            prompt_len=new_prompt_len,
+            pad_len=pad_len,
+            mirror_decode=mirror_decode_this_call,
+        )
+        counts.append(n)
+    return counts
+
+
+def compute_num_per_call_forwards(calls) -> int:
+    """How many forward passes per_call_segmented_forward will run for
+    this list of calls. Used to all-reduce-MAX across DP ranks so FSDP2
+    all-gathers stay synchronized."""
+    return max(sum(compute_per_call_forward_counts(calls)), 1)
+
+
+def compute_per_call_bptt_window_forward_counts(
+    calls,
+    bptt_segments: int | None,
+) -> list[int]:
+    """Forward-pass counts grouped by per-call BPTT window."""
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
+    call_counts = compute_per_call_forward_counts(calls)
+    if not call_counts:
+        return []
+    if bptt_segments is None:
+        return [sum(call_counts)]
+    if bptt_segments < 1:
+        raise ValueError(f"bptt_segments must be None or >= 1, got {bptt_segments}")
+    return [
+        sum(call_counts[i : i + bptt_segments])
+        for i in range(0, len(call_counts), bptt_segments)
+    ]
+
+
+def compute_num_per_call_bptt_windows(
+    calls,
+    bptt_segments: int | None,
+) -> int:
+    """Number of real backward windows for per-call BPTT."""
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
+    counts = compute_per_call_forward_counts(calls)
+    if not counts:
+        return 0
+    if bptt_segments is None:
+        return 1
+    if bptt_segments < 1:
+        raise ValueError(f"bptt_segments must be None or >= 1, got {bptt_segments}")
+    return math.ceil(len(counts) / bptt_segments)
+
+
+def _detach_dynamic_cache(cache: DynamicCache) -> DynamicCache:
+    """Return a fresh DynamicCache whose K/V tensors are detached from
+    the autograd graph. Called between per-call forwards in
+    `per_call_segmented_forward` so each call's backward stops at the
+    cache boundary, preserving bptt_segments=1 / M3 semantics."""
+    detached = DynamicCache()
+    n_layers = len(cache)
+    for layer_idx in range(n_layers):
+        if hasattr(cache, "layers"):
+            k = cache.layers[layer_idx].keys
+            v = cache.layers[layer_idx].values
+        else:
+            k = cache.key_cache[layer_idx]
+            v = cache.value_cache[layer_idx]
+        detached.update(k.detach(), v.detach(), layer_idx)
+    return detached
+
+
+def _splice_dynamic_cache(
+    cache: DynamicCache,
+    evict_start: int,
+    evict_end: int,
+) -> DynamicCache:
+    """Drop K/V slices [evict_start, evict_end) from every layer of a
+    DynamicCache. Mirrors compaction_debug.py / diagnostic_kl_dummy.py's
+    H2 oracle splice (lines 254-271).
+
+    Per-layer K/V shape is [1, n_heads, seq, head_dim]. We slice along
+    dim=2. Returns a fresh DynamicCache with the spliced K/V uploaded.
+    """
+    spliced = DynamicCache()
+    n_layers = len(cache)
+    for layer_idx in range(n_layers):
+        if hasattr(cache, "layers"):
+            k = cache.layers[layer_idx].keys
+            v = cache.layers[layer_idx].values
+        else:
+            k = cache.key_cache[layer_idx]
+            v = cache.value_cache[layer_idx]
+        # [1, n_heads, seq, head_dim]; drop along dim=2.
+        new_k = torch.cat(
+            [k[:, :, :evict_start, :], k[:, :, evict_end:, :]], dim=2,
+        ).contiguous()
+        new_v = torch.cat(
+            [v[:, :, :evict_start, :], v[:, :, evict_end:, :]], dim=2,
+        ).contiguous()
+        spliced.update(new_k, new_v, layer_idx)
+    return spliced
+
+
+def _piecewise_positions(
+    start: int,
+    end: int,
+    *,
+    offset: int,
+    protected_prefix_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """vLLM's piecewise RoPE frame for physical positions [start, end)."""
+    physical = torch.arange(start, end, device=device, dtype=torch.long)
+    if offset != 0:
+        if protected_prefix_len > 0:
+            physical = physical + (
+                (physical >= protected_prefix_len).to(torch.long) * offset
+            )
+        else:
+            physical = physical + offset
+    return physical.unsqueeze(0)
+
+
+def _extract_logits(model_output) -> Tensor:
+    logits = (
+        model_output["logits"]
+        if isinstance(model_output, dict)
+        else model_output.logits
+    )
+    if isinstance(logits, dict):
+        logits = logits["logits"]
+    return logits
+
+
+def _preview_1d(t: Tensor, start: int, end: int) -> tuple[list[int], list[int]]:
+    vals = t[0, start:end].detach().cpu().tolist()
+    return vals[:8], vals[-8:]
+
+
+def _set_attn_implementation_if_needed(
+    model: torch.nn.Module,
+    attn_impl: str | None,
+) -> None:
+    if not attn_impl or not hasattr(model, "set_attn_implementation"):
+        return
+    cfg = getattr(model, "config", None)
+    cur = getattr(cfg, "_attn_implementation", None)
+    if cur != attn_impl:
+        model.set_attn_implementation(attn_impl)
+
+
+def _model_forward_with_optional_attn_switch(
+    model: torch.nn.Module,
+    *,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    past_key_values: DynamicCache,
+    base_attn_impl: str | None,
+    past_attn_impl: str | None,
+    attn_impl_override: str | None = None,
+):
+    target_attn_impl = attn_impl_override or (
+        past_attn_impl
+        if past_attn_impl and past_key_values.get_seq_length() > 0
+        else base_attn_impl
+    )
+    _set_attn_implementation_if_needed(model, target_attn_impl)
+    return model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+
+
+def _forward_with_optional_decode_mirror(
+    model: torch.nn.Module,
+    *,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    past_key_values: DynamicCache,
+    prompt_len: int,
+    pad_len: int,
+    mirror_decode: bool,
+    base_attn_impl: str | None,
+    past_attn_impl: str | None,
+    trace_label: str | None = None,
+) -> tuple[Tensor, int]:
+    """Forward a request tail, optionally mirroring vLLM decode shape.
+
+    Diagnostic mode (`KVE_TRAINER_MIRROR_VLLM_DECODE=1`) preserves the
+    same logical span but changes execution shape:
+      - prompt/new-user tail in one prefill forward;
+      - generated tokens one at a time;
+      - final generated token plus auto-pad fillers in one tail forward.
+
+    Returned logits exclude auto-pad filler rows, matching the normal
+    loss/logprob frame. The cache still receives the pad K/V writes.
+    """
+    seq_len = int(input_ids.shape[1])
+    if seq_len <= 0:
+        raise ValueError("_forward_with_optional_decode_mirror got empty input")
+
+    keep_len = seq_len - int(pad_len)
+    if keep_len < 0:
+        raise ValueError(
+            f"pad_len={pad_len} exceeds forwarded seq_len={seq_len}"
+        )
+    prompt_len = max(0, min(int(prompt_len), keep_len))
+
+    if not mirror_decode:
+        split_prompt_tail = (
+            _regular_split_prompt_tail_enabled()
+            and 0 < prompt_len < seq_len
+        )
+        if split_prompt_tail:
+            pieces: list[Tensor] = []
+            n_forwards = 0
+
+            cache_before = past_key_values.get_seq_length()
+            out = _model_forward_with_optional_attn_switch(
+                model,
+                input_ids=input_ids[:, :prompt_len],
+                position_ids=position_ids[:, :prompt_len],
+                past_key_values=past_key_values,
+                base_attn_impl=base_attn_impl,
+                past_attn_impl=past_attn_impl,
+            )
+            pieces.append(_extract_logits(out))
+            n_forwards += 1
+            if trace_label is not None:
+                tok_head, tok_tail = _preview_1d(input_ids, 0, prompt_len)
+                pos_head, pos_tail = _preview_1d(position_ids, 0, prompt_len)
+                logger.warning(
+                    "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                    "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                    "attn_override=%s pos_head=%s pos_tail=%s "
+                    "tok_head=%s tok_tail=%s",
+                    trace_label, 0, prompt_len, prompt_len,
+                    cache_before, past_key_values.get_seq_length(),
+                    prompt_len, pad_len, mirror_decode, None,
+                    pos_head, pos_tail, tok_head, tok_tail,
+                )
+
+            split_final_pad_tail = (
+                _split_final_pad_enabled()
+                and pad_len > 0
+            )
+            tail_chunks: list[tuple[int, int]] = []
+            if split_final_pad_tail:
+                final_pad_start = max(prompt_len, keep_len - 1)
+                if final_pad_start > prompt_len:
+                    tail_chunks.append((prompt_len, final_pad_start))
+                tail_chunks.append((final_pad_start, seq_len))
+            else:
+                tail_chunks.append((prompt_len, seq_len))
+
+            for start, end in tail_chunks:
+                if end <= start:
+                    continue
+                cache_before = past_key_values.get_seq_length()
+                out = _model_forward_with_optional_attn_switch(
+                    model,
+                    input_ids=input_ids[:, start:end],
+                    position_ids=position_ids[:, start:end],
+                    past_key_values=past_key_values,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                )
+                tail_logits = _extract_logits(out)
+                n_forwards += 1
+                if trace_label is not None:
+                    tok_head, tok_tail = _preview_1d(input_ids, start, end)
+                    pos_head, pos_tail = _preview_1d(position_ids, start, end)
+                    logger.warning(
+                        "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                        "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                        "attn_override=%s pos_head=%s pos_tail=%s "
+                        "tok_head=%s tok_tail=%s",
+                        trace_label, start, end, end - start,
+                        cache_before, past_key_values.get_seq_length(),
+                        prompt_len, pad_len, mirror_decode, None,
+                        pos_head, pos_tail, tok_head, tok_tail,
+                    )
+                keep_in_chunk = max(0, min(end, keep_len) - start)
+                if keep_in_chunk > 0:
+                    pieces.append(tail_logits[:, :keep_in_chunk, :])
+            return torch.cat(pieces, dim=1), n_forwards
+
+        split_final_pad = (
+            _split_final_pad_enabled()
+            and pad_len > 0
+        )
+        if split_final_pad:
+            pieces: list[Tensor] = []
+            n_forwards = 0
+            tail_start = max(0, keep_len - 1)
+            if tail_start > 0:
+                cache_before = past_key_values.get_seq_length()
+                out = _model_forward_with_optional_attn_switch(
+                    model,
+                    input_ids=input_ids[:, :tail_start],
+                    position_ids=position_ids[:, :tail_start],
+                    past_key_values=past_key_values,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                )
+                pieces.append(_extract_logits(out))
+                n_forwards += 1
+                if trace_label is not None:
+                    tok_head, tok_tail = _preview_1d(input_ids, 0, tail_start)
+                    pos_head, pos_tail = _preview_1d(position_ids, 0, tail_start)
+                    logger.warning(
+                        "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                        "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                        "attn_override=%s pos_head=%s pos_tail=%s "
+                        "tok_head=%s tok_tail=%s",
+                        trace_label, 0, tail_start, tail_start,
+                        cache_before, past_key_values.get_seq_length(),
+                        prompt_len, pad_len, mirror_decode, None,
+                        pos_head, pos_tail, tok_head, tok_tail,
+                    )
+            cache_before = past_key_values.get_seq_length()
+            out = _model_forward_with_optional_attn_switch(
+                model,
+                input_ids=input_ids[:, tail_start:],
+                position_ids=position_ids[:, tail_start:],
+                past_key_values=past_key_values,
+                base_attn_impl=base_attn_impl,
+                past_attn_impl=past_attn_impl,
+            )
+            tail_logits = _extract_logits(out)
+            n_forwards += 1
+            if trace_label is not None:
+                tok_head, tok_tail = _preview_1d(input_ids, tail_start, seq_len)
+                pos_head, pos_tail = _preview_1d(position_ids, tail_start, seq_len)
+                logger.warning(
+                    "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                    "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                    "attn_override=%s pos_head=%s pos_tail=%s "
+                    "tok_head=%s tok_tail=%s",
+                    trace_label, tail_start, seq_len, seq_len - tail_start,
+                    cache_before, past_key_values.get_seq_length(),
+                    prompt_len, pad_len, mirror_decode, None,
+                    pos_head, pos_tail, tok_head, tok_tail,
+                )
+            if keep_len > tail_start:
+                pieces.append(tail_logits[:, : keep_len - tail_start, :])
+            if pieces:
+                return torch.cat(pieces, dim=1), n_forwards
+            return tail_logits[:, :0, :], n_forwards
+
+        cache_before = past_key_values.get_seq_length()
+        out = _model_forward_with_optional_attn_switch(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            base_attn_impl=base_attn_impl,
+            past_attn_impl=past_attn_impl,
+        )
+        logits = _extract_logits(out)
+        if trace_label is not None:
+            tok_head, tok_tail = _preview_1d(input_ids, 0, seq_len)
+            pos_head, pos_tail = _preview_1d(position_ids, 0, seq_len)
+            logger.warning(
+                "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                "attn_override=%s pos_head=%s pos_tail=%s "
+                "tok_head=%s tok_tail=%s",
+                trace_label, 0, seq_len, seq_len,
+                cache_before, past_key_values.get_seq_length(),
+                prompt_len, pad_len, mirror_decode, None,
+                pos_head, pos_tail, tok_head, tok_tail,
+            )
+        return logits[:, :keep_len, :], 1
+
+    if os.environ.get("KVE_TRAINER_MIRROR_PROMPT_DECODE", "0") == "1":
+        prompt_len = 0
+
+    pieces: list[Tensor] = []
+    n_forwards = 0
+    last_logits: Tensor | None = None
+
+    def run_chunk(
+        start: int,
+        end: int,
+        *,
+        attn_impl_override: str | None = None,
+    ) -> Tensor:
+        nonlocal n_forwards, last_logits
+        cache_before = past_key_values.get_seq_length()
+        out = _model_forward_with_optional_attn_switch(
+            model,
+            input_ids=input_ids[:, start:end],
+            position_ids=position_ids[:, start:end],
+            past_key_values=past_key_values,
+            base_attn_impl=base_attn_impl,
+            past_attn_impl=past_attn_impl,
+            attn_impl_override=attn_impl_override,
+        )
+        logits = _extract_logits(out)
+        last_logits = logits
+        n_forwards += 1
+        if trace_label is not None:
+            tok_head, tok_tail = _preview_1d(input_ids, start, end)
+            pos_head, pos_tail = _preview_1d(position_ids, start, end)
+            logger.warning(
+                "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                "attn_override=%s pos_head=%s pos_tail=%s "
+                "tok_head=%s tok_tail=%s",
+                trace_label,
+                start,
+                end,
+                end - start,
+                cache_before,
+                past_key_values.get_seq_length(),
+                prompt_len,
+                pad_len,
+                mirror_decode,
+                str(attn_impl_override),
+                pos_head,
+                pos_tail,
+                tok_head,
+                tok_tail,
+            )
+        return logits
+
+    # vLLM prefill: all prompt/new-user tokens in one forward.
+    if prompt_len > 0:
+        prompt_tail_attn_impl = (
+            os.environ.get("KVE_TRAINER_PROMPT_TAIL_ATTN_IMPL", "") or None
+        )
+        if past_key_values.get_seq_length() <= 0:
+            prompt_tail_attn_impl = None
+        pieces.append(
+            run_chunk(
+                0,
+                prompt_len,
+                attn_impl_override=prompt_tail_attn_impl,
+            )
+        )
+
+    # vLLM decode: each already-sampled completion token is fed on the
+    # next scheduler iteration. The last completion token is fed together
+    # with auto-pad fillers when auto-pad is active.
+    if keep_len > prompt_len:
+        for i in range(prompt_len, keep_len - 1):
+            pieces.append(run_chunk(i, i + 1))
+        tail_logits = run_chunk(keep_len - 1, seq_len)
+        pieces.append(tail_logits[:, :1, :])
+    elif keep_len < seq_len:
+        # Pad-only tail. This should be rare, but keep cache layout exact.
+        run_chunk(keep_len, seq_len)
+
+    if pieces:
+        return torch.cat(pieces, dim=1), n_forwards
+    assert last_logits is not None
+    return last_logits[:, :0, :], n_forwards
+
+
+def _backward_loss_or_zero(loss_val: Tensor, logits: Tensor) -> None:
+    if loss_val.requires_grad:
+        loss_val.backward()
+    elif logits.requires_grad:
+        (logits.float().mean() * 0.0).backward()
+
+
+def _forward_mirror_decode_stream_loss(
+    model: torch.nn.Module,
+    *,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    past_key_values: DynamicCache,
+    prompt_len: int,
+    pad_len: int,
+    base_attn_impl: str | None,
+    past_attn_impl: str | None,
+    loss_fn: SegmentLossFn,
+    full_logit_start: int,
+    trace_label: str | None = None,
+) -> tuple[DynamicCache, int, float, int]:
+    """Run vLLM-shaped decode forwards without retaining every graph.
+
+    This is the production-memory version of
+    `_forward_with_optional_decode_mirror(..., mirror_decode=True)`.
+    Each kept logits chunk is sent through the caller's `loss_fn` and
+    backwarded immediately, then the cache is detached before the next
+    decode chunk. This keeps the diagnostic execution shape while
+    bounding activation lifetime to one chunk.
+    """
+    seq_len = int(input_ids.shape[1])
+    if seq_len <= 0:
+        raise ValueError("_forward_mirror_decode_stream_loss got empty input")
+
+    keep_len = seq_len - int(pad_len)
+    if keep_len < 0:
+        raise ValueError(
+            f"pad_len={pad_len} exceeds forwarded seq_len={seq_len}"
+        )
+    prompt_len = max(0, min(int(prompt_len), keep_len))
+    if os.environ.get("KVE_TRAINER_MIRROR_PROMPT_DECODE", "0") == "1":
+        prompt_len = 0
+
+    n_forwards = 0
+    accumulated_loss = 0.0
+    kept_so_far = 0
+
+    def run_chunk(
+        start: int,
+        end: int,
+        *,
+        keep_in_chunk: int,
+        attn_impl_override: str | None = None,
+    ) -> None:
+        nonlocal past_key_values, n_forwards, accumulated_loss, kept_so_far
+        cache_before = past_key_values.get_seq_length()
+        out = _model_forward_with_optional_attn_switch(
+            model,
+            input_ids=input_ids[:, start:end],
+            position_ids=position_ids[:, start:end],
+            past_key_values=past_key_values,
+            base_attn_impl=base_attn_impl,
+            past_attn_impl=past_attn_impl,
+            attn_impl_override=attn_impl_override,
+        )
+        logits = _extract_logits(out)
+        n_forwards += 1
+        if trace_label is not None:
+            tok_head, tok_tail = _preview_1d(input_ids, start, end)
+            pos_head, pos_tail = _preview_1d(position_ids, start, end)
+            logger.warning(
+                "[T-FWD-SIG] label=%s chunk=[%d,%d) len=%d "
+                "cache=%d->%d prompt_len=%d pad_len=%d mirror=%s "
+                "attn_override=%s pos_head=%s pos_tail=%s "
+                "tok_head=%s tok_tail=%s stream_loss=True",
+                trace_label,
+                start,
+                end,
+                end - start,
+                cache_before,
+                past_key_values.get_seq_length(),
+                prompt_len,
+                pad_len,
+                True,
+                str(attn_impl_override),
+                pos_head,
+                pos_tail,
+                tok_head,
+                tok_tail,
+            )
+
+        if keep_in_chunk > 0:
+            chunk_logits = logits[:, :keep_in_chunk, :]
+            chunk_start = full_logit_start + kept_so_far
+            chunk_end = chunk_start + keep_in_chunk
+            loss_val = loss_fn(chunk_logits, chunk_start, chunk_end)
+            _backward_loss_or_zero(loss_val, chunk_logits)
+            accumulated_loss += float(loss_val.detach().item())
+            kept_so_far += keep_in_chunk
+        else:
+            (logits.float().mean() * 0.0).backward()
+        past_key_values = _detach_dynamic_cache(past_key_values)
+
+    if prompt_len > 0:
+        prompt_tail_attn_impl = (
+            os.environ.get("KVE_TRAINER_PROMPT_TAIL_ATTN_IMPL", "") or None
+        )
+        if past_key_values.get_seq_length() <= 0:
+            prompt_tail_attn_impl = None
+        run_chunk(
+            0,
+            prompt_len,
+            keep_in_chunk=prompt_len,
+            attn_impl_override=prompt_tail_attn_impl,
+        )
+
+    if keep_len > prompt_len:
+        for i in range(prompt_len, keep_len - 1):
+            run_chunk(i, i + 1, keep_in_chunk=1)
+        run_chunk(keep_len - 1, seq_len, keep_in_chunk=1)
+    elif keep_len < seq_len:
+        run_chunk(keep_len, seq_len, keep_in_chunk=0)
+
+    return past_key_values, n_forwards, accumulated_loss, kept_so_far
+
+
+def _apply_splices_to_submitted(
+    submitted: list[int],
+    splices: list[tuple[int, int]],
+    cached_pre: int,
+) -> tuple[list[int], list[int], int]:
+    """Apply admission deletions to submitted prompt and cached length.
+
+    Returns:
+      - post-trim submitted token ids
+      - post-index -> pre-index map
+      - cached token count after the same deletions
+    """
+    post = list(submitted)
+    post_to_pre = list(range(len(submitted)))
+    cached = int(cached_pre)
+    for es, te in splices:
+        if te <= 0:
+            continue
+        overlap = max(0, min(cached, es + te) - es)
+        cached -= overlap
+        del post[es:es + te]
+        del post_to_pre[es:es + te]
+    return post, post_to_pre, cached
+
+
+def _build_pre_trim_plan(calls):
+    """Walk a sample's CallWire list and build a per-call execution plan.
+
+    For each call, computes:
+      - call_pre_start, call_pre_end: this call's contribution range in
+        the sample's pre-trim cumulative coordinate (= persistent_cache
+        logical positions this call writes).
+      - has_admission: bool — call has at least one admission event
+        with tokens_evicted > 0.
+      - inherited_end_pre: pre-trim absolute position where this call's
+        "new" content begins. For admission calls this is
+        (call_pre_start + sub_len - new_user_fragment_len). For non-
+        admission calls this is call_pre_start (no inherited region to
+        warm up — extension calls inherit via persistent_cache).
+      - splices: list of (es, te) tuples per admission event in order.
+        Each event's evict_start is in the CURRENT submitted-prompt-iter
+        coordinate (matches `_apply_admission_trim` semantics: each
+        successive event sees the prior iters' deletions already
+        applied). Translates 1:1 to cache-index for `_splice_dynamic_cache`
+        because cache content and submitted_prompt are co-indexed up
+        through `inherited_end_pre` at the moment of splicing.
+      - post_start, post_end: post-trim merged coord (matches
+        merged_input_ids / labels / loss_mask / advantages frame).
+      - kept_in_call: int64 list of pre-trim positions WITHIN this
+        call's contribution that survive admission. Indexed relative to
+        call_pre_start. Length = post_end - post_start.
+      - new_content_start_in_sub: where this call's NEW pre-trim
+        contribution starts within submitted_prompt_ids (0 for first
+        call, prior cum_pre for extension calls).
+
+    Asserts no mid-generation events (those are routed to legacy
+    segmented_forward upstream).
+
+    Returns (plans, pre_trim_ids) where pre_trim_ids is the full
+    pre-trim merged token list for the sample.
+    """
+    plans = []
+    pre_trim_ids: list[int] = []
+    cum_pre = 0
+    cum_post = 0
+    # DIAG: stitch-fidelity trace. Reconstructs V's actual KV-cache token
+    # sequence by replaying each call's writes + admission splices, then
+    # at entry to every extension call (N>0) compares against the
+    # orchestrator-provided `sub[:cum_post]`. A mismatch means
+    # Phase 4 stitching has placed V's cache content somewhere different
+    # from what the trainer's plan accounting assumes — making every
+    # downstream `new_content_start_in_sub = cum_post` slice off by the
+    # mismatch length. Gated on KVE_TRACE_STITCH=1.
+    stitch_trace = os.environ.get("KVE_TRACE_STITCH", "") == "1"
+    expected_v_cache_tokens: list[int] = []
+    if stitch_trace:
+        import sys as _sys
+        print(
+            f"[STITCH-START] _build_pre_trim_plan: {len(calls)} calls",
+            file=_sys.stderr, flush=True,
+        )
+    for call_idx, call in enumerate(calls):
+        sub = list(call.submitted_prompt_ids)
+        comp = list(call.completion_ids)
+        # vLLM auto-pad: filler tokens vLLM appended to its KV cache at
+        # finish-time so the trailing block lands in the prefix cache.
+        # Empty when auto-pad did not fire for this call. They live at
+        # the END of this call's K-cache contribution (after comp).
+        trailing_pad = list(getattr(call, "trailing_pad_ids", None) or [])
+        sub_len = len(sub)
+        comp_len = len(comp)
+        pad_len = len(trailing_pad)
+
+        events = list(call.compaction_events or [])
+        for e in events:
+            assert int(e.num_output_tokens_at_compaction) == 0, (
+                "per_call_segmented_forward got a mid-generation event "
+                f"(call {call_idx}); upstream dispatcher must route "
+                "mid-gen samples to legacy segmented_forward."
+            )
+        admission_events = [
+            e for e in events
+            if int(e.num_output_tokens_at_compaction) == 0
+            and int(e.tokens_evicted) > 0
+        ]
+        # Synthetic events are emitted whenever vLLM's prefix cache
+        # returned a non-empty match. They carry nuf_len =
+        # num_prompt - cached_tokens (= where V's prefill begins). The
+        # admission event's nuf_len reflects something different (tokens
+        # past last turn boundary marker), so we always prefer the
+        # synthetic event's nuf_len. position_offset_after may be 0 (for
+        # non-inheritor cache hits) or > 0 (inheritor); both forms encode
+        # the same cached_tokens info via nuf_len.
+        synthetic_events = [
+            e for e in events
+            if int(e.num_output_tokens_at_compaction) == 0
+            and int(e.tokens_evicted) == 0
+        ]
+
+        # Determine where this call's NEW content starts in sub.
+        # Call 0: starts at 0 (whole sub is new).
+        # Extension call: this call's submitted_prompt_ids reconstructs
+        # the prior calls' POST-TRIM content (= what V sees after
+        # admissions) followed by completions and the new_user_fragment.
+        # The orchestrator's stitching guarantees that sub[:cum_post]
+        # matches the prior calls' POST-TRIM contribution (= cum_post is
+        # the post-trim cumulative length we've accumulated so far). The
+        # NEW content this call adds (in pre-trim) is sub[cum_post:] +
+        # completion_ids. Prior calls' PRE-TRIM content (including any
+        # tokens evicted by their admissions) is already in pre_trim_ids
+        # from the prior call's append; we do NOT reproduce it here.
+        if call_idx == 0:
+            new_content_start_in_sub = 0
+            call_pre_start = 0
+        else:
+            # In the post-trim frame, this call's sub must start with the
+            # orchestrator's accumulated prefix (= V's prev_kept_state).
+            # Note: admissions in this call evict tokens from V's PRIOR
+            # cache content (the prev_kept region of sub) BEFORE V
+            # prefills the new content. After Phase A in the orchestrator,
+            # the merged sample's POST-TRIM cumulative arrays already
+            # reflect this admission deletion (extend_sample applied it).
+            # So `sub[:cum_post]` matches the sample's accumulated
+            # POST-TRIM content AT THIS CALL'S ENTRY — the stitching
+            # invariant continues to hold call-locally.
+            assert sub_len >= cum_post, (
+                f"extension call {call_idx}: sub_len={sub_len} < "
+                f"cum_post={cum_post} (orchestrator stitching invariant)"
+            )
+            new_content_start_in_sub = cum_post
+            call_pre_start = cum_pre
+
+            # DIAG: token-equality check between orchestrator's sub[:cum_post]
+            # (= what stitching SAYS V's cache holds) and trainer's replayed
+            # V cache (= what V actually wrote). Run before any append so the
+            # log surfaces the precise divergence position.
+            if stitch_trace:
+                import sys as _sys
+                actual = sub[:cum_post]
+                expected = expected_v_cache_tokens
+                if expected != actual:
+                    exp_len = len(expected)
+                    act_len = len(actual)
+                    min_len = min(exp_len, act_len)
+                    first_diff = next(
+                        (i for i in range(min_len) if expected[i] != actual[i]),
+                        min_len,
+                    )
+                    lo = max(0, first_diff - 8)
+                    hi = min(max(exp_len, act_len), first_diff + 8)
+                    print(
+                        f"[STITCH-MISMATCH] call={call_idx}  "
+                        f"exp_len={exp_len}  act_len={act_len}  "
+                        f"first_diff={first_diff}  "
+                        f"expected[{lo}:{hi}]={expected[lo:hi]}  "
+                        f"actual[{lo}:{hi}]={actual[lo:hi]}",
+                        file=_sys.stderr, flush=True,
+                    )
+                else:
+                    print(
+                        f"[STITCH-OK] call={call_idx}  cum_post={cum_post}",
+                        file=_sys.stderr, flush=True,
+                    )
+
+        # Append this call's new pre-trim content. For extension calls
+        # following an admission, sub[cum_post:] is everything past the
+        # accumulated POST-TRIM prefix (= new_user_fragment + any other
+        # NEW tokens beyond prior completion). Auto-pad fillers (when
+        # present) sit at the END of the contribution — V's auto-pad
+        # forward wrote them last in its request, so the trainer must
+        # too so persistent_cache layout matches V's.
+        pre_trim_ids.extend(sub[new_content_start_in_sub:])
+        pre_trim_ids.extend(comp)
+        pre_trim_ids.extend(trailing_pad)
+        call_pre_end = len(pre_trim_ids)
+        contrib_pre_len = call_pre_end - call_pre_start
+
+        # Determine inherited_end_pre = boundary where this call's NEW
+        # content (= what V's prefill writes, NOT what was inherited
+        # via prefix cache) begins.
+        #
+        # Inheritor (synthetic event present): cached_tokens =
+        # sub_len - synthetic_nuf_len. The synthetic event is emitted
+        # ONLY when get_computed_blocks returned inherited_offset > 0.
+        # Its nuf_len = num_prompt - num_new_local_computed_tokens =
+        # exact "new tokens past inheritance".
+        #
+        # Non-inheritor with admission (no synthetic event): the
+        # admission event's nuf_len reflects "tokens past last turn
+        # boundary" (= generation prompt marker length, typically ~4),
+        # NOT the cached-tokens boundary. For this case V's prefix
+        # cache may still match prior content (offset 0 chain). Without
+        # the cached_tokens info in the wire, we conservatively place
+        # the boundary at sub_len - admission_nuf_len (= just before
+        # the generation prompt). This produces a wider warmup region
+        # than V's actual cached_tokens, so warmup K at positions
+        # [cached_tokens, sub_len - nuf) will differ from V's prefill
+        # K at those positions (attention context includes the eventually-
+        # evicted region). This is a known limitation; the bulk of
+        # admissions (= inheritors) hit the synthetic-event path.
+        if synthetic_events:
+            nuf_len = int(synthetic_events[-1].new_user_fragment_len)
+            inherited_end_in_sub = sub_len - nuf_len
+        elif admission_events:
+            nuf_len = int(admission_events[-1].new_user_fragment_len)
+            inherited_end_in_sub = sub_len - nuf_len
+        else:
+            nuf_len = 0
+            inherited_end_in_sub = sub_len  # no admission, no split
+        if admission_events:
+            if nuf_len <= 0:
+                raise ValueError(
+                    f"call {call_idx}: nuf_len must be > 0 on admission, "
+                    f"got {nuf_len}"
+                )
+            if inherited_end_in_sub <= 0:
+                raise ValueError(
+                    f"call {call_idx}: inherited_end_in_sub="
+                    f"{inherited_end_in_sub} (sub_len={sub_len}, "
+                    f"nuf={nuf_len})"
+                )
+            inherited_end_pre = call_pre_start + inherited_end_in_sub
+        else:
+            inherited_end_pre = call_pre_start  # no warmup needed
+
+        # Build splice list. event.evict_start is in the post-prior-iter
+        # sub coord (composition matches `_apply_admission_trim`).
+        #
+        # Interpretation depends on call_idx:
+        # - call 0: admission fires INTRA-call (V evicts mid-prefill).
+        #   es is in this call's PRE-TRIM contribution coord; the eviction
+        #   removes K rows [es, es+te) from the SAME call's prefill cache.
+        # - call N>0: admission fires BETWEEN calls (V evicts from its
+        #   live cache before prefilling new content). es is in CURRENT
+        #   sub coord, which (for the prev_kept region) equals the cache
+        #   index coord (= POST-TRIM cumulative through prior calls).
+        #
+        # Important (Phase A.3 reverted): the orchestrator does NOT
+        # delete admission ranges from the merged sample's arrays, so
+        # mb.input_ids is PRE-TRIM cumulative (= pre_trim_ids). Each
+        # call's logits cover its full pre-trim contribution; loss is
+        # computed in pre-trim cumulative (= cum_pre) coordinates.
+        # `cum_post` is still tracked because it's what V uses to compute
+        # `new_content_start_in_sub` for the next call's sub layout.
+        splices: list[tuple[int, int]] = []
+        for ev in admission_events:
+            es = int(ev.evict_start)
+            te = int(ev.tokens_evicted)
+            if es < 0 or te <= 0:
+                raise ValueError(
+                    f"call {call_idx}: bad event evict_start={es}, "
+                    f"tokens_evicted={te}"
+                )
+            splices.append((es, te))
+        total_evicted = sum(te for (_, te) in splices)
+
+        # Loss positions: pre-trim cumulative frame (matches mb.input_ids).
+        # Auto-pad fillers were not sampled — exclude them from the loss
+        # frame. The K-cache forward still WRITES K at the pad positions
+        # (for layout match with V), but the resulting logits at those
+        # positions are dropped before loss_fn is called.
+        post_start = call_pre_start
+        post_end = call_pre_end - pad_len
+        # `kept_in_call` is the full pre-trim contribution minus trailing
+        # pad; subsetting (for B.2a's two-phase warmup) is handled inside
+        # per_call_segmented_forward via dummy padding at the evict gap.
+        kept_in_call = list(range(contrib_pre_len - pad_len))
+
+        if call_idx > 0 and splices:
+            # Defensive: each event's es is in post-prior-iter cache coord.
+            running_cache_len = cum_post
+            for (es, te) in splices:
+                assert es + te <= running_cache_len, (
+                    f"call {call_idx}: admission [{es},{es+te}) extends past "
+                    f"running cache length {running_cache_len}"
+                )
+                running_cache_len -= te
+
+        # writer_offset: the inheritance offset of the WRITER whose K
+        # this call inherits via prefix cache. For an inheritor (chain
+        # cb_offset > 0), vLLM emits a synthetic event with
+        # position_offset_after = inherited_offset. Trainer's warmup
+        # must rotate K at the writer's frame (= physical + writer_offset
+        # for post-sys slots) to match V's cached K. For first-generation
+        # admissions (no synthetic, or synthetic with offset 0) this is 0.
+        writer_offset = 0
+        if synthetic_events:
+            writer_offset = int(synthetic_events[-1].position_offset_after)
+        # admission_offset_after: V's final position_offset after this
+        # call's admission (= writer_offset + total_evicted, used by the
+        # MAIN forward to rotate new prefill K at V's post-admission frame).
+        admission_offset_after = (
+            int(admission_events[-1].position_offset_after)
+            if admission_events else 0
+        )
+        # evict_start of the admission boundary in sub coord (= block-
+        # aligned sys boundary, the piecewise split point for warmup
+        # positions when writer_offset > 0). For inheritor admissions
+        # this is the same across all admission iterations.
+        evict_start_in_sub = (
+            int(admission_events[0].evict_start)
+            if admission_events else 0
+        )
+        # The worker gates position_offset application at the protected
+        # prefix boundary. Synthetic prefix-cache events carry this same
+        # block-aligned boundary even on calls with no admission, so prefer
+        # them whenever present.
+        protected_prefix_len = (
+            int(synthetic_events[-1].evict_start)
+            if synthetic_events else evict_start_in_sub
+        )
+
+        # sub_end_pre: pre-trim position where this call's NEW sub
+        # content ends and comp begins. V re-prefills every token in
+        # [new_content_start_in_sub..sub_len) of sub before admission
+        # fires, so for the B.2a warmup-then-splice path the warmup
+        # must cover the FULL re-prefill region (not just up to
+        # inherited_end_pre) — otherwise survivor K rows past
+        # inherited_end_pre would be written under post-splice
+        # attention context, and the splice itself can run off the
+        # end of the warmup output when V's evict range extends
+        # into the new_user_fragment.
+        sub_end_pre = call_pre_start + (sub_len - new_content_start_in_sub)
+
+        plans.append({
+            "call_idx": call_idx,
+            "call_pre_start": call_pre_start,
+            "call_pre_end": call_pre_end,
+            "inherited_end_pre": inherited_end_pre,
+            "sub_end_pre": sub_end_pre,
+            "has_admission": len(admission_events) > 0,
+            "splices": splices,  # [(es, te), ...] in CURRENT sub coord
+            "post_start": post_start,
+            "post_end": post_end,
+            "kept_in_call": kept_in_call,  # pre-trim positions WITHIN
+                                            # this call's contribution
+                                            # that survive admission
+            "new_content_start_in_sub": new_content_start_in_sub,
+            "sub_len": sub_len,
+            "comp_len": comp_len,
+            "contrib_pre_len": contrib_pre_len,
+            "nuf_len": (int(admission_events[-1].new_user_fragment_len)
+                        if admission_events else 0),
+            "writer_offset": writer_offset,
+            "admission_offset_after": admission_offset_after,
+            "evict_start_in_sub": evict_start_in_sub,
+            "protected_prefix_len": protected_prefix_len,
+            "pad_len": pad_len,
+            "synthetic_num_prompt": (
+                int(synthetic_events[-1].num_prompt_tokens)
+                if synthetic_events else None
+            ),
+            "synthetic_nuf_len": (
+                int(synthetic_events[-1].new_user_fragment_len)
+                if synthetic_events else None
+            ),
+            "synthetic_cached_tokens": (
+                int(synthetic_events[-1].num_prompt_tokens)
+                - int(synthetic_events[-1].new_user_fragment_len)
+                if synthetic_events else None
+            ),
+            "synthetic_offset_after": (
+                int(synthetic_events[-1].position_offset_after)
+                if synthetic_events else None
+            ),
+            "admission_num_prompt": (
+                int(admission_events[-1].num_prompt_tokens)
+                if admission_events else None
+            ),
+            "admission_nuf_len": (
+                int(admission_events[-1].new_user_fragment_len)
+                if admission_events else None
+            ),
+            "admission_total_evicted": total_evicted,
+            "admission_event_offset_after": (
+                int(admission_events[-1].position_offset_after)
+                if admission_events else None
+            ),
+        })
+        # ── DIAG: log per-call cache-state accounting vs V's wire events.
+        # Compares trainer's cum_post (= predicted V cache state) against
+        # V's reported cached_tokens (= num_prompt - synthetic.nuf_len) and
+        # surfaces a per-call delta. The first call where delta != 0 is
+        # where trainer and V have fallen out of sync.
+        if os.environ.get("KVE_TRACE_CACHE_DELTA", "") == "1":
+            v_cached_tokens = None
+            if synthetic_events:
+                v_np = int(synthetic_events[-1].num_prompt_tokens)
+                v_nuf = int(synthetic_events[-1].new_user_fragment_len)
+                v_cached_tokens = v_np - v_nuf
+            cum_post_in = cum_post
+            cum_post_out = cum_post - total_evicted + contrib_pre_len
+            delta = (cum_post_in - v_cached_tokens
+                     if v_cached_tokens is not None else None)
+            logger.warning(
+                "[CACHE-TRACE] call=%d  trainer_cum_post_in=%d  "
+                "v_cached_tokens=%s  delta=%s  sub_len=%d  pad_len=%d  "
+                "total_evicted=%d  contrib_pre_len=%d  cum_post_out=%d",
+                call_idx, cum_post_in,
+                str(v_cached_tokens), str(delta),
+                sub_len, pad_len, total_evicted,
+                contrib_pre_len, cum_post_out,
+            )
+
+        # DIAG: B.2a-specific trace. Catastrophic L1+ outliers in the
+        # textworld testbed concentrate on single-call samples with
+        # call 0 admission (B.2a path). Log enough to determine whether
+        # `inherited_end_pre` matches V's actual cached_tokens, and
+        # whether the splice/offset chain on this call is well-formed.
+        if os.environ.get("KVE_TRACE_B2A", "") == "1" and call_idx == 0 and admission_events:
+            import sys as _sys
+            v_cached_tokens = None
+            v_num_prompt = None
+            v_synth_nuf = None
+            if synthetic_events:
+                v_num_prompt = int(synthetic_events[-1].num_prompt_tokens)
+                v_synth_nuf = int(synthetic_events[-1].new_user_fragment_len)
+                v_cached_tokens = v_num_prompt - v_synth_nuf
+            adm_es = int(admission_events[0].evict_start)
+            adm_te = int(admission_events[0].tokens_evicted)
+            adm_nuf = int(admission_events[-1].new_user_fragment_len)
+            adm_offset_after = int(admission_events[-1].position_offset_after)
+            trainer_inherited_end = inherited_end_pre
+            delta_inh_vs_cached = (
+                trainer_inherited_end - v_cached_tokens
+                if v_cached_tokens is not None else None
+            )
+            print(
+                f"[B2A] sub_len={sub_len}  comp_len={comp_len}  "
+                f"pad_len={pad_len}  "
+                f"adm:(es={adm_es},te={adm_te},nuf={adm_nuf},off_aft={adm_offset_after})  "
+                f"synth:({'yes' if synthetic_events else 'no'},"
+                f"np={v_num_prompt},nuf={v_synth_nuf},cached={v_cached_tokens})  "
+                f"trainer:(inh_end_pre={trainer_inherited_end},"
+                f"sub_end_pre={sub_end_pre},"
+                f"writer_off={writer_offset},"
+                f"protected_pref={protected_prefix_len})  "
+                f"delta(inh_end - cached)={delta_inh_vs_cached}",
+                file=_sys.stderr, flush=True,
+            )
+
+        cum_pre = call_pre_end
+        # cum_post tracks V's cumulative cache state after this call
+        # (used by the NEXT call's plan to compute
+        # new_content_start_in_sub). It evolves as:
+        #   cum_post[N] = cum_post[N-1] - admission_te[N] + contrib_pre[N]
+        cum_post = cum_post - total_evicted + contrib_pre_len
+
+        # DIAG: replay this call's writes + splices into the running
+        # expected V cache. Mirrors per_call_segmented_forward's actual
+        # B.2a / B.2b / extension paths so the running token list ends
+        # up byte-equal to what V's cache holds at this call's end.
+        if stitch_trace:
+            if call_idx == 0 and splices:
+                # B.2a: warmup writes full sub_N, then splice removes
+                # rows in pre-trim contribution coord, then main writes
+                # comp + pad.
+                expected_v_cache_tokens.extend(sub)
+                for (es, te) in splices:
+                    del expected_v_cache_tokens[es : es + te]
+                expected_v_cache_tokens.extend(comp)
+                expected_v_cache_tokens.extend(trailing_pad)
+            elif splices:
+                # B.2b: splice removes rows in cumulative cache coord,
+                # then main writes sub[new_start:] + comp + pad.
+                for (es, te) in splices:
+                    del expected_v_cache_tokens[es : es + te]
+                expected_v_cache_tokens.extend(
+                    sub[new_content_start_in_sub:]
+                )
+                expected_v_cache_tokens.extend(comp)
+                expected_v_cache_tokens.extend(trailing_pad)
+            else:
+                # Extension (no admission): plain append of new content.
+                expected_v_cache_tokens.extend(
+                    sub[new_content_start_in_sub:]
+                )
+                expected_v_cache_tokens.extend(comp)
+                expected_v_cache_tokens.extend(trailing_pad)
+            assert len(expected_v_cache_tokens) == cum_post, (
+                f"[STITCH-INTERNAL] call={call_idx} replay length="
+                f"{len(expected_v_cache_tokens)} != cum_post={cum_post}"
+            )
+    return plans, pre_trim_ids
+
+
+def _maybe_dump_trainer_kv(
+    persistent_cache: DynamicCache,
+    *,
+    call_idx: int,
+    is_last_call: bool,
+    pre_trim_ids: list[int],
+    pre_trim_through: int,
+    cache_token_ids: list[int] | None,
+    cache_position_ids: list[int] | None,
+    position_ids_this_call: list[int],
+    new_tokens_this_call: list[int],
+) -> None:
+    """Optional K/V cache dump for V-vs-T cache divergence diagnosis.
+
+    Gated on env vars (see debug/local_kl_diag.py):
+      - KVE_DUMP_TRAINER_K=<path>: enable, write to <path>
+      - KVE_DUMP_TRAINER_CALL_IDX=<int>[,<int>...]: dump after these calls
+        (0-indexed within this per_call invocation); default = last call only
+      - KVE_DUMP_LAYERS=<csv ints>: subset of layer indices (default all)
+    """
+    import os as _os
+    dump_path = _os.environ.get("KVE_DUMP_TRAINER_K", "")
+    if not dump_path:
+        return
+    dump_call_idx_s = _os.environ.get("KVE_DUMP_TRAINER_CALL_IDX", "")
+    if dump_call_idx_s != "":
+        target_idxs = {
+            int(x.strip())
+            for x in dump_call_idx_s.split(",")
+            if x.strip()
+        }
+        fire = call_idx in target_idxs
+    else:
+        target_idxs = set()
+        fire = is_last_call
+    if not fire:
+        return
+    if len(target_idxs) > 1 or _os.environ.get(
+        "KVE_DUMP_TRAINER_K_INCLUDE_CALL", ""
+    ) == "1":
+        root, ext = _os.path.splitext(dump_path)
+        if not ext:
+            ext = ".pt"
+        dump_path = f"{root}_C{call_idx}{ext}"
+    _keys, _values = _get_kv_from_cache(persistent_cache)
+    _layers_env = _os.environ.get("KVE_DUMP_LAYERS", "")
+    if _layers_env:
+        _layer_idxs = [int(x) for x in _layers_env.split(",") if x.strip()]
+    else:
+        _layer_idxs = list(range(len(_keys)))
+    K_per_layer = [
+        _keys[l].detach().to(torch.float32).cpu() for l in _layer_idxs
+    ]
+    V_per_layer = [
+        _values[l].detach().to(torch.float32).cpu() for l in _layer_idxs
+    ]
+    payload = {
+        "K": K_per_layer[0],
+        "V": V_per_layer[0],
+        "K_per_layer": K_per_layer,
+        "V_per_layer": V_per_layer,
+        "layer_idxs": _layer_idxs,
+        "num_layers_total": len(_keys),
+        "call_idx": call_idx,
+        "position_ids_this_call": position_ids_this_call,
+        "new_tokens_this_call": new_tokens_this_call,
+        "merged_input_ids_so_far": pre_trim_ids[:pre_trim_through],
+        "cache_token_ids": (
+            list(cache_token_ids) if cache_token_ids is not None else None
+        ),
+        "cache_position_ids": (
+            list(cache_position_ids) if cache_position_ids is not None else None
+        ),
+    }
+    torch.save(payload, dump_path)
+    logger.warning(
+        "[T-dump] wrote %d layers (of %d); layer 0 K=%s V=%s "
+        "after trainer call %d -> %s",
+        len(_layer_idxs), len(_keys),
+        tuple(K_per_layer[0].shape), tuple(V_per_layer[0].shape),
+        call_idx, dump_path,
+    )
+
+
+def per_call_segmented_forward(
+    model: torch.nn.Module,
+    calls: list,  # list[CallWire]
+    merged_input_ids: Tensor,  # [1, post_trim_full_len], post-trim (used for dummy passes only)
+    merged_position_ids: Tensor,  # [1, post_trim_full_len] (dummy passes only)
+    loss_fn: SegmentLossFn,
+    *,
+    max_forward_passes: int,
+    max_bptt_window_forward_passes: list[int] | None = None,
+    bptt_segments: int | None = 1,
+    device: torch.device,
+) -> dict:
+    """Per-call forward with PRE-TRIM input + cache splice on admission.
+
+    Mirrors vLLM exactly: trainer's K cache at any logical position is
+    written under the SAME attention context vLLM's writer used at that
+    position. The eviction is realized via splice of the persistent_cache
+    (the way vLLM evicts in HBM), not by trimming the input tokens (the
+    old approach, which broke L1+ K values at the first post-eviction
+    slot — see debug/local_kl_diag.py + compare_kv.py).
+
+    For an ADMISSION call (>=1 admission event with tokens_evicted > 0):
+      1. Warmup forward over [call_pre_start, inherited_end_pre) — the
+         inherited part of submitted_prompt. K cache fills under full
+         pre-admission causal attention.
+      2. Splice persistent_cache for each admission event in order
+         (sequential composition matches _apply_admission_trim).
+      3. Main forward over [inherited_end_pre, call_pre_end) — the
+         new_user_fragment + completion. Attention sees the spliced cache
+         + freshly-written K, matching vLLM's post-admission state.
+      4. Concatenate logits: warmup logits (subset to surviving pre-trim
+         positions) ++ main logits → length matches the call's post-trim
+         contribution to merged_input_ids.
+
+    For an EXTENSION call (no admission, second+ call in a multi-call
+    sample): single forward over the call's NEW pre-trim content (the
+    tokens beyond what prior calls' forwards already wrote to cache).
+
+    Positions use plain arange + pre-trim absolute offset while the request
+    stays in the local frame. When vLLM reports an inherited or
+    post-admission position_offset, the trainer switches to the same
+    physical-position + piecewise-offset rule the worker uses so cached K
+    and newly-written Q/K stay in the writer's RoPE frame.
+    """
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
+    if not calls:
+        raise ValueError("per_call_segmented_forward requires non-empty calls list")
+    if bptt_segments is not None and bptt_segments < 1:
+        raise ValueError(f"bptt_segments must be None or >= 1, got {bptt_segments}")
+    bptt_windowed = bptt_segments != 1
+
+    plans, pre_trim_ids_py = _build_pre_trim_plan(calls)
+    pre_trim_total = len(pre_trim_ids_py)
+    pre_trim_ids = torch.tensor(
+        pre_trim_ids_py, device=device, dtype=torch.long,
+    ).unsqueeze(0)
+
+    n_forwards_run = 0
+    accumulated_loss = 0.0
+    window_loss: Tensor | None = None
+    calls_in_window = 0
+    forwards_in_window = 0
+    bptt_window_idx = 0
+    persistent_cache: DynamicCache = DynamicCache()
+    # Token id map for the live DynamicCache slots after admission splices.
+    # `pre_trim_ids` is useful for loss coordinates, but after an admission
+    # eviction it no longer matches physical cache slots.
+    cache_token_ids_py: list[int] = []
+    cache_position_ids_py: list[int] = []
+    mirror_decode = os.environ.get("KVE_TRAINER_MIRROR_VLLM_DECODE", "0") == "1"
+    mirror_decode_filter_env = os.environ.get(
+        "KVE_TRAINER_MIRROR_DECODE_CALL_IDX", ""
+    )
+    mirror_decode_call_filter = None
+    if mirror_decode_filter_env:
+        mirror_decode_call_filter = {
+            int(x.strip())
+            for x in mirror_decode_filter_env.split(",")
+            if x.strip()
+        }
+    mirror_decode_last_n = int(
+        os.environ.get("KVE_TRAINER_MIRROR_DECODE_LAST_N", "0") or "0"
+    )
+    stream_mirror_decode_loss = (
+        os.environ.get("KVE_TRAINER_STREAM_MIRROR_LOSS", "1") != "0"
+    )
+    if bptt_windowed and mirror_decode and stream_mirror_decode_loss:
+        logger.warning(
+            "KVE_TRAINER_STREAM_MIRROR_LOSS is disabled when "
+            "per_call_segmented_forward runs with bptt_segments=%s; "
+            "losses must stay live until the BPTT window backward.",
+            str(bptt_segments),
+        )
+        stream_mirror_decode_loss = False
+    base_attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
+    past_attn_impl = os.environ.get("KVE_TRAINER_PAST_ATTN_IMPL", "") or None
+    trace_b2b = os.environ.get("KVE_TRACE_B2B", "") == "1"
+    trace_call_filter_env = os.environ.get("KVE_TRACE_CALL_IDX", "")
+    trace_call_filter = None
+    if trace_call_filter_env:
+        trace_call_filter = {
+            int(x.strip())
+            for x in trace_call_filter_env.split(",")
+            if x.strip()
+        }
+    trace_forward_sig = os.environ.get("KVE_TRACE_FORWARD_SIG", "0") == "1"
+
+    def _add_window_loss(loss_val: Tensor) -> None:
+        nonlocal accumulated_loss, window_loss
+        accumulated_loss += float(loss_val.detach().item())
+        if not bptt_windowed:
+            loss_val.backward()
+            return
+        window_loss = loss_val if window_loss is None else window_loss + loss_val
+
+    def _flush_bptt_window(force: bool = False) -> None:
+        nonlocal window_loss, calls_in_window, forwards_in_window
+        nonlocal bptt_window_idx, persistent_cache
+        if not bptt_windowed:
+            return
+        if not force and calls_in_window <= 0:
+            return
+        target_forwards = forwards_in_window
+        if max_bptt_window_forward_passes is not None:
+            if bptt_window_idx >= len(max_bptt_window_forward_passes):
+                raise ValueError(
+                    "max_bptt_window_forward_passes is shorter than the "
+                    f"local BPTT windows: idx={bptt_window_idx}, "
+                    f"len={len(max_bptt_window_forward_passes)}"
+                )
+            target_forwards = int(max_bptt_window_forward_passes[bptt_window_idx])
+        if target_forwards < forwards_in_window:
+            raise ValueError(
+                "max_bptt_window_forward_passes must be >= local forwards "
+                f"for each window, got target={target_forwards}, "
+                f"local={forwards_in_window}, window={bptt_window_idx}"
+            )
+        for _ in range(target_forwards - forwards_in_window):
+            dummy_loss = _dummy_forward_loss(
+                model,
+                merged_input_ids,
+                merged_position_ids,
+            )
+            window_loss = (
+                dummy_loss if window_loss is None else window_loss + dummy_loss
+            )
+        if window_loss is not None:
+            window_loss.backward()
+            window_loss = None
+        persistent_cache = _detach_dynamic_cache(persistent_cache)
+        calls_in_window = 0
+        forwards_in_window = 0
+        bptt_window_idx += 1
+
+    def _finish_call(loss_val: Tensor, n_forwards: int) -> None:
+        nonlocal n_forwards_run, calls_in_window, forwards_in_window
+        nonlocal persistent_cache
+        _add_window_loss(loss_val)
+        n_forwards_run += n_forwards
+        if bptt_windowed:
+            calls_in_window += 1
+            forwards_in_window += n_forwards
+            if bptt_segments is not None and calls_in_window >= bptt_segments:
+                _flush_bptt_window()
+        else:
+            # Detach the cache so the next call's backward stops at this
+            # call boundary (bptt_segments=1 / M3 semantics).
+            persistent_cache = _detach_dynamic_cache(persistent_cache)
+
+    for plan in plans:
+        call_idx = plan["call_idx"]
+        cps = plan["call_pre_start"]
+        cpe = plan["call_pre_end"]
+        ie_pre = plan["inherited_end_pre"]
+        has_admission = plan["has_admission"]
+        splices = plan["splices"]
+        post_start = plan["post_start"]
+        post_end = plan["post_end"]
+        kept_in_call = plan["kept_in_call"]
+        writer_offset = plan["writer_offset"]
+        admission_offset_after = plan["admission_offset_after"]
+        evict_start_in_sub = plan["evict_start_in_sub"]
+        protected_prefix_len = plan.get("protected_prefix_len", evict_start_in_sub)
+        pad_len = plan.get("pad_len", 0)
+        sub_end_pre = plan.get("sub_end_pre", plan["inherited_end_pre"])
+        trace_this_call = (
+            trace_b2b
+            and (trace_call_filter is None or call_idx in trace_call_filter)
+        )
+        trace_forward_this_call = (
+            trace_forward_sig
+            and (trace_call_filter is None or call_idx in trace_call_filter)
+        )
+        mirror_decode_has_filter = (
+            mirror_decode_call_filter is not None or mirror_decode_last_n > 0
+        )
+        mirror_decode_this_call = mirror_decode and (
+            not mirror_decode_has_filter
+            or (
+                mirror_decode_call_filter is not None
+                and call_idx in mirror_decode_call_filter
+            )
+            or (
+                mirror_decode_last_n > 0
+                and call_idx >= max(0, len(calls) - mirror_decode_last_n)
+            )
+        )
+
+        if cpe <= cps:
+            continue  # empty contribution
+
+        if has_admission and cps > 0:
+            # ── B.2b: splice-only path for admission in extension calls.
+            #
+            # When admission fires in call N>0, V's KV cache at the start
+            # of this call already contains K written by prior calls (=
+            # by the trainer's own prior call forwards in this sample).
+            # V's admission evicts rows from that live cache BEFORE
+            # prefilling new content; the trainer mirrors this exactly
+            # by splicing `persistent_cache` then running a single main
+            # forward over [cps..cpe).
+            #
+            # No warmup needed — the cache K rows for the surviving
+            # prior content were written by THIS sample's prior call
+            # forwards under their pre-trim logical positions (matching
+            # V's writer). The splice removes the same rows V removed.
+            #
+            # Multi-event composition: each event's es is in
+            # post-prior-iter cache coord (matches `_apply_admission_trim`);
+            # successive splices operate on the running cache state.
+            # Invariant: trainer's cache length at entry to an extension
+            # call equals the prior calls' POST-TRIM cumulative length
+            # (since prior admissions already shrunk the cache via the
+            # two-phase warmup / splice in their own calls). For the
+            # very first multi-call admission case (where prior calls
+            # had no admissions) this length equals cps (= cum_pre).
+            # B.2b: splice cache first, then single forward over the new
+            # contribution (sub[cum_post:] + comp). Reorder attempts
+            # (re-prefill new content with pre-admission attention before
+            # splicing) measurably regressed production KL — likely
+            # because they expose more partial-tail batch-shape FA2
+            # numerical drift than they remove. Keep the splice-first
+            # design until the drift is measured directly.
+            b2b_warmup_splice = (
+                os.environ.get("KVE_TRAINER_B2B_WARMUP_SPLICE", "0") == "1"
+            )
+            cache_len_before_splice = persistent_cache.get_seq_length()
+            if b2b_warmup_splice:
+                # Diagnostic mirror of vLLM's synthetic prefill + admission:
+                # write the newly submitted prompt tail against the pre-splice
+                # cache, then splice, then write generated/pad tokens against
+                # the post-admission cache. Positions are computed from
+                # physical cache slots plus the relevant vLLM offset.
+                warm_end = sub_end_pre
+                warm_logits_detached: torch.Tensor | None = None
+                warm_n_forwards = 0
+                if warm_end > cps:
+                    w_toks = pre_trim_ids[:, cps:warm_end]
+                    if writer_offset != 0:
+                        w_pos = _piecewise_positions(
+                            cache_len_before_splice,
+                            cache_len_before_splice + (warm_end - cps),
+                            offset=writer_offset,
+                            protected_prefix_len=protected_prefix_len,
+                            device=device,
+                        )
+                    else:
+                        w_pos = (
+                            torch.arange(
+                                warm_end - cps,
+                                device=device,
+                                dtype=torch.long,
+                            )
+                            + cps
+                        ).unsqueeze(0)
+                    cache_before_warm = persistent_cache.get_seq_length()
+                    out_w = _model_forward_with_optional_attn_switch(
+                        model,
+                        input_ids=w_toks,
+                        position_ids=w_pos,
+                        past_key_values=persistent_cache,
+                        base_attn_impl=base_attn_impl,
+                        past_attn_impl=past_attn_impl,
+                    )
+                    w_log = _extract_logits(out_w)
+                    warm_logits_detached = w_log if bptt_windowed else w_log.detach()
+                    if not bptt_windowed:
+                        (w_log.float().mean() * 0.0).backward()
+                    warm_n_forwards = 1
+                    if trace_forward_this_call:
+                        tok_head, tok_tail = _preview_1d(w_toks, 0, warm_end - cps)
+                        pos_head, pos_tail = _preview_1d(w_pos, 0, warm_end - cps)
+                        logger.warning(
+                            "[T-FWD-SIG] label=C%d:B2B-warm chunk=[%d,%d) "
+                            "len=%d cache=%d->%d prompt_len=%d pad_len=%d "
+                            "mirror=%s attn_override=%s pos_head=%s "
+                            "pos_tail=%s tok_head=%s tok_tail=%s",
+                            call_idx, cps, warm_end, warm_end - cps,
+                            cache_before_warm, persistent_cache.get_seq_length(),
+                            warm_end - cps, 0, False, None,
+                            pos_head, pos_tail, tok_head, tok_tail,
+                        )
+                    cache_token_ids_py.extend(pre_trim_ids_py[cps:warm_end])
+                    cache_position_ids_py.extend(
+                        w_pos[0].detach().cpu().tolist()
+                    )
+                if not bptt_windowed:
+                    persistent_cache = _detach_dynamic_cache(persistent_cache)
+
+                running_cache_len = persistent_cache.get_seq_length()
+                for (es, te) in splices:
+                    assert es + te <= running_cache_len, (
+                        f"call {call_idx} (B.2b-warm): splice "
+                        f"[{es},{es+te}) out of cache (len={running_cache_len})"
+                    )
+                    persistent_cache = _splice_dynamic_cache(
+                        persistent_cache, es, es + te,
+                    )
+                    del cache_token_ids_py[es : es + te]
+                    del cache_position_ids_py[es : es + te]
+                    if trace_forward_this_call:
+                        logger.warning(
+                            "[T-SPLICE-SIG] label=C%d:B2B-warm "
+                            "splice=[%d,%d) cache=%d->%d",
+                            call_idx, es, es + te,
+                            running_cache_len,
+                            persistent_cache.get_seq_length(),
+                        )
+                    running_cache_len -= te
+
+                main_start = warm_end
+                main_tokens = pre_trim_ids[:, main_start:cpe]
+                if admission_offset_after != 0:
+                    physical_start = persistent_cache.get_seq_length()
+                    main_positions = _piecewise_positions(
+                        physical_start,
+                        physical_start + (cpe - main_start),
+                        offset=admission_offset_after,
+                        protected_prefix_len=protected_prefix_len,
+                        device=device,
+                    )
+                else:
+                    main_positions = (
+                        torch.arange(
+                            cpe - main_start,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        + main_start
+                    ).unsqueeze(0)
+                if trace_this_call:
+                    w_pos_1d = (
+                        w_pos[0].detach().cpu().tolist()
+                        if warm_end > cps else []
+                    )
+                    m_pos_1d = main_positions[0].detach().cpu().tolist()
+                    logger.warning(
+                        "[B2B-WARM] call=%d cache_entry=%d splices=%s "
+                        "warm=[%d,%d) main=[%d,%d) cache_after_splice=%d "
+                        "writer_offset=%d admission_offset_after=%d "
+                        "warm_pos_head=%s warm_pos_tail=%s "
+                        "main_pos_head=%s main_pos_tail=%s",
+                        call_idx, cache_len_before_splice, splices,
+                        cps, warm_end, main_start, cpe,
+                        persistent_cache.get_seq_length(),
+                        writer_offset, admission_offset_after,
+                        w_pos_1d[:8], w_pos_1d[-8:],
+                        m_pos_1d[:8], m_pos_1d[-8:],
+                    )
+                if mirror_decode_this_call and stream_mirror_decode_loss:
+                    warm_kept_len = 0
+                    if warm_logits_detached is not None:
+                        warm_kept_len = int(warm_logits_detached.shape[1])
+                        warm_loss = loss_fn(
+                            warm_logits_detached,
+                            post_start,
+                            post_start + warm_kept_len,
+                        )
+                        _backward_loss_or_zero(warm_loss, warm_logits_detached)
+                        accumulated_loss += float(warm_loss.detach().item())
+                    (
+                        persistent_cache,
+                        main_n_forwards,
+                        main_loss,
+                        main_kept_len,
+                    ) = _forward_mirror_decode_stream_loss(
+                        model,
+                        input_ids=main_tokens,
+                        position_ids=main_positions,
+                        past_key_values=persistent_cache,
+                        prompt_len=0,
+                        pad_len=pad_len,
+                        base_attn_impl=base_attn_impl,
+                        past_attn_impl=past_attn_impl,
+                        loss_fn=loss_fn,
+                        full_logit_start=post_start + warm_kept_len,
+                        trace_label=(
+                            f"C{call_idx}:B2B-warm-main"
+                            if trace_forward_this_call else None
+                        ),
+                    )
+                    cache_token_ids_py.extend(pre_trim_ids_py[main_start:cpe])
+                    cache_position_ids_py.extend(
+                        main_positions[0].detach().cpu().tolist()
+                    )
+                    assert warm_kept_len + main_kept_len == post_end - post_start, (
+                        f"call {call_idx} (B.2b-warm): streamed logits len="
+                        f"{warm_kept_len + main_kept_len} != "
+                        f"post_end-post_start={post_end - post_start}"
+                    )
+
+                    _maybe_dump_trainer_kv(
+                        persistent_cache,
+                        call_idx=call_idx,
+                        is_last_call=(call_idx == len(calls) - 1),
+                        pre_trim_ids=pre_trim_ids_py,
+                        pre_trim_through=cpe,
+                        cache_token_ids=cache_token_ids_py,
+                        cache_position_ids=cache_position_ids_py,
+                        position_ids_this_call=(
+                            main_positions[0].detach().cpu().tolist()
+                        ),
+                        new_tokens_this_call=main_tokens[0].detach().cpu().tolist(),
+                    )
+
+                    accumulated_loss += main_loss
+                    n_forwards_run += warm_n_forwards + main_n_forwards
+                    persistent_cache = _detach_dynamic_cache(persistent_cache)
+                    continue
+
+                main_logits, main_n_forwards = _forward_with_optional_decode_mirror(
+                    model,
+                    input_ids=main_tokens,
+                    position_ids=main_positions,
+                    past_key_values=persistent_cache,
+                    prompt_len=0,
+                    pad_len=pad_len,
+                    mirror_decode=mirror_decode_this_call,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                    trace_label=(
+                        f"C{call_idx}:B2B-warm-main"
+                        if trace_forward_this_call else None
+                    ),
+                )
+                cache_token_ids_py.extend(pre_trim_ids_py[main_start:cpe])
+                cache_position_ids_py.extend(
+                    main_positions[0].detach().cpu().tolist()
+                )
+
+                pieces: list[torch.Tensor] = []
+                if warm_logits_detached is not None:
+                    pieces.append(warm_logits_detached)
+                pieces.append(main_logits)
+                kept_logits = torch.cat(pieces, dim=1)
+                assert kept_logits.shape[1] == post_end - post_start, (
+                    f"call {call_idx} (B.2b-warm): kept_logits len="
+                    f"{kept_logits.shape[1]} != post_end-post_start="
+                    f"{post_end - post_start}"
+                )
+
+                _maybe_dump_trainer_kv(
+                    persistent_cache,
+                    call_idx=call_idx,
+                    is_last_call=(call_idx == len(calls) - 1),
+                    pre_trim_ids=pre_trim_ids_py,
+                    pre_trim_through=cpe,
+                    cache_token_ids=cache_token_ids_py,
+                    cache_position_ids=cache_position_ids_py,
+                    position_ids_this_call=main_positions[0].detach().cpu().tolist(),
+                    new_tokens_this_call=main_tokens[0].detach().cpu().tolist(),
+                )
+
+                loss_val = loss_fn(kept_logits, post_start, post_end)
+                _finish_call(loss_val, warm_n_forwards + main_n_forwards)
+                continue
+
+            cache_len_at_entry = cache_len_before_splice
+            for (es, te) in splices:
+                assert es + te <= cache_len_at_entry, (
+                    f"call {call_idx} (B.2b): splice [{es},{es+te}) "
+                    f"out of cache (len={cache_len_at_entry})"
+                )
+                persistent_cache = _splice_dynamic_cache(
+                    persistent_cache, es, es + te,
+                )
+                del cache_token_ids_py[es : es + te]
+                del cache_position_ids_py[es : es + te]
+                if trace_forward_this_call:
+                    logger.warning(
+                        "[T-SPLICE-SIG] label=C%d:B2B "
+                        "splice=[%d,%d) cache=%d->%d",
+                        call_idx, es, es + te,
+                        cache_len_at_entry,
+                        persistent_cache.get_seq_length(),
+                    )
+                cache_len_at_entry -= te
+
+            main_tokens = pre_trim_ids[:, cps:cpe]
+            if admission_offset_after != 0:
+                physical_start = cache_len_at_entry
+                main_positions = _piecewise_positions(
+                    physical_start,
+                    physical_start + (cpe - cps),
+                    offset=admission_offset_after,
+                    protected_prefix_len=protected_prefix_len,
+                    device=device,
+                )
+            else:
+                main_positions = (
+                    torch.arange(cpe - cps, device=device, dtype=torch.long)
+                    + cps
+                ).unsqueeze(0)
+            main_prompt_len = max(0, min(sub_end_pre, cpe) - cps)
+            if trace_this_call:
+                pos_1d = main_positions[0].detach().cpu().tolist()
+                logger.warning(
+                    "[B2B] call=%d cps=%d cpe=%d cache_entry=%d "
+                    "splices=%s cache_after_splice=%d main_tokens=%d "
+                    "main_prompt_len=%d pad_len=%d post_range=[%d,%d) "
+                    "sub_len=%s comp_len=%s sub_end_pre=%d "
+                    "new_content_start_in_sub=%s admission_offset_after=%d "
+                    "writer_offset=%d protected_prefix_len=%d "
+                    "v_synth=(np=%s,nuf=%s,cached=%s,off=%s) "
+                    "v_adm=(np=%s,nuf=%s,evicted=%s,off=%s) "
+                    "positions_head=%s positions_tail=%s",
+                    call_idx, cps, cpe, cache_len_before_splice,
+                    splices, cache_len_at_entry, cpe - cps,
+                    main_prompt_len, pad_len, post_start, post_end,
+                    str(plan.get("sub_len")), str(plan.get("comp_len")),
+                    sub_end_pre, str(plan.get("new_content_start_in_sub")),
+                    admission_offset_after, writer_offset, protected_prefix_len,
+                    str(plan.get("synthetic_num_prompt")),
+                    str(plan.get("synthetic_nuf_len")),
+                    str(plan.get("synthetic_cached_tokens")),
+                    str(plan.get("synthetic_offset_after")),
+                    str(plan.get("admission_num_prompt")),
+                    str(plan.get("admission_nuf_len")),
+                    str(plan.get("admission_total_evicted")),
+                    str(plan.get("admission_event_offset_after")),
+                    pos_1d[:8], pos_1d[-8:],
+                )
+            if mirror_decode_this_call and stream_mirror_decode_loss:
+                (
+                    persistent_cache,
+                    main_n_forwards,
+                    main_loss,
+                    main_kept_len,
+                ) = _forward_mirror_decode_stream_loss(
+                    model,
+                    input_ids=main_tokens,
+                    position_ids=main_positions,
+                    past_key_values=persistent_cache,
+                    prompt_len=main_prompt_len,
+                    pad_len=pad_len,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                    loss_fn=loss_fn,
+                    full_logit_start=post_start,
+                    trace_label=(
+                        f"C{call_idx}:B2B-main"
+                        if trace_forward_this_call else None
+                    ),
+                )
+                cache_token_ids_py.extend(pre_trim_ids_py[cps:cpe])
+                cache_position_ids_py.extend(
+                    main_positions[0].detach().cpu().tolist()
+                )
+                assert main_kept_len == post_end - post_start, (
+                    f"call {call_idx} (B.2b): streamed logits len="
+                    f"{main_kept_len} != post_end-post_start="
+                    f"{post_end - post_start}"
+                )
+
+                _maybe_dump_trainer_kv(
+                    persistent_cache,
+                    call_idx=call_idx,
+                    is_last_call=(call_idx == len(calls) - 1),
+                    pre_trim_ids=pre_trim_ids_py,
+                    pre_trim_through=cpe,
+                    cache_token_ids=cache_token_ids_py,
+                    cache_position_ids=cache_position_ids_py,
+                    position_ids_this_call=main_positions[0].detach().cpu().tolist(),
+                    new_tokens_this_call=main_tokens[0].detach().cpu().tolist(),
+                )
+
+                accumulated_loss += main_loss
+                n_forwards_run += main_n_forwards
+                persistent_cache = _detach_dynamic_cache(persistent_cache)
+                continue
+
+            main_logits, main_n_forwards = _forward_with_optional_decode_mirror(
+                model,
+                input_ids=main_tokens,
+                position_ids=main_positions,
+                past_key_values=persistent_cache,
+                prompt_len=main_prompt_len,
+                pad_len=pad_len,
+                mirror_decode=mirror_decode_this_call,
+                base_attn_impl=base_attn_impl,
+                past_attn_impl=past_attn_impl,
+                trace_label=(
+                    f"C{call_idx}:B2B-main"
+                    if trace_forward_this_call else None
+                ),
+            )
+            cache_token_ids_py.extend(pre_trim_ids_py[cps:cpe])
+            cache_position_ids_py.extend(
+                main_positions[0].detach().cpu().tolist()
+            )
+            assert main_logits.shape[1] == post_end - post_start, (
+                f"call {call_idx} (B.2b): main_logits len="
+                f"{main_logits.shape[1]} != post_end-post_start="
+                f"{post_end - post_start}"
+            )
+
+            _maybe_dump_trainer_kv(
+                persistent_cache,
+                call_idx=call_idx,
+                is_last_call=(call_idx == len(calls) - 1),
+                pre_trim_ids=pre_trim_ids_py,
+                pre_trim_through=cpe,
+                cache_token_ids=cache_token_ids_py,
+                cache_position_ids=cache_position_ids_py,
+                position_ids_this_call=main_positions[0].detach().cpu().tolist(),
+                new_tokens_this_call=main_tokens[0].detach().cpu().tolist(),
+            )
+
+            loss_val = loss_fn(main_logits, post_start, post_end)
+            _finish_call(loss_val, main_n_forwards)
+            continue
+
+        if has_admission:
+            # ── B.2a: Warmup-then-splice for admission in call 0.
+            #
+            # V's K at survivor positions in call 0's admission was
+            # written in ONE prefill forward — V's call 0 (or the
+            # writer for cross-rollout inheritor cases) prefills all of
+            # sub_0 with full causal attention to every prior position,
+            # THEN admission evicts cache rows. The surviving rows'
+            # K *values* still encode attention to the (now-evicted)
+            # range. They aren't "gap-position" K — that earlier
+            # diagnosis was wrong.
+            #
+            # Single forward over pre-trim [cps..sub_end_pre), then splice
+            # cache rows [es..es+te) post-hoc. For cross-writer prefix-cache
+            # inheritance, the warmup uses vLLM's piecewise writer-offset
+            # positions so reconstructed K lands in the same RoPE frame as
+            # the cached writer rows.
+            #
+            # Warmup covers the FULL sub_N (not just the inherited
+            # region), because V re-prefilled every token in sub_N
+            # under full causal attention BEFORE admission fired —
+            # including the new_user_fragment. Stopping warmup at
+            # inherited_end_pre left survivor K past that boundary
+            # written under wrong attention context AND caused the
+            # splice to run off the end of the warmup output when V's
+            # evict range extended into the new_user_fragment region.
+            warm_end = sub_end_pre
+            warm_logits_detached: torch.Tensor | None = None
+            warm_n_forwards = 0
+            if warm_end > cps:
+                w_toks = pre_trim_ids[:, cps:warm_end]
+                if writer_offset != 0:
+                    w_pos = _piecewise_positions(
+                        cps,
+                        warm_end,
+                        offset=writer_offset,
+                        protected_prefix_len=protected_prefix_len,
+                        device=device,
+                    )
+                else:
+                    w_pos = (
+                        torch.arange(warm_end - cps, device=device, dtype=torch.long)
+                        + cps
+                    ).unsqueeze(0)
+                cache_before_warm = persistent_cache.get_seq_length()
+                out_w = _model_forward_with_optional_attn_switch(
+                    model,
+                    input_ids=w_toks,
+                    position_ids=w_pos,
+                    past_key_values=persistent_cache,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                )
+                w_log = _extract_logits(out_w)
+                warm_logits_detached = w_log if bptt_windowed else w_log.detach()
+                # FSDP2 fwd/bwd lockstep — keep the existing 2-bwd shape
+                # for admission calls so dummy-pass padding stays
+                # symmetric across ranks.
+                if not bptt_windowed:
+                    (w_log.float().mean() * 0.0).backward()
+                warm_n_forwards = 1
+                if trace_forward_this_call:
+                    tok_head, tok_tail = _preview_1d(w_toks, 0, warm_end - cps)
+                    pos_head, pos_tail = _preview_1d(w_pos, 0, warm_end - cps)
+                    logger.warning(
+                        "[T-FWD-SIG] label=C%d:B2A-warm chunk=[%d,%d) "
+                        "len=%d cache=%d->%d prompt_len=%d pad_len=%d "
+                        "mirror=%s attn_override=%s pos_head=%s "
+                        "pos_tail=%s tok_head=%s tok_tail=%s",
+                        call_idx, cps, warm_end, warm_end - cps,
+                        cache_before_warm, persistent_cache.get_seq_length(),
+                        warm_end - cps, 0, False, None,
+                        pos_head, pos_tail, tok_head, tok_tail,
+                    )
+                cache_token_ids_py.extend(pre_trim_ids_py[cps:warm_end])
+                cache_position_ids_py.extend(
+                    w_pos[0].detach().cpu().tolist()
+                )
+            if not bptt_windowed:
+                persistent_cache = _detach_dynamic_cache(persistent_cache)
+
+            # Splice cache rows [es..es+te) per admission event in
+            # post-prior-iter order. For call 0 admission, es is in
+            # this call's pre-trim coord and the cache content is
+            # co-indexed with pre_trim_ids; for multi-iter the events
+            # already compose against the running cache state.
+            running_cache_len = persistent_cache.get_seq_length()
+            for (es, te) in splices:
+                assert es + te <= running_cache_len, (
+                    f"call {call_idx} (B.2a): splice [{es},{es+te}) "
+                    f"out of cache (len={running_cache_len})"
+                )
+                persistent_cache = _splice_dynamic_cache(
+                    persistent_cache, es, es + te,
+                )
+                del cache_token_ids_py[es : es + te]
+                del cache_position_ids_py[es : es + te]
+                if trace_forward_this_call:
+                    logger.warning(
+                        "[T-SPLICE-SIG] label=C%d:B2A splice=[%d,%d) "
+                        "cache=%d->%d",
+                        call_idx, es, es + te,
+                        running_cache_len,
+                        persistent_cache.get_seq_length(),
+                    )
+                running_cache_len -= te
+
+            # Main forward over the remaining pre-trim contribution =
+            # [sub_end_pre..cpe) = comp + pad. The warmup covered the
+            # full sub_N region, so the only new tokens this forward
+            # needs to process are the decode outputs and the auto-pad
+            # fillers (both written by V AFTER admission, under V's
+            # post-admission attention context = the spliced cache).
+            main_start = sub_end_pre
+            main_tokens = pre_trim_ids[:, main_start:cpe]
+            if admission_offset_after != 0:
+                physical_start = persistent_cache.get_seq_length()
+                main_positions = _piecewise_positions(
+                    physical_start,
+                    physical_start + (cpe - main_start),
+                    offset=admission_offset_after,
+                    protected_prefix_len=protected_prefix_len,
+                    device=device,
+                )
+            else:
+                main_positions = (
+                    torch.arange(cpe - main_start, device=device, dtype=torch.long)
+                    + main_start
+                ).unsqueeze(0)
+            if mirror_decode_this_call and stream_mirror_decode_loss:
+                warm_kept_len = 0
+                if warm_logits_detached is not None:
+                    warm_kept_len = int(warm_logits_detached.shape[1])
+                    warm_loss = loss_fn(
+                        warm_logits_detached,
+                        post_start,
+                        post_start + warm_kept_len,
+                    )
+                    _backward_loss_or_zero(warm_loss, warm_logits_detached)
+                    accumulated_loss += float(warm_loss.detach().item())
+                (
+                    persistent_cache,
+                    main_n_forwards,
+                    main_loss,
+                    main_kept_len,
+                ) = _forward_mirror_decode_stream_loss(
+                    model,
+                    input_ids=main_tokens,
+                    position_ids=main_positions,
+                    past_key_values=persistent_cache,
+                    prompt_len=0,
+                    pad_len=pad_len,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                    loss_fn=loss_fn,
+                    full_logit_start=post_start + warm_kept_len,
+                    trace_label=(
+                        f"C{call_idx}:B2A-main"
+                        if trace_forward_this_call else None
+                    ),
+                )
+                cache_token_ids_py.extend(pre_trim_ids_py[main_start:cpe])
+                cache_position_ids_py.extend(
+                    main_positions[0].detach().cpu().tolist()
+                )
+                assert warm_kept_len + main_kept_len == post_end - post_start, (
+                    f"call {call_idx}: streamed logits len="
+                    f"{warm_kept_len + main_kept_len} "
+                    f"!= post_end-post_start={post_end - post_start} "
+                    f"(ie_pre={ie_pre}, main_start={main_start}, cpe={cpe})"
+                )
+
+                _maybe_dump_trainer_kv(
+                    persistent_cache,
+                    call_idx=call_idx,
+                    is_last_call=(call_idx == len(calls) - 1),
+                    pre_trim_ids=pre_trim_ids_py,
+                    pre_trim_through=cpe,
+                    cache_token_ids=cache_token_ids_py,
+                    cache_position_ids=cache_position_ids_py,
+                    position_ids_this_call=main_positions[0].detach().cpu().tolist(),
+                    new_tokens_this_call=main_tokens[0].detach().cpu().tolist(),
+                )
+
+                accumulated_loss += main_loss
+                n_forwards_run += warm_n_forwards + main_n_forwards
+                persistent_cache = _detach_dynamic_cache(persistent_cache)
+                continue
+            else:
+                main_logits, main_n_forwards = _forward_with_optional_decode_mirror(
+                    model,
+                    input_ids=main_tokens,
+                    position_ids=main_positions,
+                    past_key_values=persistent_cache,
+                    prompt_len=0,
+                    pad_len=pad_len,
+                    mirror_decode=mirror_decode_this_call,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                    trace_label=(
+                        f"C{call_idx}:B2A-main"
+                        if trace_forward_this_call else None
+                    ),
+                )
+                cache_token_ids_py.extend(pre_trim_ids_py[main_start:cpe])
+                cache_position_ids_py.extend(
+                    main_positions[0].detach().cpu().tolist()
+                )
+
+                # Assemble logits at every pre-trim position [cps..cpe).
+                # Warmup wrote logits at [cps..ie_pre) in one tensor (no gap);
+                # main wrote [main_start..cpe). The main helper already drops
+                # auto-pad filler logits while still writing their K/V rows.
+                pieces: list[torch.Tensor] = []
+                if warm_logits_detached is not None:
+                    pieces.append(warm_logits_detached)
+                pieces.append(main_logits)
+                kept_logits = torch.cat(pieces, dim=1)
+                assert kept_logits.shape[1] == post_end - post_start, (
+                    f"call {call_idx}: kept_logits len={kept_logits.shape[1]} "
+                    f"!= post_end-post_start={post_end - post_start} "
+                    f"(ie_pre={ie_pre}, main_start={main_start}, cpe={cpe})"
+                )
+
+                _maybe_dump_trainer_kv(
+                    persistent_cache,
+                    call_idx=call_idx,
+                    is_last_call=(call_idx == len(calls) - 1),
+                    pre_trim_ids=pre_trim_ids_py,
+                    pre_trim_through=cpe,
+                    cache_token_ids=cache_token_ids_py,
+                    cache_position_ids=cache_position_ids_py,
+                    position_ids_this_call=main_positions[0].detach().cpu().tolist(),
+                    new_tokens_this_call=main_tokens[0].detach().cpu().tolist(),
+                )
+
+                loss_val = loss_fn(kept_logits, post_start, post_end)
+                _finish_call(loss_val, warm_n_forwards + main_n_forwards)
+        else:
+            # ── Extension (or single first-call without admission): single forward.
+            # Plain arange + cps in the normal same-frame case. If this
+            # request inherited cached blocks from a nonzero writer frame,
+            # mirror vLLM's physical+piecewise-offset RoPE positions for the
+            # newly written tail.
+            new_tokens = pre_trim_ids[:, cps:cpe]
+            if writer_offset != 0:
+                physical_start = persistent_cache.get_seq_length()
+                new_positions = _piecewise_positions(
+                    physical_start,
+                    physical_start + (cpe - cps),
+                    offset=writer_offset,
+                    protected_prefix_len=protected_prefix_len,
+                    device=device,
+                )
+            else:
+                new_positions = (
+                    torch.arange(cpe - cps, device=device, dtype=torch.long) + cps
+                ).unsqueeze(0)
+            new_prompt_len = max(0, min(sub_end_pre, cpe) - cps)
+            if mirror_decode_this_call and stream_mirror_decode_loss:
+                (
+                    persistent_cache,
+                    new_n_forwards,
+                    new_loss,
+                    new_kept_len,
+                ) = _forward_mirror_decode_stream_loss(
+                    model,
+                    input_ids=new_tokens,
+                    position_ids=new_positions,
+                    past_key_values=persistent_cache,
+                    prompt_len=new_prompt_len,
+                    pad_len=pad_len,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                    loss_fn=loss_fn,
+                    full_logit_start=post_start,
+                    trace_label=(
+                        f"C{call_idx}:ext"
+                        if trace_forward_this_call else None
+                    ),
+                )
+                cache_token_ids_py.extend(pre_trim_ids_py[cps:cpe])
+                cache_position_ids_py.extend(
+                    new_positions[0].detach().cpu().tolist()
+                )
+                assert new_kept_len == post_end - post_start, (
+                    f"call {call_idx} (no admission): streamed logits len="
+                    f"{new_kept_len} != post_end-post_start="
+                    f"{post_end - post_start}"
+                )
+
+                _maybe_dump_trainer_kv(
+                    persistent_cache,
+                    call_idx=call_idx,
+                    is_last_call=(call_idx == len(calls) - 1),
+                    pre_trim_ids=pre_trim_ids_py,
+                    pre_trim_through=cpe,
+                    cache_token_ids=cache_token_ids_py,
+                    cache_position_ids=cache_position_ids_py,
+                    position_ids_this_call=new_positions[0].detach().cpu().tolist(),
+                    new_tokens_this_call=new_tokens[0].detach().cpu().tolist(),
+                )
+
+                accumulated_loss += new_loss
+                n_forwards_run += new_n_forwards
+                persistent_cache = _detach_dynamic_cache(persistent_cache)
+                continue
+
+            logits, new_n_forwards = _forward_with_optional_decode_mirror(
+                model,
+                input_ids=new_tokens,
+                position_ids=new_positions,
+                past_key_values=persistent_cache,
+                prompt_len=new_prompt_len,
+                pad_len=pad_len,
+                mirror_decode=mirror_decode_this_call,
+                base_attn_impl=base_attn_impl,
+                past_attn_impl=past_attn_impl,
+                trace_label=(
+                    f"C{call_idx}:ext"
+                    if trace_forward_this_call else None
+                ),
+            )
+            cache_token_ids_py.extend(pre_trim_ids_py[cps:cpe])
+            cache_position_ids_py.extend(
+                new_positions[0].detach().cpu().tolist()
+            )
+            # No admission → kept_in_call is the full range minus pad
+            # tail, so logits now match the post-trim contribution 1:1.
+            assert logits.shape[1] == post_end - post_start, (
+                f"call {call_idx} (no admission): logits len={logits.shape[1]} "
+                f"!= post_end-post_start={post_end - post_start}"
+            )
+
+            _maybe_dump_trainer_kv(
+                persistent_cache,
+                call_idx=call_idx,
+                is_last_call=(call_idx == len(calls) - 1),
+                pre_trim_ids=pre_trim_ids_py,
+                pre_trim_through=cpe,
+                cache_token_ids=cache_token_ids_py,
+                cache_position_ids=cache_position_ids_py,
+                position_ids_this_call=new_positions[0].detach().cpu().tolist(),
+                new_tokens_this_call=new_tokens[0].detach().cpu().tolist(),
+            )
+
+            loss_val = loss_fn(logits, post_start, post_end)
+            _finish_call(loss_val, new_n_forwards)
+
+    if bptt_windowed:
+        _flush_bptt_window()
+        if max_bptt_window_forward_passes is not None:
+            while bptt_window_idx < len(max_bptt_window_forward_passes):
+                _flush_bptt_window(force=True)
+    else:
+        n_dummy = max(0, max_forward_passes - n_forwards_run)
+        if n_dummy > 0:
+            _run_dummy_passes_with_backward(
+                model,
+                merged_input_ids,
+                merged_position_ids,
+                num_dummy=n_dummy,
+            )
+
+    return {
+        "loss": torch.tensor(accumulated_loss, device=device),
+        "n_segments": n_forwards_run,
+    }

@@ -1,0 +1,6 @@
+{
+  "job_id": "f2291afd-8640-4940-969f-e8ecf55d906d",
+  "config": "experiments/debug_balrog/rl_no_eviction.toml",
+  "run_name": "debug-balrog-no-eviction",
+  "launched_at": "2026-04-14T19:08:22.736959"
+}

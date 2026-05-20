@@ -1,0 +1,134 @@
+# markovian_taubench_retail: Markovian Thinker baseline on Sierra's tau-bench
+# (retail domain, 500 train / 115 test) — EAI single-node, seed 2.
+#
+# Mirrors experiments/full_context_taubench_retail/rl_eai_seed2.toml but
+# replaces full-context rollouts with client-side message truncation: the
+# orchestrator drops old turn groups from `messages` before each chat
+# completion request so vLLM sees a bounded-context prompt every turn
+# with no KV eviction. Training runs the standard full-context forward
+# (no segmented_forward).
+#
+# See `plans/markovian_thinker_baseline.md` for semantics + rationale.
+
+max_steps = 600
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/markovian-taubench-retail-seed2-v2"
+clean_output_dir = false
+
+[ckpt]
+interval = 50
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "tau2bench-eviction"
+name = "markovian-taubench-retail-seed2-v2"
+id = "markovian-taubench-retail-seed2-v2"
+group = "markovian-taubench-retail"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "auto"
+attn = "flash_attention_2"
+ac = { mode = "full" }
+
+# No [trainer.compaction] — validate_markovian_thinker rejects
+# trainer.compaction.window_size > 0 alongside Markovian.
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+oversampling_factor = 1.0
+# Required by validate_markovian_thinker: TITO assumes the chat template
+# has the extension property across turns, which truncation breaks.
+use_token_client = false
+
+# Padding is incompatible with Markovian (the validator rejects both-on).
+# Markovian stashes its own prompt_token_ids on the response.
+[orchestrator.compaction_padding]
+enabled = false
+
+[orchestrator.markovian_thinker]
+enabled = true
+max_turns = 6
+log_truncated_messages = false
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 512
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "tau-bench-train"
+# User simulator points at the local vLLM server (Qwen3-4B) instead of
+# OpenAI. litellm needs the "openai/" prefix to route via OpenAI-compatible
+# API. OPENAI_API_KEY is set to "EMPTY" by the launcher (vLLM accepts any
+# value when started without --api-key). `user_provider="openai"` selects
+# litellm's OpenAI-compatible transport; combined with `api_base` injected
+# by our monkey-patch (from `user_base_url`), requests land at the local
+# vLLM server.
+args = { domain = "retail", user_model = "openai/Qwen/Qwen3-4B-Instruct-2507", user_provider = "openai", user_base_url = "http://localhost:8000/v1", user_api_key_var = "OPENAI_API_KEY", max_num_steps = 30, max_workers = 128, max_turns = -1 }
+
+[orchestrator.eval]
+interval = 50
+
+# Held-out retail test: the 115 tasks the wrapper exposes as `eval_dataset`.
+[[orchestrator.eval.env]]
+id = "tau-bench-train"
+name = "tau-bench-retail"
+args = { domain = "retail", user_model = "openai/Qwen/Qwen3-4B-Instruct-2507", user_provider = "openai", user_base_url = "http://localhost:8000/v1", user_api_key_var = "OPENAI_API_KEY", max_num_steps = 30, max_workers = 128, max_turns = -1 }
+
+# Airline (50 test tasks, no train split upstream) — out-of-distribution
+# generalization check since training is retail-only.
+[[orchestrator.eval.env]]
+id = "tau-bench-train"
+name = "tau-bench-airline"
+args = { domain = "airline", user_model = "openai/Qwen/Qwen3-4B-Instruct-2507", user_provider = "openai", user_base_url = "http://localhost:8000/v1", user_api_key_var = "OPENAI_API_KEY", max_num_steps = 30, max_workers = 128, max_turns = -1 }
+
+[inference]
+seed = 2
+# Each truncation shifts the prefix, so automatic prefix caching misses
+# on nearly every turn past max_turns. Disable to save bookkeeping.
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+# No compaction_* fields in [inference.vllm_extra]; validator rejects
+# vLLM-side compaction alongside Markovian.
+[inference.vllm_extra]
+async_scheduling = false

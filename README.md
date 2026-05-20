@@ -322,6 +322,146 @@ automatically via the broadcast worker hook.
   at batch_size=64 on 4×A100-80GB, scales roughly linearly in
   seq_len, not batch size (each micro-batch is one sample).
 
+### Sequence-length truncation in compaction runs
+
+When compaction is active, two per-turn and per-sample truncation
+stages are disabled to keep completion token counts and compaction
+event coordinates in the same space:
+
+| Stage | Variable | Location | Compaction runs | Non-compaction runs |
+|-------|----------|----------|-----------------|---------------------|
+| Per-turn | `env.max_seq_len` | `kv_eviction/env.py` monkey-patch on `MultiTurnEnv.add_model_response` | Set to `None` — per-turn truncation skipped | Unchanged (verifiers truncates as normal) |
+| Final sample | `seq_len` | `prime-rl trainer/batch.py` `prepare_sample` | Skipped when `compaction_enabled=True` | Active — truncates sample + clamps events |
+
+**Why**: verifiers' `parse_response_tokens` truncates `completion_ids`
+when `prompt_len + completion_len > max_seq_len`, but does NOT truncate
+compaction events (which live in response metadata). This puts token
+counts and event coordinates in different spaces, causing a
+non-monotonic boundary assertion crash in `interleave_rollout`. The
+trainer-side `seq_len` truncation has the same issue unless
+`_clamp_compaction_events` is called, but skipping it entirely in
+compaction runs is cleaner: `segmented_forward` with `bptt_segments=1`
+processes one segment at a time, so peak memory is bounded by the
+largest segment (~prompt_len tokens), not total sequence length.
+
+**Scope**: both disables apply ONLY to multi-turn compaction envs.
+The `env.py` monkey-patch targets `MultiTurnEnv.add_model_response`
+specifically — `SingleTurnEnv` is never patched. The `prepare_sample`
+skip gates on `compaction_enabled=True`, which is set from the trainer
+config (`compaction.window_size > 0`).
+
+**Potential failure mode**: if `kv_eviction.env` is imported in a
+process that also runs non-compaction `MultiTurnEnv` instances, those
+envs will have `max_seq_len` set to `None` (the monkey-patch applies
+to the base class unconditionally at import time). This is harmless
+when Stage 2 (`seq_len`) is active, since the trainer-side truncation
+catches oversized samples. But if both stages are disabled (e.g.,
+`compaction_enabled=True` in the trainer config while some envs don't
+actually use compaction), non-compaction multi-turn samples will flow
+through untruncated, which can cause OOM in the standard forward path.
+**Fix**: ensure `compaction_enabled` is only set when ALL envs in the
+run are backed by a compaction-enabled vLLM server. Do not mix
+compaction and non-compaction multi-turn envs in the same process.
+
+### Multi-turn RL with turn-based eviction (BabyAI / BALROG)
+
+The `experiments/debug_balrog/` directory contains a matched pair of configs
+for multi-turn BabyAI environments via the BALROG harness:
+
+| Config | Description |
+|---|---|
+| `rl_full.toml` | Turn-based KV eviction + segmented-forward training |
+| `rl_no_eviction.toml` | Full-context baseline (no eviction) |
+
+Both run on a single node with 8 GPUs (4 infer + 4 train) and can be
+launched via:
+
+```bash
+python experiments/debug_balrog/launch_eai.py experiments/debug_balrog/rl_full.toml
+```
+
+#### Turn-based eviction (vLLM side)
+
+Token-wise compaction (sliding window) evicts a fixed number of tokens
+regardless of message boundaries. For multi-turn environments this is
+disruptive — eviction can slice mid-message, leaving orphaned tokens from
+a partial user or assistant turn in the KV cache. Turn-based eviction
+instead drops whole completed `user + assistant` turn pairs:
+
+```toml
+[inference.vllm_extra]
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+compaction_protected_prefix_tokens = -1  # auto: protect system prompt
+# Turn-based mode — evict whole turns instead of raw token windows.
+compaction_max_turns = 4                 # keep at most 4 turns in the window
+compaction_eviction_turn_stride = 2      # drop 2 turns per eviction event
+compaction_assume_aligned_turn_boundaries = true  # see padding note below
+async_scheduling = false
+```
+
+Setting `compaction_max_turns` enables turn-based mode in the vLLM
+scheduler. The stride (`compaction_eviction_turn_stride`) controls how
+many turns are dropped when the window overflows. `compaction_protected_prefix_tokens = -1`
+auto-detects the system prompt length by scanning for the first EOS token
+and protects it from eviction.
+
+#### Block-aligned padding interceptor (orchestrator side)
+
+PagedAttention evicts whole blocks (16 tokens). If a turn boundary falls
+mid-block, evicting "up to the end of turn N" actually evicts N plus a
+partial tail — the next turn's first tokens are already in the same block.
+The solution is to pad each message's closing `<|im_end|>` token so it
+lands on a block boundary, guaranteeing that turn boundaries are exactly
+block-aligned:
+
+```toml
+[orchestrator.compaction_padding]
+enabled = true
+block_size = 16  # must match inference.vllm_extra.block_size
+
+[orchestrator]
+# Must be false: the padding interceptor lives inside AsyncCompletions.create.
+# use_token_client=true bypasses chat.completions.create entirely and sends
+# prompt_token_ids directly, skipping the interceptor.
+use_token_client = false
+```
+
+With `compaction_assume_aligned_turn_boundaries = true` the vLLM scheduler
+snaps `evict_end` upward (align_up) to absorb the padding of the last
+evicted turn, rather than aligning down and leaving an orphan tail.
+
+#### No-eviction baseline requires activation checkpointing
+
+Without eviction the context grows up to `max_model_len = 16384` tokens.
+Processing a 16K-token sequence in a standard packed forward OOMs on
+80 GB GPUs without activation checkpointing. The no-eviction trainer
+config therefore enables full AC:
+
+```toml
+[trainer.model]
+impl = "auto"
+attn = "flash_attention_2"
+ac = { mode = "full" }   # required — avoids OOM on 16K sequences
+```
+
+Note: AC is intentionally **disabled** for compaction training. The
+segmented-forward path uses a live `DynamicCache` across segments;
+prime-rl's non-reentrant `checkpoint_wrapper` double-appends K/V on
+the recompute pass and raises `CheckpointError`. Compaction stays within
+memory budget without AC because each segment is short (≤ window_size
+tokens).
+
+#### Enabling `compaction_padding` on a no-eviction baseline
+
+`compaction_padding.enabled = true` with `trainer.compaction.window_size = 0`
+is intentional: the interceptor still sends `prompt_token_ids` via
+`extra_body` to bypass vLLM's `tool_choice="auto"` validation (which
+rejects requests that include pre-tokenised prompts). The prime-rl
+`RLConfig` validator accepts this combination — block-size consistency
+checks are only enforced when `window_size > 0`.
+
 ### Constraints to keep in mind
 
 - `[trainer.compaction]` in `rl.toml` MUST mirror the inference

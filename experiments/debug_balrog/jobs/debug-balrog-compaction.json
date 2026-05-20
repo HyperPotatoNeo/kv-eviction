@@ -1,0 +1,6 @@
+{
+  "job_id": "c295e0f4-04e2-4ffa-af5a-c66acfbc35fd",
+  "config": "experiments/debug_balrog/rl_full.toml",
+  "run_name": "debug-balrog-compaction",
+  "launched_at": "2026-04-14T14:44:11.823145"
+}

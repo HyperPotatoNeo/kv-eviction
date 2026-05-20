@@ -1,0 +1,130 @@
+# debug_balrog: BabyAI multi-turn RL with KV cache compaction.
+#
+# Uses the BALROG BabyAI environment (MiniGrid grid-world tasks).
+# Compaction evicts old conversation turns while protecting the system
+# prompt via protected_prefix_tokens. Small batch for single-node debug.
+
+max_steps = 500
+seq_len = 16384
+output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/runs2"
+clean_output_dir = true
+
+[ckpt]
+interval = 10
+resume_step = -1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "kv-eviction"
+name = "debug-balrog-compaction"
+id = "debug-balrog-compaction"
+group = "debug-balrog-compaction"
+
+[trainer.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+attn = "flash_attention_2"
+
+[trainer.compaction]
+window_size = 4096
+stride = 512
+block_size = 16
+bptt_segments = 1
+# -1 = auto-detect: protect up to the end of the first system message
+# by scanning for the first eos token in the prompt.
+protected_prefix_tokens = -1
+
+[trainer]
+dist_timeout_seconds = 3600
+
+[trainer.loss]
+kl_tau = 0.0
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.01
+betas1 = 0.9
+betas2 = 0.9
+max_norm = 1.0
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 8
+oversampling_factor = 1.0
+# TITO (token-in-token-out) bypasses openai-python's chat.completions.create,
+# which is where the block-aligned padding interceptor lives
+# (src/kv_eviction/env.py). Disable it so every turn's full padded conversation
+# flows through AsyncCompletions.create → extra_body.prompt_token_ids → vLLM
+# render_chat bypass. This mirrors the debug script's llm.generate(prompts=
+# [{"prompt_token_ids": padded}], ...) path exactly.
+use_token_client = false
+
+[orchestrator.compaction_padding]
+# Block-aligned message padding: orchestrator pads each chat message so
+# the closing <|im_end|> lands on a PagedAttention block boundary. Mirrors
+# the notebook's PAD=True path (experiments/debug_balrog/compaction_test.ipynb).
+enabled = true
+block_size = 16
+# Debug-only: decode each compaction event's evicted token range and log a
+# framed `| ... |` block. Mirrors out_turn.txt. Off in production.
+log_evicted_text = true
+
+[orchestrator.client]
+base_url = ["http://localhost:8000/v1"]
+
+[orchestrator.train.sampling]
+max_completion_tokens = 6000
+temperature = 1.0
+
+[[orchestrator.train.env]]
+id = "balrog-bench"
+args = { environments = ["babyai"], max_text_history = 16, max_turns = 30 }
+
+[inference]
+seed = 0
+enable_prefix_caching = false
+gpu_memory_utilization = 0.85
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 8192
+enforce_eager = true
+
+[inference.parallel]
+dp = 4
+tp = 1
+
+[inference.vllm_extra]
+compaction_window_size = 4096
+compaction_stride = 512
+block_size = 16
+compaction_protected_prefix_tokens = -1
+# Turn-based eviction: drop whole completed user+assistant turns instead of
+# raw token windows. Mirrors the notebook's loader cell.
+compaction_max_turns = 4
+compaction_eviction_turn_stride = 2
+# Match orchestrator.compaction_padding.enabled=true: each <|im_end|> is
+# padded so the NEXT message's first token lands on a block boundary. The
+# scheduler's turn-mode planner then snaps evict_end UP (align_up) to
+# include the padding of the last evicted turn, eliminating the orphan
+# tail that align_down leaves behind.
+compaction_assume_aligned_turn_boundaries = true
+async_scheduling = false
+# Hermes parser disabled: we parse <tool_call> from raw text in env_response
+# (matches the debug script path exactly). Keeping tools in apply_chat_template
+# so the model sees the # Tools header, but not using vLLM's structured
+# tool_calls extraction.
+# enable_auto_tool_choice = true
+# tool_call_parser = "hermes"

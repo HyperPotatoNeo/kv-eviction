@@ -1,0 +1,26 @@
+# full_context_textworld: inference-only config for the 100-sample smoke test.
+#
+# Single-node DP=4 (1 x 4xA100-80GB) vLLM server with NO KV compaction.
+# Apples-to-apples baseline for experiments/compaction_textworld/inference.toml:
+# everything except the compaction_* fields matches exactly, so reward /
+# completion length differences attribute cleanly to the eviction policy.
+
+seed = 0
+enable_prefix_caching = false
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 16384
+enforce_eager = true
+
+[parallel]
+dp = 4
+tp = 1
+
+[vllm_extra]
+block_size = 16
+async_scheduling = false

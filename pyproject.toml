@@ -3,7 +3,15 @@ name = "kv-eviction"
 version = "0.1.0"
 description = "Native vLLM KV cache compaction for RL training"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "minigrid @ git+https://github.com/BartekCupial/Minigrid.git",
+]
+
+[dependency-groups]
+balrog = [
+    "omegaconf>=2.3.0",
+    "gym>=0.23.0",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

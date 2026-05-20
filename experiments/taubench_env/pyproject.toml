@@ -1,0 +1,20 @@
+[project]
+name = "tau-bench-train"
+version = "0.1.0"
+description = "Training-capable wrapper around Sierra's original tau-bench (retail 500/115 train/test + airline 50 test)"
+requires-python = ">=3.12"
+dependencies = [
+    "verifiers>=0.1.9",
+    "datasets>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = [
+    "tau_bench_train.py",
+    "pyproject.toml",
+    "README.md",
+]

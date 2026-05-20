@@ -53,6 +53,8 @@ uv pip install \
     "tilelang>=0.1.8" "liger-kernel>=0.5.10" \
     "ring-flash-attn>=0.1.8" "wandb>=0.24.2" \
     "verifiers @ git+https://github.com/PrimeIntellect-ai/verifiers.git@0760204" \
+    "tau-bench @ git+https://github.com/sierra-research/tau-bench.git" \
+    "protobuf>=6.31.1,<7" \
     "torchtitan @ git+https://github.com/pytorch/torchtitan@a1fdd7e" \
     "pydantic-config @ git+https://github.com/samsja/pydantic_config.git@main" \
     "dion @ git+https://github.com/samsja/dion.git@d891eeb" \
@@ -63,6 +65,26 @@ uv pip install -e ./prime-rl --no-deps
 
 echo "=== Step 6: kv-eviction editable ==="
 uv pip install -e .
+
+echo "=== Step 7: textworld-env editable ==="
+# Ships the TextWorld multi-turn env package (a plain vf.MultiTurnEnv
+# subclass) and its textworld>=1.6.0 runtime dep. The kv-eviction
+# compaction monkey-patches automatically apply to it — no env-side code.
+uv pip install -e ./experiments/textworld_env
+
+echo "=== Step 8: tau2-bench-train editable ==="
+# Thin wrapper that turns primeintellect/tau2-bench (eval-only) into a
+# training-capable env by aliasing eval_dataset_source -> dataset_source.
+# Requires `prime env install primeintellect/tau2-bench` to have already
+# installed the upstream tau2-bench package.
+uv pip install -e ./experiments/tau2bench_env
+
+echo "=== Step 9: tau-bench-train editable ==="
+# In-repo wrapper for Sierra's original tau-bench (the only tau-family
+# variant with a real retail train split: 500 train / 115 test + 50 airline
+# test). Monkey-patches tau_bench.envs.user.completion to route the user
+# simulator at a local vLLM endpoint via env vars (no upstream fork).
+uv pip install -e ./experiments/taubench_env
 
 echo ""
 echo "=== Verification ==="
@@ -81,6 +103,7 @@ from prime_rl.transport.types import TrainingSample
 from prime_rl.trainer.model import forward
 print("prime-rl imports OK")
 import kv_eviction; print("kv_eviction OK")
+import textworld_env; print("textworld_env OK")
 print("\n=== SETUP COMPLETE ===")
 print(f"Activate with: source {'/pscratch/sd/s/siddart2/kv-eviction'}/.venv/bin/activate")
 PYEOF

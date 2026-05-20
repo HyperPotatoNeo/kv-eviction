@@ -31,5 +31,12 @@ tp = 1
 compaction_window_size = 4096
 compaction_stride = 512
 block_size = 16
+# -1 = auto-detect the protected prefix from the first <|im_end|> in each
+# prompt. Must mirror [trainer.compaction] protected_prefix_tokens in
+# rl.toml; the RLConfig cross-validator only fires when [inference] is
+# embedded in rl.toml, so in this split-config setup we keep them in sync
+# by hand. vLLM default is 0 (no protection) which would silently drift
+# from the trainer's -1.
+compaction_protected_prefix_tokens = -1
 # Compaction requires synchronous scheduling (see scheduler.py assert).
 async_scheduling = false

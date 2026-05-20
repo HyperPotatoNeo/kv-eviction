@@ -1,0 +1,275 @@
+============================================================
+CHAINED-ADMISSION COLLISION — BUG + FIX, WORKED EXAMPLES
+============================================================
+
+ONE-LINER (bug)
+---------------
+After a 2nd admission, the K cache holds two different K vectors
+rotated at THE SAME logical position. Q attends both as one token
+→ broken attention → confidently-wrong outputs.
+
+ONE-LINER (fix we want — "piecewise")
+-------------------------------------
+Bump position_offset SMARTLY so new K writes land ABOVE the highest
+surviving K. Apply the bumped offset ONLY to post-sys positions
+(sys keeps offset=0). Result: survivors stay in cache, no re-prefill,
+no collision.
+
+
+SETUP (toy numbers)
+-------------------
+  block_size = 4
+  sys        = 4 tokens (block 0)
+  each turn  = 4 tokens (1 block: user msg + asst response combined)
+  max_turns  = 2  (keep the 2 most recent turn pairs)
+
+Each block holds 4 K vectors. Each K vector has its logical position
+baked in via RoPE rotation at write time. Logical position is FROZEN
+once the K is written.
+
+vLLM today: ONE position_offset per request, applied to ALL Q.
+With the fix: position_offset applied to Q ONLY when physical >= 4
+              (i.e., post-sys); sys Q always uses offset 0.
+
+
+==========================================================
+TURN 1 — fresh writes. No admission.
+==========================================================
+position_offset = 0.
+
+After turn 1's prefill + decode:
+
+   slot:  0 1 2 3   4 5 6 7
+   K of:  [  sys  ] [   T1  ]
+   logi:  0 1 2 3   4 5 6 7
+                                    (all K at slot S → logical S)
+
+
+==========================================================
+TURN 2 — extend, no admission.
+==========================================================
+Fresh request. position_offset = 0. Prefix-cache hits the
+inherited 2 blocks (sys + T1).
+
+After prefill + decode of T2:
+
+   slot:  0 1 2 3   4 5 6 7   8 9 10 11
+   K of:  [  sys  ] [   T1  ] [   T2   ]
+   logi:  0 1 2 3   4 5 6 7   8 9 10 11
+
+Cache holds 3 blocks. All K logical positions equal their slots.
+
+
+==========================================================
+TURN 3 — admission #1. Evict T1 (max_turns=2 → keep T2 + new T3).
+==========================================================
+Fresh request. position_offset = 0. Prefix-cache hits 3 blocks.
+
+The inherited K's are STILL at logical [0..3, 4..7, 8..11] (frozen
+from turns 1 & 2's writes at offset=0).
+
+vLLM scheduler: evict T1 (slot 4..7). Splice that block out.
+
+After admission splice:
+
+   slot:  0 1 2 3   4 5 6 7
+   K of:  [  sys  ] [   T2  ]   ← T2's K vectors UNCHANGED but
+                                  shifted DOWN one block.
+   logi:  0 1 2 3   8 9 10 11   ← logical positions still FROZEN
+                                  at T2's original 8..11
+
+position_offset bump (SMART): we need new K writes to land above
+the max survivor logical position.
+    max_survivor_logical = 11 (T2's last K)
+    num_computed_post    = 8  (4 sys + 4 surviving T2)
+    Required offset      = 12 − 8 = 4
+    position_offset      ← max(prior + total_evicted, required) = 4
+
+Generate T3 (1 block). New K at physical slots 8..11.
+With post-sys offset = 4:
+    new K logical = physical + 4 = 12..15
+
+After turn 3:
+
+   slot:  0 1 2 3   4 5 6 7   8 9 10 11
+   K of:  [  sys  ] [   T2  ] [   T3   ]
+   logi:  0 1 2 3   8 9 10 11 12 13 14 15
+
+✓ Monotonic. ✓ No collision. ✓ T2's K WAS NOT RE-PREFILLED.
+
+
+==========================================================
+TURN 4 — admission #2 (chained). Evict T2.
+==========================================================
+Fresh request. position_offset = 0. Prefix-cache hits 3 blocks.
+
+Inherited K's at frozen logical positions from turn 3:
+   slot:  0 1 2 3   4 5 6 7   8 9 10 11
+   K of:  [  sys  ] [   T2  ] [   T3   ]
+   logi:  0 1 2 3   8 9 10 11 12 13 14 15
+                   ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+            POST-SYS K were rotated at logical 8..15
+            (set by turn 3's writes; FROZEN now)
+
+vLLM scheduler: evict T2 (slot 4..7).
+
+After admission splice:
+
+   slot:  0 1 2 3   4 5 6 7
+   K of:  [  sys  ] [   T3  ]   ← T3's K KEPT, shifted down
+   logi:  0 1 2 3   12 13 14 15   ← logical positions FROZEN
+                                    at T3's original 12..15
+
+position_offset bump (SMART):
+    max_survivor_logical = 15 (T3's last K)
+    num_computed_post    = 8
+    Required offset      = 16 − 8 = 8
+    position_offset      ← max(0 + 4, 8) = 8
+                                          ↑
+                          NOT 4! The donor's offset already used up
+                          some of the logical space. Naive "+=4"
+                          would put new writes at logical 12..15,
+                          colliding with T3's K. Smart bump skips to 8.
+
+Generate T4 (1 block). New K at physical slots 8..11.
+With post-sys offset = 8:
+    new K logical = physical + 8 = 16..19
+
+After turn 4:
+
+   slot:  0 1 2 3   4 5 6 7   8 9 10 11
+   K of:  [  sys  ] [   T3  ] [   T4   ]
+   logi:  0 1 2 3   12 13 14 15  16 17 18 19
+
+✓ Monotonic. ✓ No collision. ✓ T3 NOT re-prefilled. ✓ sys still
+at logical 0..3 (because sys Q always uses offset 0 — the 2-piece
+rule).
+
+
+==========================================================
+WHAT THE OLD "DROP SURVIVORS" FIX DID INSTEAD (for comparison)
+==========================================================
+At turn 4 admission, instead of bumping the offset smartly, it
+FREES the survivor blocks (T3) and forces re-prefill:did
+
+   slot:  0 1 2 3
+   K of:  [  sys  ]              ← T3 K vectors thrown away
+   logi:  0 1 2 3
+
+num_computed_post  = 4 (sys only)
+position_offset    = 4 (simple += total_evicted)
+
+Re-prefill T3 + T4_user (8 tokens) at physical 4..11, offset 4
+   → logical 8..15
+Then decode T4_asst at logical 16..19.
+
+Final cache:
+
+   slot:  0 1 2 3   4 5 6 7   8 9 10 11
+   K of:  [  sys  ] [ T3 *new* ] [ T4 *new* ]
+   logi:  0 1 2 3   8 9 10 11  12 13 14 15
+
+✓ Correct (no collision).
+✗ T3 RE-PREFILLED from scratch.
+
+Cost over a long rollout: each chained admission re-prefills 1 turn
+pair worth of tokens. For a 20-turn rollout, that's 18 extra
+re-prefills × ~50-200 tokens per turn = significant wasted compute.
+
+The new piecewise fix avoids this by keeping survivors in cache.
+
+
+==========================================================
+HOW THE PIECEWISE FIX IS IMPLEMENTED — IN PIECES
+==========================================================
+
+PIECE 1: Each K-cache block remembers its logical_start
+--------------------------------------------------------
+Add a field to KVCacheBlock:
+
+    KVCacheBlock.logical_start: int = -1
+
+Meaning: "the K at slot 0 of this block was rotated at this logical
+position." For the toy example, T3's block has logical_start = 12.
+
+When a block is freshly allocated (cache miss):
+    block.logical_start = (block_idx_in_request × block_size)
+                        + request.position_offset
+
+When a block is freed (ref_cnt → 0):
+    block.logical_start = -1  (reset so re-allocation starts clean)
+
+When a block is reused via prefix-cache hit:
+    no-op (the logical_start from the original writer carries over)
+
+
+PIECE 2: Smart offset bump at admission
+---------------------------------------
+In `_compact_request`, after the eviction splice:
+
+    max_survivor_logical = max(
+        b.logical_start + block_size - 1
+        for b in request_blocks
+        if b.logical_start >= 0
+    )
+    if max_survivor_logical >= 0:
+        required_offset = max_survivor_logical + 1 - request.num_computed_tokens
+        request.position_offset = max(
+            request.position_offset,  # simple bump (+= total_evicted)
+            required_offset,          # smart bump (clear all survivors)
+        )
+
+For turn 4 example: max_survivor_logical = 15, num_computed_post = 8
+   → required_offset = 8, simple_bump = 0+4 = 4
+   → position_offset = max(4, 8) = 8. ✓
+
+
+PIECE 3: GPU per-token offset (2-piece)
+---------------------------------------
+In `gpu_model_runner._prepare_inputs`, change the position formula:
+
+    # Old: positions = physical + position_offset_per_req[req_id]
+    # New:
+    is_post_sys = physical >= protected_prefix_len_per_req[req_id]
+    positions   = physical + position_offset_per_req[req_id] * is_post_sys
+
+For turn 4:
+    Q at physical 0..3  → logical 0..3   (sys, offset 0)
+    Q at physical 4..7  → logical 12..15 (offset 8, matches T3 K)
+    Q at physical 8..11 → logical 16..19 (offset 8, matches T4 K)
+
+Q at every physical position rotates at the SAME logical position
+as the K stored at that slot. Attention math is correct.
+
+
+PIECE 4: Wire `protected_prefix_len` to worker
+----------------------------------------------
+Add `protected_prefix_len` to `NewRequestData` and `CachedRequestData`
+(parallel to existing `position_offset` field). Add a CPU/GPU buffer
+to InputBatch. Populate from `scheduler._compute_effective_prompt`
+(which already detects sys boundary).
+
+
+PIECE 5: Trainer reads the smart offset from CompactionEvent
+------------------------------------------------------------
+The trainer's `per_call_segmented_forward` currently does:
+    cum_position_offset += total_evicted   # naive
+Change to:
+    cum_position_offset = event.position_offset_after  # vLLM's smart value
+
+The trainer's existing piecewise position_ids construction (protected
+prefix at offset 0, post-sys at cum_position_offset) is already correct
+— it just needs the right offset value.
+
+
+WHAT'S PRESERVED, WHAT'S RE-PREFILLED
+-------------------------------------
+After the piecewise fix:
+  ✓ sys is preserved (always, never evicted, always at offset 0)
+  ✓ All kept turn pairs are preserved (= max_turns most recent)
+  ✓ Only the NEW user fragment + this turn's response gets prefilled
+    (= what would happen WITHOUT compaction at all)
+
+The fix delivers the full prefix-cache benefit that motivated
+compaction in the first place: subsequent turns reuse all the K
+they can, paying only for new tokens.
