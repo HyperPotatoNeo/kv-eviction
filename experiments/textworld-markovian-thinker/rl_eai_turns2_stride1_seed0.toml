@@ -7,7 +7,7 @@
 
 max_steps = 600
 seq_len = 16384
-output_dir = "/mnt/adea/data_rw/finetuning/emilianopp/experiments/rebuttal/markovian-textworld-turns2-stride1-seed0"
+output_dir = "/scratch/epp/markovian-textworld-turns2-stride1-seed0"
 clean_output_dir = false
 
 [ckpt]

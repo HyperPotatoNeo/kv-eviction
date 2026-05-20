@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from kv_eviction.segmented_forward import (
+    compute_per_call_bptt_window_forward_counts,
     compute_num_per_call_forwards,
     per_call_segmented_forward,
 )
@@ -100,6 +101,45 @@ class _RecordingModel(torch.nn.Module):
                 v = (position_ids.float() + 100).view(1, 1, seq_len, 1).expand(
                     1, self.num_heads, seq_len, self.head_dim
                 ).contiguous()
+                past_key_values.update(k, v, layer)
+
+        return {"logits": logits, "past_key_values": past_key_values}
+
+
+class _CrossCallGradModel(torch.nn.Module):
+    """Mock model whose current logits depend on previously written K rows."""
+
+    def __init__(self, vocab_size: int = 8, num_layers: int = 1,
+                 num_heads: int = 1, head_dim: int = 1):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.cache_scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids, position_ids, past_key_values=None, use_cache=False):
+        batch, seq_len = input_ids.shape
+        device = input_ids.device
+        past_signal = torch.zeros((), device=device)
+        if past_key_values is not None and hasattr(past_key_values, "layers") \
+                and past_key_values.layers:
+            past_signal = past_key_values.layers[0].keys.sum()
+        elif past_key_values is not None and hasattr(past_key_values, "key_cache") \
+                and past_key_values.key_cache:
+            past_signal = past_key_values.key_cache[0].sum()
+
+        logits = past_signal.reshape(1, 1, 1).expand(
+            batch, seq_len, self.vocab_size
+        )
+
+        if use_cache and past_key_values is not None:
+            for layer in range(self.num_layers):
+                k = (
+                    self.cache_scale
+                    * position_ids.float().view(batch, 1, seq_len, 1)
+                ).expand(batch, self.num_heads, seq_len, self.head_dim).contiguous()
+                v = torch.zeros_like(k)
                 past_key_values.update(k, v, layer)
 
         return {"logits": logits, "past_key_values": past_key_values}
@@ -187,6 +227,18 @@ def test_compute_num_per_call_forwards_with_midgen_only():
     ]
     with pytest.raises(AssertionError, match="mid-generation event"):
         compute_num_per_call_forwards(calls)
+
+
+def test_compute_per_call_bptt_window_forward_counts_groups_calls():
+    calls = [
+        _CallSpec(submitted_prompt_ids=[1, 2], completion_ids=[3]),
+        _CallSpec(submitted_prompt_ids=[1, 2, 3, 4], completion_ids=[5]),
+        _CallSpec(submitted_prompt_ids=[1, 2, 3, 4, 5, 6], completion_ids=[7]),
+    ]
+
+    assert compute_per_call_bptt_window_forward_counts(calls, 2) == [4, 2]
+    assert compute_per_call_bptt_window_forward_counts(calls, None) == [6]
+    assert compute_per_call_bptt_window_forward_counts(calls, -1) == [6]
 
 
 # ─── No-admission per-call dispatch ───────────────────────────────────
@@ -291,6 +343,115 @@ def test_per_call_pads_with_dummy_passes_for_fsdp_sync():
     assert model.calls[1]["seq_len"] == 1
     for dummy in model.calls[2:]:
         assert dummy["seq_len"] == 1
+
+
+def test_per_call_bptt_segments_one_keeps_backward_per_call(monkeypatch):
+    calls = [
+        _CallSpec(submitted_prompt_ids=[1, 2], completion_ids=[3]),
+        _CallSpec(submitted_prompt_ids=[1, 2, 3, 4], completion_ids=[5]),
+    ]
+    input_ids, pos_ids, _ = _merged_from_calls(calls)
+    model = _RecordingModel()
+    backward_calls = []
+    orig_backward = torch.Tensor.backward
+
+    def counted_backward(self, *args, **kwargs):
+        backward_calls.append(self)
+        return orig_backward(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "backward", counted_backward)
+
+    def fake_loss(seg_logits, start, end):
+        return seg_logits.float().sum()
+
+    per_call_segmented_forward(
+        model, calls, input_ids, pos_ids,
+        loss_fn=fake_loss, max_forward_passes=compute_num_per_call_forwards(calls),
+        bptt_segments=1,
+        device=torch.device("cpu"),
+    )
+
+    assert len(backward_calls) == 2
+
+
+def test_per_call_bptt_segments_two_backwards_once_and_pads_window(monkeypatch):
+    calls = [
+        _CallSpec(submitted_prompt_ids=[1, 2], completion_ids=[3]),
+        _CallSpec(submitted_prompt_ids=[1, 2, 3, 4], completion_ids=[5]),
+    ]
+    input_ids, pos_ids, _ = _merged_from_calls(calls)
+    model = _RecordingModel()
+    backward_calls = []
+    orig_backward = torch.Tensor.backward
+
+    def counted_backward(self, *args, **kwargs):
+        backward_calls.append(self)
+        return orig_backward(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "backward", counted_backward)
+
+    def fake_loss(seg_logits, start, end):
+        return seg_logits.float().sum()
+
+    per_call_segmented_forward(
+        model, calls, input_ids, pos_ids,
+        loss_fn=fake_loss,
+        max_forward_passes=compute_num_per_call_forwards(calls),
+        max_bptt_window_forward_passes=[5],
+        bptt_segments=2,
+        device=torch.device("cpu"),
+    )
+
+    assert len(model.calls) == 5
+    assert len(backward_calls) == 1
+
+
+def test_per_call_bptt_segments_two_backprops_through_prior_call_cache():
+    calls = [
+        _CallSpec(submitted_prompt_ids=[1, 2], completion_ids=[3]),
+        _CallSpec(submitted_prompt_ids=[1, 2, 3, 4], completion_ids=[5]),
+    ]
+    input_ids, pos_ids, _ = _merged_from_calls(calls)
+
+    def loss_from_second_call_first_logit(seg_logits, start, end):
+        if start == 0:
+            return seg_logits.float().sum() * 0.0
+        # The first logit of call 1 is computed before call 1 writes its
+        # own K rows. It can only depend on call 0's carried cache.
+        return seg_logits[:, :1, :].float().sum()
+
+    bptt_model = _CrossCallGradModel()
+    per_call_segmented_forward(
+        bptt_model, calls, input_ids, pos_ids,
+        loss_fn=loss_from_second_call_first_logit,
+        max_forward_passes=compute_num_per_call_forwards(calls),
+        bptt_segments=2,
+        device=torch.device("cpu"),
+    )
+    assert bptt_model.cache_scale.grad is not None
+    assert bptt_model.cache_scale.grad.abs().item() > 0
+
+    full_chain_model = _CrossCallGradModel()
+    per_call_segmented_forward(
+        full_chain_model, calls, input_ids, pos_ids,
+        loss_fn=loss_from_second_call_first_logit,
+        max_forward_passes=compute_num_per_call_forwards(calls),
+        bptt_segments=-1,
+        device=torch.device("cpu"),
+    )
+    assert full_chain_model.cache_scale.grad is not None
+    assert full_chain_model.cache_scale.grad.abs().item() > 0
+
+    detached_model = _CrossCallGradModel()
+    per_call_segmented_forward(
+        detached_model, calls, input_ids, pos_ids,
+        loss_fn=loss_from_second_call_first_logit,
+        max_forward_passes=compute_num_per_call_forwards(calls),
+        bptt_segments=1,
+        device=torch.device("cpu"),
+    )
+    detached_grad = detached_model.cache_scale.grad
+    assert detached_grad is None or detached_grad.abs().item() == 0
 
 
 # ─── Admission per-call dispatch ──────────────────────────────────────

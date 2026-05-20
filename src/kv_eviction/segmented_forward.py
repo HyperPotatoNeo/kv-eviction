@@ -60,6 +60,7 @@ Not attempted here; we ship M3 first.
 """
 
 import logging
+import math
 import os
 from typing import Callable
 
@@ -93,6 +94,13 @@ logger = logging.getLogger(__name__)
 # callback typically slices advantages / old_logprobs / loss_mask at
 # positions [full_logit_start + 1, full_logit_end + 1).
 SegmentLossFn = Callable[[Tensor, int, int], Tensor]
+
+
+def _normalize_bptt_segments(bptt_segments: int | None) -> int | None:
+    """Map the config-facing -1 sentinel to full-chain BPTT."""
+    if bptt_segments == -1:
+        return None
+    return bptt_segments
 
 
 def compute_num_segments(
@@ -360,6 +368,7 @@ def segmented_forward(
             model.parameters().grad). Loss is detached so the caller
             can log/reduce it without re-entering the graph.
     """
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
     assert input_ids.shape[0] == 1, "segmented_forward requires batch_size=1"
     # Empty segment_boundaries is a legal no-event sample: the trainer's
     # unified compaction dispatch (D5 fix) routes every sample through
@@ -823,6 +832,23 @@ def segmented_forward(
     return {"logits": full_logits}
 
 
+def _dummy_forward_loss(
+    model: torch.nn.Module,
+    input_ids: Tensor,
+    position_ids: Tensor,
+) -> Tensor:
+    d_out = model(
+        input_ids=input_ids[:, :1],
+        position_ids=position_ids[:, :1],
+    )
+    d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
+    if isinstance(d_logits, dict):
+        d_logits = d_logits["logits"]
+    # float().mean() first to avoid bf16 sum overflow producing Inf
+    # (Inf * 0 = NaN, which would corrupt gradients).
+    return d_logits.float().mean() * 0.0
+
+
 def _run_dummy_passes_with_backward(
     model: torch.nn.Module,
     input_ids: Tensor,
@@ -844,17 +870,7 @@ def _run_dummy_passes_with_backward(
       3. Calls .backward() to trigger FSDP2's reduce-scatter.
     """
     for _ in range(num_dummy):
-        d_out = model(
-            input_ids=input_ids[:, :1],
-            position_ids=position_ids[:, :1],
-        )
-        d_logits = d_out["logits"] if isinstance(d_out, dict) else d_out.logits
-        if isinstance(d_logits, dict):
-            d_logits = d_logits["logits"]
-        # float().mean() first to avoid bf16 sum overflow producing Inf
-        # (Inf * 0 = NaN, which would corrupt gradients).
-        dummy_loss = d_logits.float().mean() * 0.0
-        dummy_loss.backward()
+        _dummy_forward_loss(model, input_ids, position_ids).backward()
 
 
 def _pad_with_dummy_passes(
@@ -998,10 +1014,8 @@ def _count_tail_forwards(
     return max(n, 1)
 
 
-def compute_num_per_call_forwards(calls) -> int:
-    """How many forward passes per_call_segmented_forward will run for
-    this list of calls. Used to all-reduce-MAX across DP ranks so FSDP2
-    all-gathers stay synchronized.
+def compute_per_call_forward_counts(calls) -> list[int]:
+    """Forward-pass count for each non-empty call in per-call dispatch.
 
     Counts the regular segmented default by replaying the same per-call plan:
     old survivor K/V stays in the persistent cache, new prompt tokens prefill
@@ -1010,7 +1024,7 @@ def compute_num_per_call_forwards(calls) -> int:
     env gate is explicitly enabled.
     """
     if not calls:
-        return 1
+        return []
     plans, _ = _build_pre_trim_plan(calls)
     mirror_decode = os.environ.get("KVE_TRAINER_MIRROR_VLLM_DECODE", "0") == "1"
     mirror_decode_filter_env = os.environ.get(
@@ -1030,7 +1044,7 @@ def compute_num_per_call_forwards(calls) -> int:
         os.environ.get("KVE_TRAINER_B2B_WARMUP_SPLICE", "0") == "1"
     )
 
-    n = 0
+    counts: list[int] = []
     for plan in plans:
         call_idx = plan["call_idx"]
         cps = plan["call_pre_start"]
@@ -1056,6 +1070,7 @@ def compute_num_per_call_forwards(calls) -> int:
         if cpe <= cps:
             continue
 
+        n = 0
         if has_admission and cps > 0:
             if b2b_warmup_splice:
                 warm_end = sub_end_pre
@@ -1076,6 +1091,7 @@ def compute_num_per_call_forwards(calls) -> int:
                     pad_len=pad_len,
                     mirror_decode=mirror_decode_this_call,
                 )
+            counts.append(n)
             continue
 
         if has_admission:
@@ -1089,6 +1105,7 @@ def compute_num_per_call_forwards(calls) -> int:
                 pad_len=pad_len,
                 mirror_decode=mirror_decode_this_call,
             )
+            counts.append(n)
             continue
 
         new_prompt_len = max(0, min(sub_end_pre, cpe) - cps)
@@ -1098,7 +1115,50 @@ def compute_num_per_call_forwards(calls) -> int:
             pad_len=pad_len,
             mirror_decode=mirror_decode_this_call,
         )
-    return max(n, 1)
+        counts.append(n)
+    return counts
+
+
+def compute_num_per_call_forwards(calls) -> int:
+    """How many forward passes per_call_segmented_forward will run for
+    this list of calls. Used to all-reduce-MAX across DP ranks so FSDP2
+    all-gathers stay synchronized."""
+    return max(sum(compute_per_call_forward_counts(calls)), 1)
+
+
+def compute_per_call_bptt_window_forward_counts(
+    calls,
+    bptt_segments: int | None,
+) -> list[int]:
+    """Forward-pass counts grouped by per-call BPTT window."""
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
+    call_counts = compute_per_call_forward_counts(calls)
+    if not call_counts:
+        return []
+    if bptt_segments is None:
+        return [sum(call_counts)]
+    if bptt_segments < 1:
+        raise ValueError(f"bptt_segments must be None or >= 1, got {bptt_segments}")
+    return [
+        sum(call_counts[i : i + bptt_segments])
+        for i in range(0, len(call_counts), bptt_segments)
+    ]
+
+
+def compute_num_per_call_bptt_windows(
+    calls,
+    bptt_segments: int | None,
+) -> int:
+    """Number of real backward windows for per-call BPTT."""
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
+    counts = compute_per_call_forward_counts(calls)
+    if not counts:
+        return 0
+    if bptt_segments is None:
+        return 1
+    if bptt_segments < 1:
+        raise ValueError(f"bptt_segments must be None or >= 1, got {bptt_segments}")
+    return math.ceil(len(counts) / bptt_segments)
 
 
 def _detach_dynamic_cache(cache: DynamicCache) -> DynamicCache:
@@ -2234,6 +2294,8 @@ def per_call_segmented_forward(
     loss_fn: SegmentLossFn,
     *,
     max_forward_passes: int,
+    max_bptt_window_forward_passes: list[int] | None = None,
+    bptt_segments: int | None = 1,
     device: torch.device,
 ) -> dict:
     """Per-call forward with PRE-TRIM input + cache splice on admission.
@@ -2268,8 +2330,12 @@ def per_call_segmented_forward(
     physical-position + piecewise-offset rule the worker uses so cached K
     and newly-written Q/K stay in the writer's RoPE frame.
     """
+    bptt_segments = _normalize_bptt_segments(bptt_segments)
     if not calls:
         raise ValueError("per_call_segmented_forward requires non-empty calls list")
+    if bptt_segments is not None and bptt_segments < 1:
+        raise ValueError(f"bptt_segments must be None or >= 1, got {bptt_segments}")
+    bptt_windowed = bptt_segments != 1
 
     plans, pre_trim_ids_py = _build_pre_trim_plan(calls)
     pre_trim_total = len(pre_trim_ids_py)
@@ -2279,6 +2345,10 @@ def per_call_segmented_forward(
 
     n_forwards_run = 0
     accumulated_loss = 0.0
+    window_loss: Tensor | None = None
+    calls_in_window = 0
+    forwards_in_window = 0
+    bptt_window_idx = 0
     persistent_cache: DynamicCache = DynamicCache()
     # Token id map for the live DynamicCache slots after admission splices.
     # `pre_trim_ids` is useful for loss coordinates, but after an admission
@@ -2302,6 +2372,14 @@ def per_call_segmented_forward(
     stream_mirror_decode_loss = (
         os.environ.get("KVE_TRAINER_STREAM_MIRROR_LOSS", "1") != "0"
     )
+    if bptt_windowed and mirror_decode and stream_mirror_decode_loss:
+        logger.warning(
+            "KVE_TRAINER_STREAM_MIRROR_LOSS is disabled when "
+            "per_call_segmented_forward runs with bptt_segments=%s; "
+            "losses must stay live until the BPTT window backward.",
+            str(bptt_segments),
+        )
+        stream_mirror_decode_loss = False
     base_attn_impl = getattr(getattr(model, "config", None), "_attn_implementation", None)
     past_attn_impl = os.environ.get("KVE_TRAINER_PAST_ATTN_IMPL", "") or None
     trace_b2b = os.environ.get("KVE_TRACE_B2B", "") == "1"
@@ -2314,6 +2392,68 @@ def per_call_segmented_forward(
             if x.strip()
         }
     trace_forward_sig = os.environ.get("KVE_TRACE_FORWARD_SIG", "0") == "1"
+
+    def _add_window_loss(loss_val: Tensor) -> None:
+        nonlocal accumulated_loss, window_loss
+        accumulated_loss += float(loss_val.detach().item())
+        if not bptt_windowed:
+            loss_val.backward()
+            return
+        window_loss = loss_val if window_loss is None else window_loss + loss_val
+
+    def _flush_bptt_window(force: bool = False) -> None:
+        nonlocal window_loss, calls_in_window, forwards_in_window
+        nonlocal bptt_window_idx, persistent_cache
+        if not bptt_windowed:
+            return
+        if not force and calls_in_window <= 0:
+            return
+        target_forwards = forwards_in_window
+        if max_bptt_window_forward_passes is not None:
+            if bptt_window_idx >= len(max_bptt_window_forward_passes):
+                raise ValueError(
+                    "max_bptt_window_forward_passes is shorter than the "
+                    f"local BPTT windows: idx={bptt_window_idx}, "
+                    f"len={len(max_bptt_window_forward_passes)}"
+                )
+            target_forwards = int(max_bptt_window_forward_passes[bptt_window_idx])
+        if target_forwards < forwards_in_window:
+            raise ValueError(
+                "max_bptt_window_forward_passes must be >= local forwards "
+                f"for each window, got target={target_forwards}, "
+                f"local={forwards_in_window}, window={bptt_window_idx}"
+            )
+        for _ in range(target_forwards - forwards_in_window):
+            dummy_loss = _dummy_forward_loss(
+                model,
+                merged_input_ids,
+                merged_position_ids,
+            )
+            window_loss = (
+                dummy_loss if window_loss is None else window_loss + dummy_loss
+            )
+        if window_loss is not None:
+            window_loss.backward()
+            window_loss = None
+        persistent_cache = _detach_dynamic_cache(persistent_cache)
+        calls_in_window = 0
+        forwards_in_window = 0
+        bptt_window_idx += 1
+
+    def _finish_call(loss_val: Tensor, n_forwards: int) -> None:
+        nonlocal n_forwards_run, calls_in_window, forwards_in_window
+        nonlocal persistent_cache
+        _add_window_loss(loss_val)
+        n_forwards_run += n_forwards
+        if bptt_windowed:
+            calls_in_window += 1
+            forwards_in_window += n_forwards
+            if bptt_segments is not None and calls_in_window >= bptt_segments:
+                _flush_bptt_window()
+        else:
+            # Detach the cache so the next call's backward stops at this
+            # call boundary (bptt_segments=1 / M3 semantics).
+            persistent_cache = _detach_dynamic_cache(persistent_cache)
 
     for plan in plans:
         call_idx = plan["call_idx"]
@@ -2431,8 +2571,9 @@ def per_call_segmented_forward(
                         past_attn_impl=past_attn_impl,
                     )
                     w_log = _extract_logits(out_w)
-                    warm_logits_detached = w_log.detach()
-                    (w_log.float().mean() * 0.0).backward()
+                    warm_logits_detached = w_log if bptt_windowed else w_log.detach()
+                    if not bptt_windowed:
+                        (w_log.float().mean() * 0.0).backward()
                     warm_n_forwards = 1
                     if trace_forward_this_call:
                         tok_head, tok_tail = _preview_1d(w_toks, 0, warm_end - cps)
@@ -2451,7 +2592,8 @@ def per_call_segmented_forward(
                     cache_position_ids_py.extend(
                         w_pos[0].detach().cpu().tolist()
                     )
-                persistent_cache = _detach_dynamic_cache(persistent_cache)
+                if not bptt_windowed:
+                    persistent_cache = _detach_dynamic_cache(persistent_cache)
 
                 running_cache_len = persistent_cache.get_seq_length()
                 for (es, te) in splices:
@@ -2618,10 +2760,7 @@ def per_call_segmented_forward(
                 )
 
                 loss_val = loss_fn(kept_logits, post_start, post_end)
-                loss_val.backward()
-                accumulated_loss += float(loss_val.detach().item())
-                n_forwards_run += warm_n_forwards + main_n_forwards
-                persistent_cache = _detach_dynamic_cache(persistent_cache)
+                _finish_call(loss_val, warm_n_forwards + main_n_forwards)
                 continue
 
             cache_len_at_entry = cache_len_before_splice
@@ -2776,10 +2915,7 @@ def per_call_segmented_forward(
             )
 
             loss_val = loss_fn(main_logits, post_start, post_end)
-            loss_val.backward()
-            accumulated_loss += float(loss_val.detach().item())
-            n_forwards_run += main_n_forwards
-            persistent_cache = _detach_dynamic_cache(persistent_cache)
+            _finish_call(loss_val, main_n_forwards)
             continue
 
         if has_admission:
@@ -2836,11 +2972,12 @@ def per_call_segmented_forward(
                     past_attn_impl=past_attn_impl,
                 )
                 w_log = _extract_logits(out_w)
-                warm_logits_detached = w_log.detach()
+                warm_logits_detached = w_log if bptt_windowed else w_log.detach()
                 # FSDP2 fwd/bwd lockstep — keep the existing 2-bwd shape
                 # for admission calls so dummy-pass padding stays
                 # symmetric across ranks.
-                (w_log.float().mean() * 0.0).backward()
+                if not bptt_windowed:
+                    (w_log.float().mean() * 0.0).backward()
                 warm_n_forwards = 1
                 if trace_forward_this_call:
                     tok_head, tok_tail = _preview_1d(w_toks, 0, warm_end - cps)
@@ -2859,7 +2996,8 @@ def per_call_segmented_forward(
                 cache_position_ids_py.extend(
                     w_pos[0].detach().cpu().tolist()
                 )
-            persistent_cache = _detach_dynamic_cache(persistent_cache)
+            if not bptt_windowed:
+                persistent_cache = _detach_dynamic_cache(persistent_cache)
 
             # Splice cache rows [es..es+te) per admission event in
             # post-prior-iter order. For call 0 admission, es is in
@@ -2966,6 +3104,8 @@ def per_call_segmented_forward(
 
                 accumulated_loss += main_loss
                 n_forwards_run += warm_n_forwards + main_n_forwards
+                persistent_cache = _detach_dynamic_cache(persistent_cache)
+                continue
             else:
                 main_logits, main_n_forwards = _forward_with_optional_decode_mirror(
                     model,
@@ -3015,9 +3155,7 @@ def per_call_segmented_forward(
                 )
 
                 loss_val = loss_fn(kept_logits, post_start, post_end)
-                loss_val.backward()
-                accumulated_loss += float(loss_val.detach().item())
-                n_forwards_run += warm_n_forwards + main_n_forwards
+                _finish_call(loss_val, warm_n_forwards + main_n_forwards)
         else:
             # ── Extension (or single first-call without admission): single forward.
             # Plain arange + cps in the normal same-frame case. If this
@@ -3127,22 +3265,22 @@ def per_call_segmented_forward(
             )
 
             loss_val = loss_fn(logits, post_start, post_end)
-            loss_val.backward()
-            accumulated_loss += float(loss_val.detach().item())
-            n_forwards_run += new_n_forwards
+            _finish_call(loss_val, new_n_forwards)
 
-        # Detach the cache so the next call's backward stops at this
-        # call's boundary (matches bptt_segments=1 / M3 semantics).
-        persistent_cache = _detach_dynamic_cache(persistent_cache)
-
-    n_dummy = max(0, max_forward_passes - n_forwards_run)
-    if n_dummy > 0:
-        _run_dummy_passes_with_backward(
-            model,
-            merged_input_ids,
-            merged_position_ids,
-            num_dummy=n_dummy,
-        )
+    if bptt_windowed:
+        _flush_bptt_window()
+        if max_bptt_window_forward_passes is not None:
+            while bptt_window_idx < len(max_bptt_window_forward_passes):
+                _flush_bptt_window(force=True)
+    else:
+        n_dummy = max(0, max_forward_passes - n_forwards_run)
+        if n_dummy > 0:
+            _run_dummy_passes_with_backward(
+                model,
+                merged_input_ids,
+                merged_position_ids,
+                num_dummy=n_dummy,
+            )
 
     return {
         "loss": torch.tensor(accumulated_loss, device=device),

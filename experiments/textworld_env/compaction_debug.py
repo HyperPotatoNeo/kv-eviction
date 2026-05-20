@@ -46,6 +46,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,9 @@ from pathlib import Path
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("VLLM_COMPACTION_DEBUG_TOKENS", "1")
+# Phase 2/4 verification logs: [PREFIX-HIT] per request at admission,
+# [EVICT-PRE-DECODE] + [EVICT-DONE] when admission compaction fires.
+os.environ.setdefault("VLLM_COMPACTION_VERBOSE", "1")
 
 
 # def _maybe_start_debugpy() -> None:
@@ -93,17 +97,30 @@ os.environ.setdefault("VLLM_COMPACTION_DEBUG_TOKENS", "1")
 # at window=4096 / stride=512 / block_size=16.
 # ---------------------------------------------------------------------------
 PAD = os.environ.get("PAD", "1") == "1"
+# Phase 2 prefix-caching smoke: set PREFIX_CACHE=1 to verify the
+# hash-chain rebuild on eviction (plans/prefix_caching_compaction.md).
+# Default off to match the historical compaction config.
+PREFIX_CACHE = os.environ.get("PREFIX_CACHE", "1") == "1"
+# Phase 4: assemble the next-turn prompt as [vLLM_kv_state + new_user_fragment]
+# instead of [full_chat_history]. Requires PREFIX_CACHE=1 + Phase 2 rehash;
+# this is what actually realizes the prefix-cache hit on the kept window.
+PHASE4 = True
 BLOCK_SIZE = 16
 PAD_FILLER_ID: int | None = None
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "30"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "2000"))
 DATASET_PATH = os.environ.get(
     "DATASET",
-    "/home/toolkit/kv-eviction/textworld_cooking_mix",
+    "/scratch/epp/textworld_cooking_mix",
 )
-GAME_IDX = int(os.environ.get("GAME_IDX", "500"))
+GAME_IDX = int(os.environ.get("GAME_IDX", "0"))
 OUT_PATH = os.environ.get(
     "OUT_PATH",
-    "/home/toolkit/kv-eviction/experiments/textworld_env/out_turn_debug.txt",
+    "/home/toolkit/emi_dir/kv-eviction/experiments/textworld_env/out_turn_debug.txt",
+)
+SUMMARY_OUT_PATH = os.environ.get(
+    "SUMMARY_OUT_PATH",
+    "/home/toolkit/emi_dir/kv-eviction/experiments/textworld_env/out_turn_debug_summary.txt",
 )
 
 
@@ -117,7 +134,7 @@ llm = LLM(
     max_model_len=16384,
     enforce_eager=True,
     gpu_memory_utilization=0.85,
-    enable_prefix_caching=False,
+    enable_prefix_caching=PREFIX_CACHE,
     block_size=BLOCK_SIZE,
     # Block-FIFO fallback (fires if KV exceeds window before turn-mode
     # accumulates max_turns completed turns).
@@ -125,8 +142,8 @@ llm = LLM(
     compaction_stride=512,
     # -1 = auto-detect system prompt end from first <|im_end|>.
     compaction_protected_prefix_tokens=-1,
-    # Turn-mode: 2-1 aggressive — evict 1 oldest completed turn whenever ≥2 live.
-    compaction_max_turns=2,
+    # Turn-mode: 3-1 — evict 1 oldest completed turn whenever ≥3 live.
+    compaction_max_turns=3,
     compaction_eviction_turn_stride=1,
     compaction_turn_end_token_id=None,
     # With PAD=True in the chat() helper, every <|im_end|> is padded so
@@ -138,7 +155,10 @@ llm = LLM(
     async_scheduling=False,
 )
 tokenizer = llm.get_tokenizer()
-print(f"loaded (turn-mode, PAD={PAD})")
+print(
+    f"loaded (turn-mode, PAD={PAD}, PREFIX_CACHE={PREFIX_CACHE}, "
+    f"PHASE4={PHASE4})"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +202,9 @@ def _render_padded(messages, im_end_id, block_size, filler_id):
 
 
 def chat(messages, max_tokens=512, temperature=1.0, seed=0, show_pad_summary=True):
-    sp = SamplingParams(max_tokens=max_tokens, temperature=temperature, seed=seed)
+    sp = SamplingParams(
+        max_tokens=max_tokens, temperature=temperature, seed=seed, logprobs=1
+    )
 
     if PAD:
         im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
@@ -210,6 +232,144 @@ def chat(messages, max_tokens=512, temperature=1.0, seed=0, show_pad_summary=Tru
     out = outs[0]
     text = out.outputs[0].text
     return text, out
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: incremental prompt assembly using vLLM's post-compaction kept view.
+#
+# Instead of re-rendering the full chat history each turn (which forces a
+# full re-prefill because compaction has rotated old turns out of cache),
+# we send the NEW user message appended to the canonical vLLM KV state:
+#
+#     submitted_prompt = [kept_token_ids_from_last_event]
+#                      + [assistant_output_tokens_from_last_turn]
+#                      + [<|im_start|>user\n{obs}<|im_end|>\n<|im_start|>assistant\n]
+#                      (with block-aligning fillers after the new im_end)
+#
+# With Phase 2 hash rebuild in vLLM, the kept_token_ids portion hashes
+# against rebuilt block entries — so we expect a near-100% prefix-cache
+# hit on everything except the new user fragment.
+# ---------------------------------------------------------------------------
+
+# Qwen3 chat-template fragment for "new user message + asst generation prompt".
+# Matches the suffix that tokenizer.apply_chat_template would produce when
+# extending a chat by one user turn with add_generation_prompt=True.
+_NEW_USER_FRAGMENT = "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+
+
+def _pad_after_im_end(tokens, start_offset, im_end_id, block_size, filler_id):
+    """Append tokens one at a time onto `start_offset` and insert
+    block-aligning fillers after each <|im_end|>. Mirrors `_render_padded`'s
+    pad logic but starts from a running offset rather than 0.
+
+    Returns (padded_tokens, total_pad_count).
+    """
+    out = []
+    running = start_offset
+    total_pad = 0
+    for tok in tokens:
+        out.append(tok)
+        running += 1
+        if tok == im_end_id:
+            remainder = running % block_size
+            n = (block_size - remainder) % block_size
+            if n:
+                out.extend([filler_id] * n)
+                running += n
+                total_pad += n
+    return out, total_pad
+
+
+def chat_phase4(
+    prev_state_tokens,
+    new_user_content,
+    max_tokens=512,
+    temperature=1.0,
+    seed=0,
+    show_summary=True,
+):
+    """Submit a turn as [prev_state_tokens + new_user_fragment].
+
+    prev_state_tokens is whatever vLLM physically has in KV after the
+    previous turn — i.e. last event's kept_token_ids extended by that
+    turn's assistant output (or the full submitted padded prompt if no
+    compaction fired that turn).
+    """
+    sp = SamplingParams(
+        max_tokens=max_tokens, temperature=temperature, seed=seed, logprobs=1
+    )
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    filler_id = _filler_token_id()
+
+    fragment_text = _NEW_USER_FRAGMENT.format(content=new_user_content)
+    fragment_ids = tokenizer.encode(fragment_text, add_special_tokens=False)
+
+    if PAD:
+        padded_fragment, total_pad = _pad_after_im_end(
+            fragment_ids, len(prev_state_tokens),
+            im_end_id, BLOCK_SIZE, filler_id,
+        )
+    else:
+        padded_fragment, total_pad = fragment_ids, 0
+
+    submitted = list(prev_state_tokens) + padded_fragment
+    if show_summary:
+        print(
+            f"  [phase4] prev_state={len(prev_state_tokens)} "
+            f"fragment_raw={len(fragment_ids)} "
+            f"fragment_padded={len(padded_fragment)} "
+            f"(+{total_pad}) total={len(submitted)}"
+        )
+
+    outs = llm.generate(
+        prompts=[{"prompt_token_ids": submitted}],
+        sampling_params=sp,
+        use_tqdm=False,
+    )
+    out = outs[0]
+    return out.outputs[0].text, out, submitted
+
+
+def derive_next_prev_state(out, submitted_prompt_ids):
+    """Compute the post-turn vLLM KV state from a RequestOutput.
+
+    If compaction fired during this turn, the last event's kept_token_ids
+    captures what physically survived after the final eviction; everything
+    sampled after that (the assistant output) is appended.
+
+    If no compaction fired, vLLM still has the full submitted prompt plus
+    the asst output in KV.
+
+    With PAD=True, the asst's trailing <|im_end|> is followed by the
+    chat-template message separator ("\n" for Qwen3) and filler tokens to
+    the next block boundary, so the next-turn user fragment's
+    <|im_start|>user lands block-aligned. Mirrors
+    `_build_incremental_padded` in src/kv_eviction/env.py. Without this,
+    `compaction_assume_aligned_turn_boundaries=True` makes the scheduler
+    snap `align_up(asst <|im_end|>)` into the next user message and
+    eviction overshoots the turn boundary.
+    """
+    events = getattr(out, "compaction_events", None) or []
+    if events:
+        kept = list(getattr(events[-1], "kept_token_ids", []))
+        # Defensive: pre-Phase-1 servers won't emit kept_token_ids; in that
+        # case fall back to the submitted prompt (no real Phase 4 hit, but
+        # at least the script doesn't crash).
+        if not kept:
+            kept = list(submitted_prompt_ids)
+    else:
+        kept = list(submitted_prompt_ids)
+    asst_tokens = list(out.outputs[0].token_ids)
+    state = kept + asst_tokens
+    if PAD:
+        filler_id = _filler_token_id()
+        sep_ids = tokenizer.encode("\n", add_special_tokens=False)
+        state.extend(sep_ids)
+        remainder = len(state) % BLOCK_SIZE
+        n = (BLOCK_SIZE - remainder) % BLOCK_SIZE
+        if n:
+            state.extend([filler_id] * n)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -283,13 +443,40 @@ def main():
 
     score = 0
 
-    with open(OUT_PATH, "w") as f:
-        f.write(f"# TextWorld turn-mode compaction trace (PAD={PAD})\n")
+    # Phase 4 carry state: vLLM's canonical KV-state token sequence after
+    # the previous turn. Initialized on turn 0 from the full first
+    # submitted prompt (kept = entire submitted prompt when no compaction
+    # has fired yet).
+    prev_state_tokens: list[int] | None = None
+
+    # Per-turn timing for cached-vs-uncached benchmarking. Each entry:
+    # (turn, gen_seconds, prompt_tokens, output_tokens, cached_tokens).
+    turn_timings: list[tuple[int, float, int, int, int]] = []
+
+    with open(OUT_PATH, "w") as f, open(SUMMARY_OUT_PATH, "w") as fs:
+        f.write(
+            f"# TextWorld turn-mode compaction trace "
+            f"(PAD={PAD} PREFIX_CACHE={PREFIX_CACHE} PHASE4={PHASE4})\n"
+        )
         f.write(
             f"# dataset={DATASET_PATH} game_idx={GAME_IDX} "
             f"game_file={game_file} max_score={max_score} "
             f"max_turns={MAX_TURNS}\n"
         )
+        # One-line-per-turn compaction summary log. Format:
+        #   turn=N events=X cumul=Y prompt=A output=B cached=C(%) \
+        #     last_evicted=Z turns_evicted_after=W tokens_evicted_this_turn=T
+        fs.write(
+            "# turn-mode compaction summary "
+            f"(max_turns=3 stride=1 game_idx={GAME_IDX})\n"
+        )
+        fs.write(
+            "# events = NEW events this turn (cumulative count is in cumul). "
+            "tokens_evicted_this_turn sums tokens_evicted across new events.\n"
+        )
+        fs.flush()
+        cumul_events = 0
+        cumul_tokens_evicted = 0
         f.write("=" * 80 + "\n")
         f.write("SYSTEM PROMPT\n")
         f.write("=" * 80 + "\n")
@@ -304,24 +491,59 @@ def main():
             for turn in range(MAX_TURNS):
                 print(f"turn {turn}...", end=" ", flush=True)
 
-                text, out = chat(
-                    conv,
-                    max_tokens=2000,
-                    temperature=1.0,
-                    seed=turn,
-                    show_pad_summary=True,
-                )
+                t0 = time.perf_counter()
+                if PHASE4 and prev_state_tokens is not None:
+                    # Submit only the new user message after the carried
+                    # post-compaction KV state. conv[-1] is the latest
+                    # appended user obs (set at end of previous iteration).
+                    new_user_content = conv[-1]["content"]
+                    text, out, submitted_ids = chat_phase4(
+                        prev_state_tokens,
+                        new_user_content,
+                        max_tokens=MAX_TOKENS,
+                        temperature=0.0,
+                        seed=turn,
+                        show_summary=True,
+                    )
+                else:
+                    text, out = chat(
+                        conv,
+                        max_tokens=MAX_TOKENS,
+                        temperature=0.0,
+                        seed=turn,
+                        show_pad_summary=True,
+                    )
+                    submitted_ids = (
+                        list(out.prompt_token_ids) if out.prompt_token_ids else []
+                    )
+                gen_seconds = time.perf_counter() - t0
                 events = getattr(out, "compaction_events", None) or []
                 action = parse_action(text)
 
                 f.write("=" * 80 + "\n")
                 f.write(f"TURN {turn}\n")
                 f.write("=" * 80 + "\n")
+                prompt_len = (
+                    len(out.prompt_token_ids) if out.prompt_token_ids else 0
+                )
+                # Phase 2 reporting: num_cached_tokens is set when prefix
+                # caching is on. Hit rate = cached / prompt_len.
+                cached = getattr(out, "num_cached_tokens", None) or 0
+                hit_pct = (100.0 * cached / prompt_len) if prompt_len else 0.0
+                output_len = len(out.outputs[0].token_ids)
+                turn_timings.append(
+                    (turn, gen_seconds, prompt_len, output_len, cached)
+                )
                 f.write(
-                    f"prompt_tokens(scheduled)="
-                    f"{len(out.prompt_token_ids) if out.prompt_token_ids else '?'} "
-                    f"output_tokens={len(out.outputs[0].token_ids)} "
-                    f"events={len(events)}\n\n"
+                    f"prompt_tokens(scheduled)={prompt_len} "
+                    f"output_tokens={output_len} "
+                    f"cached_tokens={cached} ({hit_pct:.1f}%) "
+                    f"events={len(events)} "
+                    f"gen_seconds={gen_seconds:.3f}\n\n"
+                )
+                print(
+                    f"  prompt={prompt_len} cached={cached} ({hit_pct:.1f}%) "
+                    f"events={len(events)} t={gen_seconds:.3f}s"
                 )
 
                 if events:
@@ -329,6 +551,57 @@ def main():
                     for i, ev in enumerate(events):
                         f.write(_format_event(i, ev) + "\n")
                     f.write("\n")
+
+                # Summary log: one line per turn. Each chat() submits a new
+                # vLLM request, so `events` here is the per-request list for
+                # THIS turn (not cumulative across turns).
+                tokens_evicted_this_turn = sum(
+                    int(getattr(ev, "tokens_evicted", 0)) for ev in events
+                )
+                cumul_events += len(events)
+                cumul_tokens_evicted += tokens_evicted_this_turn
+                last_ev = events[-1] if events else None
+                last_turn_evicted = (
+                    getattr(last_ev, "last_turn_evicted", -1) if last_ev else -1
+                )
+                turns_evicted_after = (
+                    getattr(last_ev, "num_turns_evicted_after", 0) if last_ev else 0
+                )
+                fs.write(
+                    f"turn={turn:2d} events={len(events)} "
+                    f"prompt={prompt_len} output={output_len} "
+                    f"cached={cached} ({hit_pct:5.1f}%) "
+                    f"tokens_evicted={tokens_evicted_this_turn} "
+                    f"last_turn_evicted={last_turn_evicted} "
+                    f"turns_evicted_after={turns_evicted_after} "
+                    f"cumul_events={cumul_events} "
+                    f"cumul_tokens_evicted={cumul_tokens_evicted}\n"
+                )
+                # Decoded evicted text per event (requires
+                # VLLM_COMPACTION_DEBUG_TOKENS=1 — set at top of file).
+                for i, ev in enumerate(events):
+                    ids = list(getattr(ev, "evicted_token_ids", []) or [])
+                    if not ids:
+                        continue
+                    try:
+                        decoded = tokenizer.decode(ids, skip_special_tokens=False)
+                    except Exception as e:
+                        decoded = f"<decode-failed: {e}>"
+                    fs.write(f"  evicted[event {i}] ({len(ids)} tok):\n")
+                    for ln in (decoded.splitlines() or [decoded]):
+                        fs.write(f"    | {ln}\n")
+                # Decoded assistant output for this turn.
+                try:
+                    out_decoded = tokenizer.decode(
+                        out.outputs[0].token_ids, skip_special_tokens=False
+                    )
+                except Exception as e:
+                    out_decoded = f"<decode-failed: {e}>"
+                fs.write(f"  output ({output_len} tok):\n")
+                for ln in (out_decoded.splitlines() or [out_decoded]):
+                    fs.write(f"    | {ln}\n")
+                fs.write("\n")
+                fs.flush()
 
                 f.write("ASSISTANT:\n")
                 f.write(text + "\n\n")
@@ -338,6 +611,14 @@ def main():
                 f.write("ASSISTANT (raw, skip_special_tokens=False):\n")
                 f.write(raw + "\n\n")
                 f.write(f"PARSED ACTION: {action!r}\n\n")
+
+                # Phase 4 carry: derive post-turn KV state for the next
+                # iteration. derive_next_prev_state uses the LAST event's
+                # kept_token_ids when compaction fired, else the full
+                # submitted prompt, then appends asst output. This is
+                # what vLLM physically has in cache going into turn N+1.
+                if PHASE4:
+                    prev_state_tokens = derive_next_prev_state(out, submitted_ids)
 
                 conv.append({"role": "assistant", "content": text})
 
@@ -392,6 +673,74 @@ def main():
                 env.close()
             except Exception:
                 pass
+
+        # ---------------------------------------------------------------
+        # Timing summary (for cached-vs-uncached benchmarking)
+        # ---------------------------------------------------------------
+        if turn_timings:
+            total_gen = sum(t[1] for t in turn_timings)
+            total_prompt = sum(t[2] for t in turn_timings)
+            total_output = sum(t[3] for t in turn_timings)
+            total_cached = sum(t[4] for t in turn_timings)
+            n = len(turn_timings)
+            hit_overall = (100.0 * total_cached / total_prompt) if total_prompt else 0.0
+            tok_per_s = (total_prompt + total_output) / total_gen if total_gen else 0.0
+
+            # Per-token timings (ms). Multiple denominators because each
+            # answers a different question:
+            #   - per_total_tok: overall throughput inverse (lower = faster).
+            #   - per_prompt_tok: prefill-side cost; should drop with caching.
+            #   - per_output_tok: decode-side cost; caching shouldn't move this.
+            #   - per_uncached_prompt_tok: prefill cost amortized only over
+            #     tokens that actually had to be prefilled (prompt - cached).
+            uncached_prompt = max(total_prompt - total_cached, 0)
+            ms_per_total = 1000.0 * total_gen / max(total_prompt + total_output, 1)
+            ms_per_prompt = 1000.0 * total_gen / max(total_prompt, 1)
+            ms_per_output = 1000.0 * total_gen / max(total_output, 1)
+            ms_per_uncached_prompt = (
+                1000.0 * total_gen / uncached_prompt if uncached_prompt > 0 else float("nan")
+            )
+
+            f.write("=" * 80 + "\n")
+            f.write(
+                f"TIMING SUMMARY (PREFIX_CACHE={PREFIX_CACHE} PAD={PAD} "
+                f"PHASE4={PHASE4})\n"
+            )
+            f.write("=" * 80 + "\n")
+            f.write(
+                f"turns={n} total_gen_s={total_gen:.3f} "
+                f"avg_per_turn_s={total_gen / n:.3f}\n"
+                f"total_prompt_tokens={total_prompt} "
+                f"total_output_tokens={total_output} "
+                f"total_cached={total_cached} ({hit_overall:.1f}%)\n"
+                f"throughput_tokens_per_s={tok_per_s:.1f}\n"
+                f"ms_per_total_tok={ms_per_total:.3f} "
+                f"ms_per_prompt_tok={ms_per_prompt:.3f} "
+                f"ms_per_output_tok={ms_per_output:.3f} "
+                f"ms_per_uncached_prompt_tok={ms_per_uncached_prompt:.3f}\n\n"
+            )
+            f.write("per-turn (turn, gen_s, prompt, output, cached, hit%):\n")
+            for tt in turn_timings:
+                turn_i, gs, pl, ol, c = tt
+                hp = (100.0 * c / pl) if pl else 0.0
+                f.write(
+                    f"  turn={turn_i:3d} t={gs:7.3f}s "
+                    f"prompt={pl:6d} output={ol:5d} "
+                    f"cached={c:6d} ({hp:5.1f}%)\n"
+                )
+
+            print(
+                f"\n=== TIMING SUMMARY (PREFIX_CACHE={PREFIX_CACHE}) ===\n"
+                f"turns={n} total_gen={total_gen:.3f}s "
+                f"avg/turn={total_gen / n:.3f}s\n"
+                f"prompt_toks={total_prompt} output_toks={total_output} "
+                f"cached={total_cached} ({hit_overall:.1f}%)\n"
+                f"throughput={tok_per_s:.1f} tok/s\n"
+                f"ms/total_tok={ms_per_total:.3f} "
+                f"ms/prompt_tok={ms_per_prompt:.3f} "
+                f"ms/output_tok={ms_per_output:.3f} "
+                f"ms/uncached_prompt_tok={ms_per_uncached_prompt:.3f}"
+            )
 
     print(f"\nfull trace written to {OUT_PATH} (PAD={PAD})")
     print(f"size: {os.path.getsize(OUT_PATH)} bytes")

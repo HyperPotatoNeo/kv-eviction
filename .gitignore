@@ -33,3 +33,11 @@ experiments/phase3_kl_test/compare_modes_*.log
 # absolute paths, SLURM account codes, podman-hpc invocation, etc.).
 # The tracked README.md has cluster-agnostic instructions.
 README.cluster.md
+
+# Per-directory wandb config (see .envrc) — local API key + settings.
+.netrc
+.wandb-config/
+.env
+
+# Local debugging/testbed archives; intentionally not committed.
+.local_artifacts/
