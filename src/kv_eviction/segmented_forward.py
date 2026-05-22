@@ -95,6 +95,10 @@ logger = logging.getLogger(__name__)
 # callback typically slices advantages / old_logprobs / loss_mask at
 # positions [full_logit_start + 1, full_logit_end + 1).
 SegmentLossFn = Callable[[Tensor, int, int], Tensor]
+SegmentDistillationFn = Callable[[Tensor, Tensor, int, int], Tensor]
+SegmentDistillationPrepareFn = Callable[[Tensor, int, int], None]
+SegmentDistillationTeacherFn = Callable[[Tensor, int, int], None]
+SegmentDistillationLossFn = Callable[[Tensor, int, int], Tensor]
 
 
 @dataclass(frozen=True)
@@ -2581,6 +2585,10 @@ def flex_mask_segmented_forward(
     loss_fn: SegmentLossFn,
     *,
     max_forward_passes: int | None = None,
+    distillation_fn: SegmentDistillationFn | None = None,
+    distillation_prepare_fn: SegmentDistillationPrepareFn | None = None,
+    distillation_teacher_fn: SegmentDistillationTeacherFn | None = None,
+    distillation_loss_fn: SegmentDistillationLossFn | None = None,
     device: torch.device,
 ) -> dict:
     """Single-forward FlexAttention path for admission KV eviction.
@@ -2628,6 +2636,81 @@ def flex_mask_segmented_forward(
     )
 
     _set_attn_implementation_if_needed(model, "flex_attention")
+
+    if distillation_fn is not None and (
+        distillation_prepare_fn is not None
+        or distillation_teacher_fn is not None
+        or distillation_loss_fn is not None
+    ):
+        raise ValueError(
+            "Use either distillation_fn or the compact distillation hook set, not both."
+        )
+
+    if (distillation_prepare_fn is not None or distillation_teacher_fn is not None) and (
+        distillation_loss_fn is None
+    ):
+        raise ValueError(
+            "distillation_loss_fn is required when compact distillation hooks are used."
+        )
+
+    if distillation_prepare_fn is not None:
+        with torch.no_grad():
+            student_probe_out = model(
+                input_ids=writer_ids,
+                position_ids=writer_positions,
+                attention_mask=block_mask,
+                use_cache=False,
+                kernel_options=_flex_kernel_options_from_env(),
+            )
+            student_probe_logits = _extract_logits(student_probe_out)
+            for writer_start, writer_end, full_start, full_end in timeline.loss_ranges:
+                if writer_end == writer_start:
+                    continue
+                distillation_prepare_fn(
+                    student_probe_logits[:, writer_start:writer_end, :],
+                    full_start,
+                    full_end,
+                )
+            del student_probe_logits, student_probe_out
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    teacher_logits: Tensor | None = None
+    if distillation_fn is not None:
+        with torch.no_grad():
+            teacher_out = model(
+                input_ids=writer_ids,
+                position_ids=writer_positions,
+                attention_mask=None,
+                use_cache=False,
+                kernel_options=_flex_kernel_options_from_env(),
+            )
+            teacher_logits = _extract_logits(teacher_out).detach().to("cpu")
+            del teacher_out
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    elif distillation_teacher_fn is not None:
+        with torch.no_grad():
+            teacher_out = model(
+                input_ids=writer_ids,
+                position_ids=writer_positions,
+                attention_mask=None,
+                use_cache=False,
+                kernel_options=_flex_kernel_options_from_env(),
+            )
+            teacher_probe_logits = _extract_logits(teacher_out)
+            for writer_start, writer_end, full_start, full_end in timeline.loss_ranges:
+                if writer_end == writer_start:
+                    continue
+                distillation_teacher_fn(
+                    teacher_probe_logits[:, writer_start:writer_end, :],
+                    full_start,
+                    full_end,
+                )
+            del teacher_probe_logits, teacher_out
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     out = model(
         input_ids=writer_ids,
         position_ids=writer_positions,
@@ -2651,7 +2734,28 @@ def flex_mask_segmented_forward(
             )
         if writer_end == writer_start:
             continue
-        loss_val = loss_fn(logits[:, writer_start:writer_end, :], full_start, full_end)
+        student_slice = logits[:, writer_start:writer_end, :]
+        distill_loss = None
+        if distillation_fn is not None:
+            assert teacher_logits is not None
+            distill_loss = distillation_fn(
+                student_slice,
+                teacher_logits[:, writer_start:writer_end, :].to(
+                    device=student_slice.device,
+                    non_blocking=True,
+                ),
+                full_start,
+                full_end,
+            )
+        elif distillation_loss_fn is not None:
+            distill_loss = distillation_loss_fn(
+                student_slice,
+                full_start,
+                full_end,
+            )
+        loss_val = loss_fn(student_slice, full_start, full_end)
+        if distill_loss is not None:
+            loss_val = loss_val + distill_loss
         accumulated_loss += float(loss_val.detach().item())
         window_loss = loss_val if window_loss is None else window_loss + loss_val
 
