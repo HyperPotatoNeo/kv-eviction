@@ -62,6 +62,7 @@ Not attempted here; we ship M3 first.
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -94,6 +95,17 @@ logger = logging.getLogger(__name__)
 # callback typically slices advantages / old_logprobs / loss_mask at
 # positions [full_logit_start + 1, full_logit_end + 1).
 SegmentLossFn = Callable[[Tensor, int, int], Tensor]
+
+
+@dataclass(frozen=True)
+class _FlexMaskWriterTimeline:
+    """Packed writer timeline for the masked FlexAttention path."""
+
+    input_ids: list[int]
+    position_ids: list[int]
+    death_indices: list[int]
+    # Tuples are (writer_start, writer_end, full_logit_start, full_logit_end).
+    loss_ranges: list[tuple[int, int, int, int]]
 
 
 def _normalize_bptt_segments(bptt_segments: int | None) -> int | None:
@@ -1051,7 +1063,9 @@ def compute_per_call_forward_counts(calls) -> list[int]:
         cpe = plan["call_pre_end"]
         has_admission = plan["has_admission"]
         sub_end_pre = plan.get("sub_end_pre", plan["inherited_end_pre"])
+        b2b_warm_end_pre = plan.get("b2b_warm_end_pre", sub_end_pre)
         pad_len = plan.get("pad_len", 0)
+        prefix_replay_len = len(plan.get("prefix_replay_tokens", []) or [])
         mirror_decode_has_filter = (
             mirror_decode_call_filter is not None or mirror_decode_last_n > 0
         )
@@ -1071,15 +1085,18 @@ def compute_per_call_forward_counts(calls) -> list[int]:
             continue
 
         n = 0
+        if prefix_replay_len > 0:
+            n += 1
         if has_admission and cps > 0:
-            if b2b_warmup_splice:
-                warm_end = sub_end_pre
+            if b2b_warmup_splice or prefix_replay_len > 0:
+                warm_end = b2b_warm_end_pre
                 if warm_end > cps:
                     n += 1
                 main_start = warm_end
+                main_prompt_len = max(0, min(sub_end_pre, cpe) - main_start)
                 n += _count_tail_forwards(
                     seq_len=cpe - main_start,
-                    prompt_len=0,
+                    prompt_len=main_prompt_len,
                     pad_len=pad_len,
                     mirror_decode=mirror_decode_this_call,
                 )
@@ -1814,6 +1831,12 @@ def _build_pre_trim_plan(calls):
             if int(e.num_output_tokens_at_compaction) == 0
             and int(e.tokens_evicted) == 0
         ]
+        synthetic_cached_tokens = None
+        if synthetic_events:
+            synthetic_cached_tokens = (
+                int(synthetic_events[-1].num_prompt_tokens)
+                - int(synthetic_events[-1].new_user_fragment_len)
+            )
 
         # Determine where this call's NEW content starts in sub.
         # Call 0: starts at 0 (whole sub is new).
@@ -1847,6 +1870,14 @@ def _build_pre_trim_plan(calls):
             )
             new_content_start_in_sub = cum_post
             call_pre_start = cum_pre
+            prefix_cache_keep_len = None
+            prefix_replay_tokens: list[int] = []
+            if (
+                synthetic_cached_tokens is not None
+                and synthetic_cached_tokens < cum_post
+            ):
+                prefix_cache_keep_len = synthetic_cached_tokens
+                prefix_replay_tokens = sub[synthetic_cached_tokens:cum_post]
 
             # DIAG: token-equality check between orchestrator's sub[:cum_post]
             # (= what stitching SAYS V's cache holds) and trainer's replayed
@@ -1879,6 +1910,9 @@ def _build_pre_trim_plan(calls):
                         f"[STITCH-OK] call={call_idx}  cum_post={cum_post}",
                         file=_sys.stderr, flush=True,
                     )
+        if call_idx == 0:
+            prefix_cache_keep_len = None
+            prefix_replay_tokens = []
 
         # Append this call's new pre-trim content. For extension calls
         # following an admission, sub[cum_post:] is everything past the
@@ -2039,6 +2073,16 @@ def _build_pre_trim_plan(calls):
         # end of the warmup output when V's evict range extends
         # into the new_user_fragment.
         sub_end_pre = call_pre_start + (sub_len - new_content_start_in_sub)
+        admission_nuf_len = (
+            int(admission_events[-1].new_user_fragment_len)
+            if admission_events else 0
+        )
+        b2b_warm_end_pre = sub_end_pre
+        if call_idx > 0 and admission_events:
+            b2b_warm_end_pre = call_pre_start + max(
+                0,
+                (sub_len - new_content_start_in_sub) - admission_nuf_len,
+            )
 
         plans.append({
             "call_idx": call_idx,
@@ -2046,6 +2090,7 @@ def _build_pre_trim_plan(calls):
             "call_pre_end": call_pre_end,
             "inherited_end_pre": inherited_end_pre,
             "sub_end_pre": sub_end_pre,
+            "b2b_warm_end_pre": b2b_warm_end_pre,
             "has_admission": len(admission_events) > 0,
             "splices": splices,  # [(es, te), ...] in CURRENT sub coord
             "post_start": post_start,
@@ -2054,11 +2099,12 @@ def _build_pre_trim_plan(calls):
                                             # this call's contribution
                                             # that survive admission
             "new_content_start_in_sub": new_content_start_in_sub,
+            "prefix_cache_keep_len": prefix_cache_keep_len,
+            "prefix_replay_tokens": prefix_replay_tokens,
             "sub_len": sub_len,
             "comp_len": comp_len,
             "contrib_pre_len": contrib_pre_len,
-            "nuf_len": (int(admission_events[-1].new_user_fragment_len)
-                        if admission_events else 0),
+            "nuf_len": admission_nuf_len,
             "writer_offset": writer_offset,
             "admission_offset_after": admission_offset_after,
             "evict_start_in_sub": evict_start_in_sub,
@@ -2200,6 +2246,442 @@ def _build_pre_trim_plan(calls):
                 f"{len(expected_v_cache_tokens)} != cum_post={cum_post}"
             )
     return plans, pre_trim_ids
+
+
+def _position_id_list(
+    start: int,
+    end: int,
+    *,
+    offset: int = 0,
+    protected_prefix_len: int = 0,
+) -> list[int]:
+    """Python-list equivalent of _piecewise_positions."""
+    positions = list(range(start, end))
+    if offset == 0:
+        return positions
+    if protected_prefix_len > 0:
+        return [
+            pos + (offset if pos >= protected_prefix_len else 0)
+            for pos in positions
+        ]
+    return [pos + offset for pos in positions]
+
+
+def _build_flex_mask_writer_timeline(calls) -> _FlexMaskWriterTimeline:
+    """Build a single forward timeline plus per-key liveness metadata.
+
+    Each element of the returned timeline is one K/V write in the order
+    vLLM would have produced it. Eviction is represented by death_indices:
+    key row k is visible to query q iff k <= q < death_indices[k].
+    """
+    plans, pre_trim_ids_py = _build_pre_trim_plan(calls)
+
+    writer_input_ids: list[int] = []
+    writer_position_ids: list[int] = []
+    death_indices: list[int | None] = []
+    live_writer_indices: list[int] = []
+    loss_ranges: list[tuple[int, int, int, int]] = []
+
+    def _append_write(
+        pre_start: int,
+        pre_end: int,
+        position_ids: list[int],
+    ) -> tuple[int, int]:
+        if pre_end < pre_start:
+            raise ValueError(
+                f"bad write range [{pre_start}, {pre_end})"
+            )
+        n_tokens = pre_end - pre_start
+        if n_tokens != len(position_ids):
+            raise ValueError(
+                "position count does not match write range: "
+                f"range=[{pre_start},{pre_end}) positions={len(position_ids)}"
+            )
+        writer_start = len(writer_input_ids)
+        writer_input_ids.extend(pre_trim_ids_py[pre_start:pre_end])
+        writer_position_ids.extend(position_ids)
+        death_indices.extend([None] * n_tokens)
+        live_writer_indices.extend(range(writer_start, writer_start + n_tokens))
+        return writer_start, writer_start + n_tokens
+
+    def _append_tokens(
+        token_ids: list[int],
+        position_ids: list[int],
+    ) -> tuple[int, int]:
+        n_tokens = len(token_ids)
+        if n_tokens != len(position_ids):
+            raise ValueError(
+                "position count does not match token count: "
+                f"tokens={n_tokens} positions={len(position_ids)}"
+            )
+        writer_start = len(writer_input_ids)
+        writer_input_ids.extend(token_ids)
+        writer_position_ids.extend(position_ids)
+        death_indices.extend([None] * n_tokens)
+        live_writer_indices.extend(range(writer_start, writer_start + n_tokens))
+        return writer_start, writer_start + n_tokens
+
+    def _splice_live_cache(evict_start: int, tokens_evicted: int, call_idx: int) -> None:
+        if tokens_evicted <= 0:
+            return
+        evict_end = evict_start + tokens_evicted
+        if evict_start < 0 or evict_end > len(live_writer_indices):
+            raise ValueError(
+                f"call {call_idx}: flex-mask splice [{evict_start},{evict_end}) "
+                f"out of live cache len={len(live_writer_indices)}"
+            )
+        death_idx = len(writer_input_ids)
+        for writer_idx in live_writer_indices[evict_start:evict_end]:
+            death_indices[writer_idx] = death_idx
+        del live_writer_indices[evict_start:evict_end]
+
+    for plan in plans:
+        call_idx = int(plan["call_idx"])
+        cps = int(plan["call_pre_start"])
+        cpe = int(plan["call_pre_end"])
+        if cpe <= cps:
+            continue
+
+        has_admission = bool(plan["has_admission"])
+        splices = list(plan["splices"])
+        post_start = int(plan["post_start"])
+        post_end = int(plan["post_end"])
+        pad_len = int(plan.get("pad_len", 0))
+        writer_offset = int(plan["writer_offset"])
+        admission_offset_after = int(plan["admission_offset_after"])
+        protected_prefix_len = int(
+            plan.get("protected_prefix_len", plan["evict_start_in_sub"])
+        )
+        sub_end_pre = int(plan.get("sub_end_pre", plan["inherited_end_pre"]))
+        b2b_warm_end_pre = int(plan.get("b2b_warm_end_pre", sub_end_pre))
+        prefix_cache_keep_len = plan.get("prefix_cache_keep_len")
+        prefix_replay_tokens = list(plan.get("prefix_replay_tokens", []) or [])
+
+        loss_len = post_end - post_start
+        if loss_len < 0:
+            raise ValueError(
+                f"call {call_idx}: negative flex-mask loss length "
+                f"post=[{post_start},{post_end})"
+            )
+
+        if prefix_cache_keep_len is not None:
+            keep_len = int(prefix_cache_keep_len)
+            if keep_len < 0 or keep_len > len(live_writer_indices):
+                raise ValueError(
+                    f"call {call_idx}: prefix keep len {keep_len} out of "
+                    f"live cache len={len(live_writer_indices)}"
+                )
+            death_idx = len(writer_input_ids)
+            for writer_idx in live_writer_indices[keep_len:]:
+                death_indices[writer_idx] = death_idx
+            del live_writer_indices[keep_len:]
+            if prefix_replay_tokens:
+                if writer_offset != 0:
+                    positions = _position_id_list(
+                        keep_len,
+                        keep_len + len(prefix_replay_tokens),
+                        offset=writer_offset,
+                        protected_prefix_len=protected_prefix_len,
+                    )
+                else:
+                    positions = _position_id_list(
+                        keep_len,
+                        keep_len + len(prefix_replay_tokens),
+                    )
+                _append_tokens(prefix_replay_tokens, positions)
+
+        if has_admission and cps > 0:
+            if prefix_replay_tokens:
+                writer_start = len(writer_input_ids)
+                warm_end = b2b_warm_end_pre
+                if warm_end > cps:
+                    physical_start = len(live_writer_indices)
+                    if writer_offset != 0:
+                        warm_positions = _position_id_list(
+                            physical_start,
+                            physical_start + (warm_end - cps),
+                            offset=writer_offset,
+                            protected_prefix_len=protected_prefix_len,
+                        )
+                    else:
+                        warm_positions = _position_id_list(
+                            physical_start,
+                            physical_start + (warm_end - cps),
+                        )
+                    _append_write(cps, warm_end, warm_positions)
+
+                for es, te in splices:
+                    _splice_live_cache(int(es), int(te), call_idx)
+
+                main_start = warm_end
+                if cpe > main_start:
+                    physical_start = len(live_writer_indices)
+                    if admission_offset_after != 0:
+                        main_positions = _position_id_list(
+                            physical_start,
+                            physical_start + (cpe - main_start),
+                            offset=admission_offset_after,
+                            protected_prefix_len=protected_prefix_len,
+                        )
+                    else:
+                        main_positions = _position_id_list(
+                            physical_start,
+                            physical_start + (cpe - main_start),
+                        )
+                    _append_write(main_start, cpe, main_positions)
+                loss_ranges.append(
+                    (writer_start, writer_start + loss_len, post_start, post_end)
+                )
+                continue
+
+            # B.2b default path: admission splices prior live cache first,
+            # then this call writes its new pre-trim contribution.
+            for es, te in splices:
+                _splice_live_cache(int(es), int(te), call_idx)
+
+            writer_start = len(writer_input_ids)
+            if admission_offset_after != 0:
+                physical_start = len(live_writer_indices)
+                positions = _position_id_list(
+                    physical_start,
+                    physical_start + (cpe - cps),
+                    offset=admission_offset_after,
+                    protected_prefix_len=protected_prefix_len,
+                )
+            else:
+                positions = _position_id_list(cps, cpe)
+            _append_write(cps, cpe, positions)
+            loss_ranges.append(
+                (writer_start, writer_start + loss_len, post_start, post_end)
+            )
+            continue
+
+        if has_admission:
+            # B.2a: write the full submitted prompt under pre-admission
+            # context, mark evicted rows dead, then write completion/pad
+            # rows under post-admission context.
+            writer_start = len(writer_input_ids)
+            warm_end = sub_end_pre
+            if warm_end > cps:
+                if writer_offset != 0:
+                    warm_positions = _position_id_list(
+                        cps,
+                        warm_end,
+                        offset=writer_offset,
+                        protected_prefix_len=protected_prefix_len,
+                    )
+                else:
+                    warm_positions = _position_id_list(cps, warm_end)
+                _append_write(cps, warm_end, warm_positions)
+
+            for es, te in splices:
+                _splice_live_cache(int(es), int(te), call_idx)
+
+            main_start = sub_end_pre
+            if cpe > main_start:
+                if admission_offset_after != 0:
+                    physical_start = len(live_writer_indices)
+                    main_positions = _position_id_list(
+                        physical_start,
+                        physical_start + (cpe - main_start),
+                        offset=admission_offset_after,
+                        protected_prefix_len=protected_prefix_len,
+                    )
+                else:
+                    main_positions = _position_id_list(main_start, cpe)
+                _append_write(main_start, cpe, main_positions)
+
+            loss_ranges.append(
+                (writer_start, writer_start + loss_len, post_start, post_end)
+            )
+            continue
+
+        # Extension or first call without admission.
+        writer_start = len(writer_input_ids)
+        if writer_offset != 0:
+            physical_start = len(live_writer_indices)
+            positions = _position_id_list(
+                physical_start,
+                physical_start + (cpe - cps),
+                offset=writer_offset,
+                protected_prefix_len=protected_prefix_len,
+            )
+        elif prefix_replay_tokens:
+            physical_start = len(live_writer_indices)
+            positions = _position_id_list(
+                physical_start,
+                physical_start + (cpe - cps),
+            )
+        else:
+            positions = _position_id_list(cps, cpe)
+        _append_write(cps, cpe, positions)
+        loss_ranges.append(
+            (writer_start, writer_start + loss_len, post_start, post_end)
+        )
+
+    final_len = len(writer_input_ids)
+    resolved_deaths: list[int] = [
+        final_len if death_idx is None else int(death_idx)
+        for death_idx in death_indices
+    ]
+    for writer_idx, death_idx in enumerate(resolved_deaths):
+        if death_idx <= writer_idx:
+            raise ValueError(
+                f"writer row {writer_idx} has invalid death_idx={death_idx}"
+            )
+
+    return _FlexMaskWriterTimeline(
+        input_ids=writer_input_ids,
+        position_ids=writer_position_ids,
+        death_indices=resolved_deaths,
+        loss_ranges=loss_ranges,
+    )
+
+
+def _flex_kernel_options_from_env() -> dict | None:
+    """Optional torch flex_attention kernel_options for diagnostics.
+
+    Production defaults to PyTorch's choices. These env vars let us probe
+    numerical and speed sensitivity without changing config surfaces.
+    """
+    options: dict[str, int | bool | str] = {}
+    for env_name, opt_name in (
+        ("KVE_FLEX_BLOCK_M", "BLOCK_M"),
+        ("KVE_FLEX_BLOCK_N", "BLOCK_N"),
+        ("KVE_FLEX_BLOCK_M1", "BLOCK_M1"),
+        ("KVE_FLEX_BLOCK_N1", "BLOCK_N1"),
+        ("KVE_FLEX_BLOCK_M2", "BLOCK_M2"),
+        ("KVE_FLEX_BLOCK_N2", "BLOCK_N2"),
+        ("KVE_FLEX_NUM_WARPS", "num_warps"),
+        ("KVE_FLEX_NUM_STAGES", "num_stages"),
+    ):
+        val = os.environ.get(env_name, "")
+        if val:
+            options[opt_name] = int(val)
+    for env_name, opt_name in (
+        ("KVE_FLEX_PRESCALE_QK", "PRESCALE_QK"),
+        ("KVE_FLEX_ROWS_GUARANTEED_SAFE", "ROWS_GUARANTEED_SAFE"),
+        ("KVE_FLEX_BLOCKS_ARE_CONTIGUOUS", "BLOCKS_ARE_CONTIGUOUS"),
+        ("KVE_FLEX_FORCE_USE_FLEX_ATTENTION", "FORCE_USE_FLEX_ATTENTION"),
+    ):
+        val = os.environ.get(env_name, "")
+        if val:
+            options[opt_name] = val.lower() not in {"0", "false", "no", "off"}
+    backend = os.environ.get("KVE_FLEX_BACKEND", "")
+    if backend:
+        options["BACKEND"] = backend
+    return options or None
+
+
+def flex_mask_segmented_forward(
+    model: torch.nn.Module,
+    calls: list,
+    merged_input_ids: Tensor,
+    merged_position_ids: Tensor,
+    loss_fn: SegmentLossFn,
+    *,
+    max_forward_passes: int | None = None,
+    device: torch.device,
+) -> dict:
+    """Single-forward FlexAttention path for admission KV eviction.
+
+    This path encodes vLLM's KV-cache liveness as a BlockMask and runs one
+    full-chain forward. It is intentionally full-BPTT: the accumulated loss
+    is backward'd once after all call ranges have been sliced from the packed
+    logits.
+    """
+    if not calls:
+        raise ValueError("flex_mask_segmented_forward requires non-empty calls")
+
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError as exc:  # pragma: no cover - depends on torch build
+        raise RuntimeError(
+            "flex_mask_segmented_forward requires torch flex_attention"
+        ) from exc
+
+    timeline = _build_flex_mask_writer_timeline(calls)
+    if not timeline.input_ids:
+        raise ValueError("flex-mask writer timeline is empty")
+
+    writer_ids = torch.tensor(
+        timeline.input_ids, device=device, dtype=torch.long,
+    ).unsqueeze(0)
+    writer_positions = torch.tensor(
+        timeline.position_ids, device=device, dtype=torch.long,
+    ).unsqueeze(0)
+    death_idx = torch.tensor(
+        timeline.death_indices, device=device, dtype=torch.long,
+    )
+    seq_len = int(writer_ids.shape[1])
+
+    def _live_cache_mask(_batch_idx, _head_idx, q_idx, kv_idx):
+        return (kv_idx <= q_idx) & (q_idx < death_idx[kv_idx])
+
+    block_mask = create_block_mask(
+        _live_cache_mask,
+        B=1,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
+
+    _set_attn_implementation_if_needed(model, "flex_attention")
+    out = model(
+        input_ids=writer_ids,
+        position_ids=writer_positions,
+        attention_mask=block_mask,
+        use_cache=False,
+        kernel_options=_flex_kernel_options_from_env(),
+    )
+    logits = _extract_logits(out)
+
+    window_loss: Tensor | None = None
+    accumulated_loss = 0.0
+    for writer_start, writer_end, full_start, full_end in timeline.loss_ranges:
+        if writer_end < writer_start:
+            raise ValueError(
+                f"bad flex-mask writer loss range [{writer_start},{writer_end})"
+            )
+        if writer_end > logits.shape[1]:
+            raise ValueError(
+                f"flex-mask writer range [{writer_start},{writer_end}) "
+                f"exceeds logits length {logits.shape[1]}"
+            )
+        if writer_end == writer_start:
+            continue
+        loss_val = loss_fn(logits[:, writer_start:writer_end, :], full_start, full_end)
+        accumulated_loss += float(loss_val.detach().item())
+        window_loss = loss_val if window_loss is None else window_loss + loss_val
+
+    if window_loss is None:
+        window_loss = logits.float().mean() * 0.0
+    window_loss.backward()
+
+    target_passes = 1 if max_forward_passes is None else int(max_forward_passes)
+    if target_passes < 1:
+        raise ValueError(f"max_forward_passes must be >= 1, got {target_passes}")
+    if target_passes > 1:
+        _run_dummy_passes_with_backward(
+            model,
+            merged_input_ids,
+            merged_position_ids,
+            target_passes - 1,
+        )
+
+    if os.environ.get("KVE_TRACE_FLEX_MASK", "") == "1":
+        logger.warning(
+            "[FLEX-MASK] writer_len=%d loss_ranges=%d live_rows=%d",
+            seq_len,
+            len(timeline.loss_ranges),
+            sum(1 for d in timeline.death_indices if d == seq_len),
+        )
+
+    return {
+        "loss": torch.tensor(accumulated_loss, device=device),
+        "n_segments": 1,
+    }
 
 
 def _maybe_dump_trainer_kv(
@@ -2471,6 +2953,9 @@ def per_call_segmented_forward(
         protected_prefix_len = plan.get("protected_prefix_len", evict_start_in_sub)
         pad_len = plan.get("pad_len", 0)
         sub_end_pre = plan.get("sub_end_pre", plan["inherited_end_pre"])
+        b2b_warm_end_pre = plan.get("b2b_warm_end_pre", sub_end_pre)
+        prefix_cache_keep_len = plan.get("prefix_cache_keep_len")
+        prefix_replay_tokens_py = list(plan.get("prefix_replay_tokens", []) or [])
         trace_this_call = (
             trace_b2b
             and (trace_call_filter is None or call_idx in trace_call_filter)
@@ -2496,6 +2981,97 @@ def per_call_segmented_forward(
 
         if cpe <= cps:
             continue  # empty contribution
+
+        prefix_replay_n_forwards = 0
+        if prefix_cache_keep_len is not None:
+            keep_len = int(prefix_cache_keep_len)
+            cache_len_at_prefix_entry = persistent_cache.get_seq_length()
+            if keep_len < 0 or keep_len > cache_len_at_prefix_entry:
+                raise ValueError(
+                    f"call {call_idx}: prefix cache keep len {keep_len} "
+                    f"out of cache len={cache_len_at_prefix_entry}"
+                )
+            if keep_len < cache_len_at_prefix_entry:
+                persistent_cache = _splice_dynamic_cache(
+                    persistent_cache,
+                    keep_len,
+                    cache_len_at_prefix_entry,
+                )
+                del cache_token_ids_py[keep_len:]
+                del cache_position_ids_py[keep_len:]
+                if trace_forward_this_call:
+                    logger.warning(
+                        "[T-PREFIX-REPLAY] label=C%d truncate cache=%d->%d",
+                        call_idx,
+                        cache_len_at_prefix_entry,
+                        persistent_cache.get_seq_length(),
+                    )
+            if prefix_replay_tokens_py:
+                replay_tokens = torch.tensor(
+                    prefix_replay_tokens_py,
+                    device=device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                if writer_offset != 0:
+                    replay_positions = _piecewise_positions(
+                        keep_len,
+                        keep_len + len(prefix_replay_tokens_py),
+                        offset=writer_offset,
+                        protected_prefix_len=protected_prefix_len,
+                        device=device,
+                    )
+                else:
+                    replay_positions = (
+                        torch.arange(
+                            len(prefix_replay_tokens_py),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        + keep_len
+                    ).unsqueeze(0)
+                cache_before_replay = persistent_cache.get_seq_length()
+                out_replay = _model_forward_with_optional_attn_switch(
+                    model,
+                    input_ids=replay_tokens,
+                    position_ids=replay_positions,
+                    past_key_values=persistent_cache,
+                    base_attn_impl=base_attn_impl,
+                    past_attn_impl=past_attn_impl,
+                )
+                replay_logits = _extract_logits(out_replay)
+                if not bptt_windowed:
+                    (replay_logits.float().mean() * 0.0).backward()
+                    persistent_cache = _detach_dynamic_cache(persistent_cache)
+                prefix_replay_n_forwards = 1
+                cache_token_ids_py.extend(prefix_replay_tokens_py)
+                cache_position_ids_py.extend(
+                    replay_positions[0].detach().cpu().tolist()
+                )
+                if trace_forward_this_call:
+                    tok_head, tok_tail = _preview_1d(
+                        replay_tokens,
+                        0,
+                        len(prefix_replay_tokens_py),
+                    )
+                    pos_head, pos_tail = _preview_1d(
+                        replay_positions,
+                        0,
+                        len(prefix_replay_tokens_py),
+                    )
+                    logger.warning(
+                        "[T-FWD-SIG] label=C%d:prefix-replay len=%d "
+                        "cache=%d->%d writer_offset=%d pos_head=%s "
+                        "pos_tail=%s tok_head=%s tok_tail=%s",
+                        call_idx,
+                        len(prefix_replay_tokens_py),
+                        cache_before_replay,
+                        persistent_cache.get_seq_length(),
+                        writer_offset,
+                        pos_head,
+                        pos_tail,
+                        tok_head,
+                        tok_tail,
+                    )
 
         if has_admission and cps > 0:
             # ── B.2b: splice-only path for admission in extension calls.
@@ -2531,7 +3107,7 @@ def per_call_segmented_forward(
             # design until the drift is measured directly.
             b2b_warmup_splice = (
                 os.environ.get("KVE_TRAINER_B2B_WARMUP_SPLICE", "0") == "1"
-            )
+            ) or bool(prefix_replay_tokens_py)
             cache_len_before_splice = persistent_cache.get_seq_length()
             if b2b_warmup_splice:
                 # Diagnostic mirror of vLLM's synthetic prefill + admission:
@@ -2539,28 +3115,18 @@ def per_call_segmented_forward(
                 # cache, then splice, then write generated/pad tokens against
                 # the post-admission cache. Positions are computed from
                 # physical cache slots plus the relevant vLLM offset.
-                warm_end = sub_end_pre
+                warm_end = b2b_warm_end_pre
                 warm_logits_detached: torch.Tensor | None = None
                 warm_n_forwards = 0
                 if warm_end > cps:
                     w_toks = pre_trim_ids[:, cps:warm_end]
-                    if writer_offset != 0:
-                        w_pos = _piecewise_positions(
-                            cache_len_before_splice,
-                            cache_len_before_splice + (warm_end - cps),
-                            offset=writer_offset,
-                            protected_prefix_len=protected_prefix_len,
-                            device=device,
-                        )
-                    else:
-                        w_pos = (
-                            torch.arange(
-                                warm_end - cps,
-                                device=device,
-                                dtype=torch.long,
-                            )
-                            + cps
-                        ).unsqueeze(0)
+                    w_pos = _piecewise_positions(
+                        cache_len_before_splice,
+                        cache_len_before_splice + (warm_end - cps),
+                        offset=writer_offset,
+                        protected_prefix_len=protected_prefix_len,
+                        device=device,
+                    )
                     cache_before_warm = persistent_cache.get_seq_length()
                     out_w = _model_forward_with_optional_attn_switch(
                         model,
@@ -2618,8 +3184,8 @@ def per_call_segmented_forward(
 
                 main_start = warm_end
                 main_tokens = pre_trim_ids[:, main_start:cpe]
+                physical_start = persistent_cache.get_seq_length()
                 if admission_offset_after != 0:
-                    physical_start = persistent_cache.get_seq_length()
                     main_positions = _piecewise_positions(
                         physical_start,
                         physical_start + (cpe - main_start),
@@ -2634,7 +3200,7 @@ def per_call_segmented_forward(
                             device=device,
                             dtype=torch.long,
                         )
-                        + main_start
+                        + physical_start
                     ).unsqueeze(0)
                 if trace_this_call:
                     w_pos_1d = (
@@ -2676,7 +3242,7 @@ def per_call_segmented_forward(
                         input_ids=main_tokens,
                         position_ids=main_positions,
                         past_key_values=persistent_cache,
-                        prompt_len=0,
+                        prompt_len=max(0, min(sub_end_pre, cpe) - main_start),
                         pad_len=pad_len,
                         base_attn_impl=base_attn_impl,
                         past_attn_impl=past_attn_impl,
@@ -2712,7 +3278,11 @@ def per_call_segmented_forward(
                     )
 
                     accumulated_loss += main_loss
-                    n_forwards_run += warm_n_forwards + main_n_forwards
+                    n_forwards_run += (
+                        prefix_replay_n_forwards
+                        + warm_n_forwards
+                        + main_n_forwards
+                    )
                     persistent_cache = _detach_dynamic_cache(persistent_cache)
                     continue
 
@@ -2721,7 +3291,7 @@ def per_call_segmented_forward(
                     input_ids=main_tokens,
                     position_ids=main_positions,
                     past_key_values=persistent_cache,
-                    prompt_len=0,
+                    prompt_len=max(0, min(sub_end_pre, cpe) - main_start),
                     pad_len=pad_len,
                     mirror_decode=mirror_decode_this_call,
                     base_attn_impl=base_attn_impl,
@@ -2760,7 +3330,12 @@ def per_call_segmented_forward(
                 )
 
                 loss_val = loss_fn(kept_logits, post_start, post_end)
-                _finish_call(loss_val, warm_n_forwards + main_n_forwards)
+                _finish_call(
+                    loss_val,
+                    prefix_replay_n_forwards
+                    + warm_n_forwards
+                    + main_n_forwards,
+                )
                 continue
 
             cache_len_at_entry = cache_len_before_splice
@@ -2873,7 +3448,7 @@ def per_call_segmented_forward(
                 )
 
                 accumulated_loss += main_loss
-                n_forwards_run += main_n_forwards
+                n_forwards_run += prefix_replay_n_forwards + main_n_forwards
                 persistent_cache = _detach_dynamic_cache(persistent_cache)
                 continue
 
@@ -2915,7 +3490,7 @@ def per_call_segmented_forward(
             )
 
             loss_val = loss_fn(main_logits, post_start, post_end)
-            _finish_call(loss_val, main_n_forwards)
+            _finish_call(loss_val, prefix_replay_n_forwards + main_n_forwards)
             continue
 
         if has_admission:
@@ -3103,7 +3678,11 @@ def per_call_segmented_forward(
                 )
 
                 accumulated_loss += main_loss
-                n_forwards_run += warm_n_forwards + main_n_forwards
+                n_forwards_run += (
+                    prefix_replay_n_forwards
+                    + warm_n_forwards
+                    + main_n_forwards
+                )
                 persistent_cache = _detach_dynamic_cache(persistent_cache)
                 continue
             else:
@@ -3155,7 +3734,12 @@ def per_call_segmented_forward(
                 )
 
                 loss_val = loss_fn(kept_logits, post_start, post_end)
-                _finish_call(loss_val, warm_n_forwards + main_n_forwards)
+                _finish_call(
+                    loss_val,
+                    prefix_replay_n_forwards
+                    + warm_n_forwards
+                    + main_n_forwards,
+                )
         else:
             # ── Extension (or single first-call without admission): single forward.
             # Plain arange + cps in the normal same-frame case. If this
@@ -3173,8 +3757,13 @@ def per_call_segmented_forward(
                     device=device,
                 )
             else:
+                position_start = (
+                    persistent_cache.get_seq_length()
+                    if prefix_replay_tokens_py else cps
+                )
                 new_positions = (
-                    torch.arange(cpe - cps, device=device, dtype=torch.long) + cps
+                    torch.arange(cpe - cps, device=device, dtype=torch.long)
+                    + position_start
                 ).unsqueeze(0)
             new_prompt_len = max(0, min(sub_end_pre, cpe) - cps)
             if mirror_decode_this_call and stream_mirror_decode_loss:
@@ -3222,7 +3811,7 @@ def per_call_segmented_forward(
                 )
 
                 accumulated_loss += new_loss
-                n_forwards_run += new_n_forwards
+                n_forwards_run += prefix_replay_n_forwards + new_n_forwards
                 persistent_cache = _detach_dynamic_cache(persistent_cache)
                 continue
 
@@ -3265,7 +3854,7 @@ def per_call_segmented_forward(
             )
 
             loss_val = loss_fn(logits, post_start, post_end)
-            _finish_call(loss_val, new_n_forwards)
+            _finish_call(loss_val, prefix_replay_n_forwards + new_n_forwards)
 
     if bptt_windowed:
         _flush_bptt_window()

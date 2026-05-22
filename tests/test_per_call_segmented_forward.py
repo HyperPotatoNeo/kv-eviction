@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from kv_eviction.segmented_forward import (
+    _build_flex_mask_writer_timeline,
     compute_per_call_bptt_window_forward_counts,
     compute_num_per_call_forwards,
     per_call_segmented_forward,
@@ -239,6 +240,72 @@ def test_compute_per_call_bptt_window_forward_counts_groups_calls():
     assert compute_per_call_bptt_window_forward_counts(calls, 2) == [4, 2]
     assert compute_per_call_bptt_window_forward_counts(calls, None) == [6]
     assert compute_per_call_bptt_window_forward_counts(calls, -1) == [6]
+
+
+# ─── flex-mask writer timeline ────────────────────────────────────────
+
+
+def test_flex_mask_timeline_no_admission_is_plain_causal_chain():
+    calls = [
+        _CallSpec(submitted_prompt_ids=[1, 2], completion_ids=[3]),
+        _CallSpec(submitted_prompt_ids=[1, 2, 3, 4], completion_ids=[5]),
+    ]
+
+    timeline = _build_flex_mask_writer_timeline(calls)
+
+    assert timeline.input_ids == [1, 2, 3, 4, 5]
+    assert timeline.position_ids == [0, 1, 2, 3, 4]
+    assert timeline.death_indices == [5, 5, 5, 5, 5]
+    assert timeline.loss_ranges == [(0, 3, 0, 3), (3, 5, 3, 5)]
+
+
+def test_flex_mask_timeline_b2b_admission_kills_prior_cache_rows():
+    admission_event = _Event(
+        evict_start=1,
+        tokens_evicted=1,
+        new_user_fragment_len=1,
+        position_offset_after=1,
+        num_prompt_tokens=4,
+    )
+    calls = [
+        _CallSpec(submitted_prompt_ids=[1, 2], completion_ids=[3]),
+        _CallSpec(
+            submitted_prompt_ids=[1, 2, 3, 4],
+            completion_ids=[5],
+            compaction_events=[admission_event],
+        ),
+    ]
+
+    timeline = _build_flex_mask_writer_timeline(calls)
+
+    assert timeline.input_ids == [1, 2, 3, 4, 5]
+    assert timeline.position_ids == [0, 1, 2, 3, 4]
+    assert timeline.death_indices == [5, 3, 5, 5, 5]
+    assert timeline.loss_ranges == [(0, 3, 0, 3), (3, 5, 3, 5)]
+
+
+def test_flex_mask_timeline_b2a_admission_keeps_prefill_context_until_splice():
+    admission_event = _Event(
+        evict_start=1,
+        tokens_evicted=2,
+        new_user_fragment_len=1,
+        position_offset_after=2,
+        num_prompt_tokens=4,
+    )
+    calls = [
+        _CallSpec(
+            submitted_prompt_ids=[1, 2, 3, 4],
+            completion_ids=[5],
+            compaction_events=[admission_event],
+        )
+    ]
+
+    timeline = _build_flex_mask_writer_timeline(calls)
+
+    assert timeline.input_ids == [1, 2, 3, 4, 5]
+    assert timeline.position_ids == [0, 1, 2, 3, 4]
+    assert timeline.death_indices == [5, 4, 4, 5, 5]
+    assert timeline.loss_ranges == [(0, 5, 0, 5)]
 
 
 # ─── No-admission per-call dispatch ───────────────────────────────────
