@@ -27,6 +27,9 @@ Usage:
     #   VLLM_DEBUGPY_OFF=1          skip debugpy entirely (script runs headless)
     #   VLLM_DEBUGPY_PORT=5678      override port (default 5678)
     #   VLLM_DEBUGPY_NOWAIT=1       listen but don't block; attach whenever
+    #   KVE_ASSERT_NO_PHASE4_REFILL=1
+    #                               fail inside vLLM if a Phase4 continuation
+    #                               would re-prefill retained KV tokens
     #   MAX_TURNS=20                how many game turns to run
     #   PAD=1                       pad messages so <|im_end|> lands on
     #                               block boundary (matches notebook default)
@@ -47,7 +50,9 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Must be set BEFORE importing vllm. Keeps the scheduler in-process so
@@ -59,6 +64,7 @@ os.environ.setdefault("VLLM_COMPACTION_DEBUG_TOKENS", "1")
 # Phase 2/4 verification logs: [PREFIX-HIT] per request at admission,
 # [EVICT-PRE-DECODE] + [EVICT-DONE] when admission compaction fires.
 os.environ.setdefault("VLLM_COMPACTION_VERBOSE", "1")
+os.environ.setdefault("KVE_TRACE_PHASE4_PREFIX_HIT", "1")
 
 
 # def _maybe_start_debugpy() -> None:
@@ -97,6 +103,7 @@ os.environ.setdefault("VLLM_COMPACTION_VERBOSE", "1")
 # at window=4096 / stride=512 / block_size=16.
 # ---------------------------------------------------------------------------
 PAD = os.environ.get("PAD", "1") == "1"
+AUTO_PAD_FINISH = os.environ.get("AUTO_PAD_FINISH", "1") == "1"
 # Phase 2 prefix-caching smoke: set PREFIX_CACHE=1 to verify the
 # hash-chain rebuild on eviction (plans/prefix_caching_compaction.md).
 # Default off to match the historical compaction config.
@@ -109,6 +116,10 @@ BLOCK_SIZE = 16
 PAD_FILLER_ID: int | None = None
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "30"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "2000"))
+N_SAMPLES = int(os.environ.get("N_SAMPLES", "1"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.0"))
+BASE_SEED = int(os.environ.get("SEED", "0"))
+COMPACTION_MAX_TURNS = int(os.environ.get("COMPACTION_MAX_TURNS", "3"))
 DATASET_PATH = os.environ.get(
     "DATASET",
     "/scratch/epp/textworld_cooking_mix",
@@ -142,8 +153,8 @@ llm = LLM(
     compaction_stride=512,
     # -1 = auto-detect system prompt end from first <|im_end|>.
     compaction_protected_prefix_tokens=-1,
-    # Turn-mode: 3-1 — evict 1 oldest completed turn whenever ≥3 live.
-    compaction_max_turns=3,
+    # Turn-mode: evict 1 oldest completed turn whenever max_turns live.
+    compaction_max_turns=COMPACTION_MAX_TURNS,
     compaction_eviction_turn_stride=1,
     compaction_turn_end_token_id=None,
     # With PAD=True in the chat() helper, every <|im_end|> is padded so
@@ -152,12 +163,18 @@ llm = LLM(
     # boundary (instead of the default inward snap), eliminating the
     # orphan tail-of-last-evicted-turn that otherwise survives in KV.
     compaction_assume_aligned_turn_boundaries=PAD,
+    # Match the production Phase 4 configs: after the assistant finishes,
+    # keep the request alive for one filler-token prefill step when needed
+    # so the next Phase 4 prompt can hit a full final block.
+    compaction_block_aligned_finish=AUTO_PAD_FINISH,
+    compaction_filler_token_id=151643,
     async_scheduling=False,
 )
 tokenizer = llm.get_tokenizer()
 print(
     f"loaded (turn-mode, PAD={PAD}, PREFIX_CACHE={PREFIX_CACHE}, "
-    f"PHASE4={PHASE4})"
+    f"PHASE4={PHASE4}, AUTO_PAD_FINISH={AUTO_PAD_FINISH}, "
+    f"COMPACTION_MAX_TURNS={COMPACTION_MAX_TURNS})"
 )
 
 
@@ -199,6 +216,54 @@ def _render_padded(messages, im_end_id, block_size, filler_id):
                 out.extend([filler_id] * n)
             pads.append(n)
     return raw, out, pads
+
+
+def _sampling_params(
+    seed: int,
+    phase4_expected_cached_tokens: int = 0,
+) -> SamplingParams:
+    extra_args = None
+    if phase4_expected_cached_tokens > 0:
+        extra_args = {
+            "kve_phase4_expected_cached_tokens": int(
+                phase4_expected_cached_tokens
+            )
+        }
+    return SamplingParams(
+        max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
+        seed=seed,
+        logprobs=1,
+        extra_args=extra_args,
+    )
+
+
+def _build_full_chat_prompt_ids(messages, show_pad_summary=True, label=""):
+    if PAD:
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assert isinstance(im_end_id, int) and im_end_id >= 0, (
+            f"<|im_end|> not in tokenizer (got {im_end_id!r})"
+        )
+        filler_id = _filler_token_id()
+        raw, padded, pads = _render_padded(
+            messages, im_end_id, BLOCK_SIZE, filler_id
+        )
+        if show_pad_summary:
+            print(
+                f"  {label}[pad] raw={len(raw)} -> padded={len(padded)} "
+                f"(+{len(padded)-len(raw)}); per-im_end pads={pads} "
+                f"(filler_id={filler_id})"
+            )
+        return padded
+
+    rendered = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False
+    )
+    ids = tokenizer.encode(rendered, add_special_tokens=False)
+    bad = [(i, type(t).__name__) for i, t in enumerate(ids) if not isinstance(t, int)]
+    if bad:
+        raise TypeError(f"non-int tokens in encode output: first 5={bad[:5]}")
+    return ids
 
 
 def chat(messages, max_tokens=512, temperature=1.0, seed=0, show_pad_summary=True):
@@ -280,24 +345,12 @@ def _pad_after_im_end(tokens, start_offset, im_end_id, block_size, filler_id):
     return out, total_pad
 
 
-def chat_phase4(
+def _build_phase4_prompt_ids(
     prev_state_tokens,
     new_user_content,
-    max_tokens=512,
-    temperature=1.0,
-    seed=0,
     show_summary=True,
+    label="",
 ):
-    """Submit a turn as [prev_state_tokens + new_user_fragment].
-
-    prev_state_tokens is whatever vLLM physically has in KV after the
-    previous turn — i.e. last event's kept_token_ids extended by that
-    turn's assistant output (or the full submitted padded prompt if no
-    compaction fired that turn).
-    """
-    sp = SamplingParams(
-        max_tokens=max_tokens, temperature=temperature, seed=seed, logprobs=1
-    )
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     filler_id = _filler_token_id()
 
@@ -315,11 +368,43 @@ def chat_phase4(
     submitted = list(prev_state_tokens) + padded_fragment
     if show_summary:
         print(
-            f"  [phase4] prev_state={len(prev_state_tokens)} "
+            f"  {label}[phase4] prev_state={len(prev_state_tokens)} "
             f"fragment_raw={len(fragment_ids)} "
             f"fragment_padded={len(padded_fragment)} "
             f"(+{total_pad}) total={len(submitted)}"
         )
+    return submitted
+
+
+def chat_phase4(
+    prev_state_tokens,
+    new_user_content,
+    max_tokens=512,
+    temperature=1.0,
+    seed=0,
+    show_summary=True,
+):
+    """Submit a turn as [prev_state_tokens + new_user_fragment].
+
+    prev_state_tokens is whatever vLLM physically has in KV after the
+    previous turn — i.e. last event's kept_token_ids extended by that
+    turn's assistant output (or the full submitted padded prompt if no
+    compaction fired that turn).
+    """
+    sp = SamplingParams(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        seed=seed,
+        logprobs=1,
+        extra_args={
+            "kve_phase4_expected_cached_tokens": len(prev_state_tokens)
+        },
+    )
+    submitted = _build_phase4_prompt_ids(
+        prev_state_tokens,
+        new_user_content,
+        show_summary=show_summary,
+    )
 
     outs = llm.generate(
         prompts=[{"prompt_token_ids": submitted}],
@@ -340,14 +425,11 @@ def derive_next_prev_state(out, submitted_prompt_ids):
     If no compaction fired, vLLM still has the full submitted prompt plus
     the asst output in KV.
 
-    With PAD=True, the asst's trailing <|im_end|> is followed by the
-    chat-template message separator ("\n" for Qwen3) and filler tokens to
-    the next block boundary, so the next-turn user fragment's
-    <|im_start|>user lands block-aligned. Mirrors
-    `_build_incremental_padded` in src/kv_eviction/env.py. Without this,
-    `compaction_assume_aligned_turn_boundaries=True` makes the scheduler
-    snap `align_up(asst <|im_end|>)` into the next user message and
-    eviction overshoots the turn boundary.
+    With PAD=True, the asst's trailing <|im_end|> is followed by filler
+    tokens to the next block boundary, so the next-turn user fragment's
+    <|im_start|>user lands block-aligned. This mirrors
+    `_update_phase4_state_from_response` in src/kv_eviction/env.py:
+    vLLM's auto-pad emits filler only, with no chat-template separator.
     """
     events = getattr(out, "compaction_events", None) or []
     if events:
@@ -363,8 +445,6 @@ def derive_next_prev_state(out, submitted_prompt_ids):
     state = kept + asst_tokens
     if PAD:
         filler_id = _filler_token_id()
-        sep_ids = tokenizer.encode("\n", add_special_tokens=False)
-        state.extend(sep_ids)
         remainder = len(state) % BLOCK_SIZE
         n = (BLOCK_SIZE - remainder) % BLOCK_SIZE
         if n:
@@ -408,6 +488,22 @@ def parse_action(text):
     return action or None
 
 
+@dataclass
+class RolloutState:
+    sample_idx: int
+    env: Any
+    max_score: int
+    game_file: Any
+    conv: list[dict[str, str]]
+    score: int = 0
+    prev_state_tokens: list[int] | None = None
+    done: bool = False
+    cumul_events: int = 0
+    cumul_tokens_evicted: int = 0
+    bad_prefix_hits: int = 0
+    timings: list[tuple[int, float, int, int, int]] = field(default_factory=list)
+
+
 def _format_event(i, ev):
     lines = [
         f"  event #{i}: evicted={ev.tokens_evicted} "
@@ -430,7 +526,244 @@ def _format_event(i, ev):
     return "\n".join(lines)
 
 
+def main_multi_sample():
+    """Run several same-game rollouts through one batched vLLM engine.
+
+    This stresses the failure mode where Phase4 continuations from
+    near-identical TextWorld traces share prefix-cache entries. Each sample
+    owns an independent TextWorld env, but all samples use the same GAME_IDX.
+    """
+    samples: list[RolloutState] = []
+    for sample_idx in range(N_SAMPLES):
+        env, game_state, max_score, game_file = reset_env(
+            dataset_path=DATASET_PATH, game_idx=GAME_IDX
+        )
+        samples.append(
+            RolloutState(
+                sample_idx=sample_idx,
+                env=env,
+                max_score=max_score,
+                game_file=game_file,
+                conv=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": game_state.feedback},
+                ],
+            )
+        )
+
+    bad_samples: set[int] = set()
+    total_bad_prefix_hits = 0
+
+    with open(OUT_PATH, "w") as f, open(SUMMARY_OUT_PATH, "w") as fs:
+        f.write(
+            f"# TextWorld multi-sample compaction trace "
+            f"(PAD={PAD} PREFIX_CACHE={PREFIX_CACHE} PHASE4={PHASE4})\n"
+        )
+        f.write(
+            f"# dataset={DATASET_PATH} game_idx={GAME_IDX} "
+            f"n_samples={N_SAMPLES} max_turns={MAX_TURNS} "
+            f"max_tokens={MAX_TOKENS} temperature={TEMPERATURE} "
+            f"seed={BASE_SEED}\n"
+        )
+        fs.write(
+            "# sample turn events prompt output cached hit_pct "
+            "phase4_expected_cached phase4_refill_delta score done batch_s\n"
+        )
+        f.flush()
+        fs.flush()
+
+        try:
+            for turn in range(MAX_TURNS):
+                active = [sample for sample in samples if not sample.done]
+                if not active:
+                    break
+
+                prompts = []
+                params = []
+                submitted_by_sample: dict[int, list[int]] = {}
+                expected_by_sample: dict[int, int] = {}
+
+                print(
+                    f"turn {turn}: batching {len(active)} same-game samples...",
+                    flush=True,
+                )
+                for sample in active:
+                    label = f"[s{sample.sample_idx}] "
+                    if PHASE4 and sample.prev_state_tokens is not None:
+                        expected = len(sample.prev_state_tokens)
+                        submitted = _build_phase4_prompt_ids(
+                            sample.prev_state_tokens,
+                            sample.conv[-1]["content"],
+                            show_summary=True,
+                            label=label,
+                        )
+                    else:
+                        expected = 0
+                        submitted = _build_full_chat_prompt_ids(
+                            sample.conv,
+                            show_pad_summary=True,
+                            label=label,
+                        )
+                    prompts.append({"prompt_token_ids": submitted})
+                    params.append(
+                        _sampling_params(
+                            BASE_SEED + sample.sample_idx * 100000 + turn,
+                            phase4_expected_cached_tokens=expected,
+                        )
+                    )
+                    submitted_by_sample[sample.sample_idx] = submitted
+                    expected_by_sample[sample.sample_idx] = expected
+
+                t0 = time.perf_counter()
+                outs = llm.generate(
+                    prompts=prompts,
+                    sampling_params=params,
+                    use_tqdm=False,
+                )
+                batch_seconds = time.perf_counter() - t0
+
+                for sample, out in zip(active, outs, strict=True):
+                    text = out.outputs[0].text
+                    action = parse_action(text)
+                    events = getattr(out, "compaction_events", None) or []
+                    prompt_len = (
+                        len(out.prompt_token_ids) if out.prompt_token_ids else 0
+                    )
+                    cached = getattr(out, "num_cached_tokens", None) or 0
+                    hit_pct = (100.0 * cached / prompt_len) if prompt_len else 0.0
+                    output_len = len(out.outputs[0].token_ids)
+                    expected = expected_by_sample[sample.sample_idx]
+                    refill_delta = max(0, expected - cached)
+                    if refill_delta > 0:
+                        sample.bad_prefix_hits += 1
+                        total_bad_prefix_hits += 1
+                        bad_samples.add(sample.sample_idx)
+
+                    sample.timings.append(
+                        (turn, batch_seconds, prompt_len, output_len, cached)
+                    )
+                    tokens_evicted_this_turn = sum(
+                        int(getattr(ev, "tokens_evicted", 0)) for ev in events
+                    )
+                    sample.cumul_events += len(events)
+                    sample.cumul_tokens_evicted += tokens_evicted_this_turn
+
+                    print(
+                        f"  s{sample.sample_idx}: prompt={prompt_len} "
+                        f"cached={cached} ({hit_pct:.1f}%) "
+                        f"expected={expected} delta={refill_delta} "
+                        f"events={len(events)}"
+                    )
+                    fs.write(
+                        f"sample={sample.sample_idx:02d} turn={turn:02d} "
+                        f"events={len(events)} prompt={prompt_len} "
+                        f"output={output_len} cached={cached} "
+                        f"hit_pct={hit_pct:.1f} "
+                        f"phase4_expected_cached={expected} "
+                        f"phase4_refill_delta={refill_delta} "
+                        f"tokens_evicted={tokens_evicted_this_turn} "
+                        f"cumul_events={sample.cumul_events} "
+                        f"cumul_tokens_evicted={sample.cumul_tokens_evicted} "
+                        f"score={sample.score}/{sample.max_score} "
+                        f"done={int(sample.done)} "
+                        f"batch_s={batch_seconds:.3f}\n"
+                    )
+
+                    f.write("=" * 80 + "\n")
+                    f.write(f"SAMPLE {sample.sample_idx} TURN {turn}\n")
+                    f.write("=" * 80 + "\n")
+                    f.write(
+                        f"prompt_tokens={prompt_len} output_tokens={output_len} "
+                        f"cached_tokens={cached} ({hit_pct:.1f}%) "
+                        f"phase4_expected_cached={expected} "
+                        f"phase4_refill_delta={refill_delta} "
+                        f"events={len(events)} batch_seconds={batch_seconds:.3f}\n\n"
+                    )
+                    if events:
+                        f.write(f"COMPACTION EVENTS ({len(events)}):\n")
+                        for i, ev in enumerate(events):
+                            f.write(_format_event(i, ev) + "\n")
+                        f.write("\n")
+                    f.write("ASSISTANT:\n")
+                    f.write(text + "\n\n")
+                    raw = tokenizer.decode(
+                        out.outputs[0].token_ids, skip_special_tokens=False
+                    )
+                    f.write("ASSISTANT (raw, skip_special_tokens=False):\n")
+                    f.write(raw + "\n\n")
+                    f.write(f"PARSED ACTION: {action!r}\n\n")
+
+                    if PHASE4:
+                        sample.prev_state_tokens = derive_next_prev_state(
+                            out, submitted_by_sample[sample.sample_idx]
+                        )
+                    sample.conv.append({"role": "assistant", "content": text})
+
+                    if action is None:
+                        action = "look"
+                        f.write("USER (no <action>, falling back to 'look'):\n\n")
+
+                    try:
+                        new_state, new_score, done = sample.env.step(str(action))
+                        obs = new_state.feedback
+                    except Exception as e:
+                        err = f"Error stepping env: {e}"
+                        sample.conv.append({"role": "user", "content": err})
+                        f.write("USER (env error):\n")
+                        f.write(err + "\n\n")
+                        print(f"  s{sample.sample_idx}: step error: {e}")
+                        continue
+
+                    reward_delta = new_score - sample.score
+                    sample.score = new_score
+                    sample.done = bool(done)
+                    f.write(
+                        f"SCORE={sample.score}/{sample.max_score} "
+                        f"(+{reward_delta}) done={done}\n\n"
+                    )
+                    f.write("USER (obs):\n")
+                    f.write(obs + "\n\n")
+
+                    if done:
+                        sample.conv.append({
+                            "role": "user",
+                            "content": (
+                                "Game Over! Final score: "
+                                f"{sample.score}/{sample.max_score}"
+                            ),
+                        })
+                    else:
+                        sample.conv.append({"role": "user", "content": obs})
+                    f.flush()
+                fs.flush()
+
+        finally:
+            for sample in samples:
+                try:
+                    sample.env.close()
+                except Exception:
+                    pass
+
+        fs.write(
+            f"\n# total_bad_prefix_hits={total_bad_prefix_hits} "
+            f"affected_samples={len(bad_samples)}/{N_SAMPLES} "
+            f"bad_sample_ids={sorted(bad_samples)}\n"
+        )
+        fs.flush()
+
+    print(
+        f"\nmulti-sample trace written to {OUT_PATH}; "
+        f"summary={SUMMARY_OUT_PATH}; "
+        f"bad_prefix_hits={total_bad_prefix_hits} "
+        f"affected_samples={len(bad_samples)}/{N_SAMPLES}"
+    )
+
+
 def main():
+    if N_SAMPLES > 1:
+        main_multi_sample()
+        return
+
     env, game_state, max_score, game_file = reset_env(
         dataset_path=DATASET_PATH, game_idx=GAME_IDX
     )
@@ -452,6 +785,7 @@ def main():
     # Per-turn timing for cached-vs-uncached benchmarking. Each entry:
     # (turn, gen_seconds, prompt_tokens, output_tokens, cached_tokens).
     turn_timings: list[tuple[int, float, int, int, int]] = []
+    expected_phase4_cached = 0
 
     with open(OUT_PATH, "w") as f, open(SUMMARY_OUT_PATH, "w") as fs:
         f.write(
@@ -497,6 +831,7 @@ def main():
                     # post-compaction KV state. conv[-1] is the latest
                     # appended user obs (set at end of previous iteration).
                     new_user_content = conv[-1]["content"]
+                    expected_phase4_cached = len(prev_state_tokens)
                     text, out, submitted_ids = chat_phase4(
                         prev_state_tokens,
                         new_user_content,
@@ -506,6 +841,7 @@ def main():
                         show_summary=True,
                     )
                 else:
+                    expected_phase4_cached = 0
                     text, out = chat(
                         conv,
                         max_tokens=MAX_TOKENS,
@@ -538,11 +874,16 @@ def main():
                     f"prompt_tokens(scheduled)={prompt_len} "
                     f"output_tokens={output_len} "
                     f"cached_tokens={cached} ({hit_pct:.1f}%) "
+                    f"phase4_expected_cached={expected_phase4_cached} "
+                    f"phase4_refill_delta="
+                    f"{max(0, expected_phase4_cached - cached)} "
                     f"events={len(events)} "
                     f"gen_seconds={gen_seconds:.3f}\n\n"
                 )
                 print(
                     f"  prompt={prompt_len} cached={cached} ({hit_pct:.1f}%) "
+                    f"expected={expected_phase4_cached} "
+                    f"delta={max(0, expected_phase4_cached - cached)} "
                     f"events={len(events)} t={gen_seconds:.3f}s"
                 )
 
@@ -571,6 +912,9 @@ def main():
                     f"turn={turn:2d} events={len(events)} "
                     f"prompt={prompt_len} output={output_len} "
                     f"cached={cached} ({hit_pct:5.1f}%) "
+                    f"phase4_expected_cached={expected_phase4_cached} "
+                    f"phase4_refill_delta="
+                    f"{max(0, expected_phase4_cached - cached)} "
                     f"tokens_evicted={tokens_evicted_this_turn} "
                     f"last_turn_evicted={last_turn_evicted} "
                     f"turns_evicted_after={turns_evicted_after} "

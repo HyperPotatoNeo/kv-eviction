@@ -2590,6 +2590,7 @@ def flex_mask_segmented_forward(
     distillation_teacher_fn: SegmentDistillationTeacherFn | None = None,
     distillation_loss_fn: SegmentDistillationLossFn | None = None,
     device: torch.device,
+    backward: bool = True,
 ) -> dict:
     """Single-forward FlexAttention path for admission KV eviction.
 
@@ -2761,12 +2762,15 @@ def flex_mask_segmented_forward(
 
     if window_loss is None:
         window_loss = logits.float().mean() * 0.0
-    window_loss.backward()
+    if backward:
+        window_loss.backward()
 
     target_passes = 1 if max_forward_passes is None else int(max_forward_passes)
     if target_passes < 1:
         raise ValueError(f"max_forward_passes must be >= 1, got {target_passes}")
     if target_passes > 1:
+        if not backward:
+            raise ValueError("max_forward_passes > 1 requires backward=True")
         _run_dummy_passes_with_backward(
             model,
             merged_input_ids,
@@ -2783,7 +2787,7 @@ def flex_mask_segmented_forward(
         )
 
     return {
-        "loss": torch.tensor(accumulated_loss, device=device),
+        "loss": torch.tensor(accumulated_loss, device=device) if backward else window_loss,
         "n_segments": 1,
     }
 

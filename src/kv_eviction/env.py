@@ -861,24 +861,35 @@ def _get_phase4_state() -> dict | None:
     return getattr(task, "_kv_eviction_phase4_state", None)
 
 
-def _set_phase4_prev_state(prev_state_tokens: list[int]) -> None:
-    """Stash the post-call KV state token sequence on the current async
-    task so the NEXT chat() call in this rollout can build its prompt
-    incrementally. No-op if not in an async task."""
+def _get_or_create_phase4_state() -> dict | None:
+    """Return the current task's Phase4 state, creating it if possible."""
     import asyncio
     try:
         task = asyncio.current_task()
     except RuntimeError:
-        return
+        return None
     if task is None:
-        return
+        return None
     state = getattr(task, "_kv_eviction_phase4_state", None)
     if state is None:
         state = {}
         try:
             setattr(task, "_kv_eviction_phase4_state", state)
         except (AttributeError, TypeError):
-            return
+            return None
+    if "trace_id" not in state:
+        state["trace_id"] = f"task-{id(task):x}"
+        state["call_idx"] = 0
+    return state
+
+
+def _set_phase4_prev_state(prev_state_tokens: list[int]) -> None:
+    """Stash the post-call KV state token sequence on the current async
+    task so the NEXT chat() call in this rollout can build its prompt
+    incrementally. No-op if not in an async task."""
+    state = _get_or_create_phase4_state()
+    if state is None:
+        return
     state["prev_state_tokens"] = list(prev_state_tokens)
 
 
@@ -910,7 +921,7 @@ def _pad_tokens_after_im_end(
 def _build_phase4_incremental_prompt(
     messages: list[dict],
     cfg: MessagePaddingConfig,
-) -> list[int] | None:
+) -> tuple[list[int], int] | None:
     """Build the Phase4 incremental prompt: prev_state + padded new_user_fragment.
 
     Returns None when no prior state exists yet (first call), the last
@@ -947,28 +958,33 @@ def _build_phase4_incremental_prompt(
         cfg.block_size,
         cfg.filler_token_id,
     )
-    return list(prev_state) + padded_fragment
+    return list(prev_state) + padded_fragment, len(prev_state)
 
 
 def _extract_kept_token_ids_last_event(response: Any) -> list[int] | None:
-    """Read kept_token_ids off the LAST compaction event in the response.
-    Returns None when no events fired or the field is empty / missing."""
+    """Read kept_token_ids off the last real eviction event in the response.
+
+    Synthetic Phase4 inherit events deliberately carry empty kept_token_ids.
+    Walk backward so those metadata-only events do not mask a preceding real
+    eviction event and make Phase4 fall back to the full submitted prompt.
+    """
     raw = getattr(response, "compaction_events", None)
     if raw is None and hasattr(response, "model_extra"):
         raw = (response.model_extra or {}).get("compaction_events")
     if not raw:
         return None
-    last = raw[-1]
-    if isinstance(last, dict):
-        kept = last.get("kept_token_ids")
-    else:
-        kept = getattr(last, "kept_token_ids", None)
-    if not kept:
-        return None
-    try:
-        return [int(x) for x in kept]
-    except (TypeError, ValueError):
-        return None
+    for event in reversed(raw):
+        if isinstance(event, dict):
+            kept = event.get("kept_token_ids")
+        else:
+            kept = getattr(event, "kept_token_ids", None)
+        if not kept:
+            continue
+        try:
+            return [int(x) for x in kept]
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _update_phase4_state_from_response(
@@ -1200,6 +1216,18 @@ def _install_message_padding_interceptor() -> None:
         if cfg is None or not cfg.enabled:
             return await orig_create(self, *args, **kwargs)
 
+        phase4_state = _get_or_create_phase4_state() if cfg.phase4_enabled else None
+        phase4_trace_id = (
+            str(phase4_state.get("trace_id")) if phase4_state is not None else ""
+        )
+        phase4_call_idx = (
+            int(phase4_state.get("call_idx", 0))
+            if phase4_state is not None
+            else -1
+        )
+        if phase4_state is not None:
+            phase4_state["call_idx"] = phase4_call_idx + 1
+
         messages = kwargs.get("messages")
         tools = kwargs.get("tools")
         logger.debug(
@@ -1221,20 +1249,23 @@ def _install_message_padding_interceptor() -> None:
         # so the prev_state portion hits the prefix cache. Falls back to
         # full-history render on first call / tools / non-string content.
         padded: list[int] | None = None
+        phase4_expected_cached_tokens = 0
         used_phase4 = False
         if cfg.phase4_enabled and tools is None:
             try:
-                padded = _build_phase4_incremental_prompt(messages, cfg)
+                built_phase4 = _build_phase4_incremental_prompt(messages, cfg)
             except Exception:
                 logger.exception(
                     "kv_eviction: phase4 incremental build failed; "
                     "falling back to full-history render"
                 )
-                padded = None
-            if padded is not None:
+                built_phase4 = None
+            if built_phase4 is not None:
+                padded, phase4_expected_cached_tokens = built_phase4
                 used_phase4 = True
                 logger.debug(
-                    "[PHASE4] incremental: prev_state+fragment len=%d",
+                    "[PHASE4] incremental: prev_state=%d total=%d",
+                    phase4_expected_cached_tokens,
                     len(padded),
                 )
 
@@ -1273,6 +1304,21 @@ def _install_message_padding_interceptor() -> None:
         # `prompt_token_ids` field.
         extra_body = dict(kwargs.pop("extra_body", None) or {})
         extra_body["prompt_token_ids"] = padded
+        if phase4_state is not None and phase4_trace_id:
+            vllm_xargs = dict(extra_body.get("vllm_xargs") or {})
+            vllm_xargs["kve_phase4_trace_id"] = phase4_trace_id
+            vllm_xargs["kve_phase4_call_idx"] = int(phase4_call_idx)
+            if used_phase4 and phase4_expected_cached_tokens > 0:
+                vllm_xargs["kve_phase4_expected_cached_tokens"] = int(
+                    phase4_expected_cached_tokens
+                )
+            extra_body["vllm_xargs"] = vllm_xargs
+        elif used_phase4 and phase4_expected_cached_tokens > 0:
+            vllm_xargs = dict(extra_body.get("vllm_xargs") or {})
+            vllm_xargs["kve_phase4_expected_cached_tokens"] = int(
+                phase4_expected_cached_tokens
+            )
+            extra_body["vllm_xargs"] = vllm_xargs
         kwargs["extra_body"] = extra_body
 
         # Force logprobs to be requested. Some upstream callers
