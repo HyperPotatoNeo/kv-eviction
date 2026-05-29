@@ -28,6 +28,7 @@ MODEL="Qwen/Qwen3-4B-Instruct-2507"
 NUM_EXAMPLES=${NUM_EXAMPLES:-100}
 MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-50}
 MAX_CONCURRENT=${MAX_CONCURRENT:-32}
+EVAL_SET_JSON=${EVAL_SET_JSON:-$EXP_DIR/eval_sets/textworld_eval_100_seed42.json}
 
 export HOME=$SCRATCH
 export PODMANHPC_PODMAN_BIN=/global/common/shared/das/podman-4.7.0/bin/podman
@@ -40,16 +41,14 @@ fi
 NODES=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 COMPUTE_NODE="${NODES[0]}"
 
-# Share the runner script from the main launcher — same contract. We reuse
-# $EXP_DIR/_eval_runner.sh if it exists (written by the main launcher), or
-# fall back to a minimal inline version.
+# Share the runner script from the main launcher — same contract. Rewritten on
+# every run so stale copies do not miss new eval args.
 RUNNER="$EXP_DIR/_eval_runner.sh"
-if [ ! -f "$RUNNER" ]; then
-    cat > "$RUNNER" <<'EOF'
+cat > "$RUNNER" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 MODE="$1"; INF_TOML="$2"; OUT_JSON="$3"
-NUM_EXAMPLES="$4"; MAX_EPISODE_STEPS="$5"; MAX_CONCURRENT="$6"; PADDING_BLOCK_SIZE="$7"
+NUM_EXAMPLES="$4"; MAX_EPISODE_STEPS="$5"; MAX_CONCURRENT="$6"; PADDING_BLOCK_SIZE="$7"; EVAL_SET_JSON="$8"
 export LD_PRELOAD=$(echo "${LD_PRELOAD:-}" | tr ':' '\n' | grep -v darshan | paste -sd ':')
 cd /pscratch/sd/s/siddart2/kv-eviction
 source .venv/bin/activate
@@ -73,14 +72,15 @@ python experiments/textworld_env/eval_textworld.py \
     --base-url http://localhost:8000/v1 \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --num-examples "$NUM_EXAMPLES" \
+    --eval-source eval \
+    --eval-set-json "$EVAL_SET_JSON" \
     --max-episode-steps "$MAX_EPISODE_STEPS" \
     --max-concurrent "$MAX_CONCURRENT" \
     --padding-block-size "$PADDING_BLOCK_SIZE" \
     --output-json "$OUT_JSON"
 echo "=== [$MODE] eval completed; wrote $OUT_JSON ==="
 EOF
-    chmod +x "$RUNNER"
-fi
+chmod +x "$RUNNER"
 
 echo "=============================================="
 echo "full_context PARALLEL test"
@@ -127,7 +127,7 @@ echo "=============================================="
 ssh -o StrictHostKeyChecking=no "$COMPUTE_NODE" \
     "export HOME=$SCRATCH && export PODMANHPC_PODMAN_BIN=$PODMANHPC_PODMAN_BIN && \
      podman-hpc exec $CONTAINER bash $RUNNER full_context $FULL_CTX_INF_TOML $FULL_CTX_OUT \
-     $NUM_EXAMPLES $MAX_EPISODE_STEPS $MAX_CONCURRENT 0"
+     $NUM_EXAMPLES $MAX_EPISODE_STEPS $MAX_CONCURRENT 0 $EVAL_SET_JSON"
 
 echo ""
 echo "=============================================="

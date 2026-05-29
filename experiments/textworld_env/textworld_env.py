@@ -173,11 +173,36 @@ class TextWorldEnv(vf.MultiTurnEnv):
         hf_ds = load_from_disk(str(dataset_path / "dataset"))
         rows = [dict(row) for row in hf_ds]
 
+        eval_path = dataset_path / "eval_dataset"
+        eval_rows_all: list[dict] = []
+        if eval_path.exists():
+            eval_rows_all = [dict(row) for row in load_from_disk(str(eval_path))]
+
         # Split train/eval
         num_train = num_train_examples if num_train_examples is not None else meta.get("num_train", len(rows))
         num_eval = num_eval_examples if num_eval_examples is not None else meta.get("num_eval", 0)
         train_rows = rows[:num_train]
-        eval_rows = rows[num_train : num_train + num_eval] if num_eval > 0 else []
+        if num_eval > 0 and eval_rows_all:
+            if len(eval_rows_all) < num_eval:
+                raise ValueError(
+                    "Requested "
+                    f"num_eval_examples={num_eval}, but {dataset_path / 'eval_dataset'} "
+                    f"contains only {len(eval_rows_all)} rows. Regenerate the "
+                    "TextWorld dataset with enough held-out games."
+                )
+            eval_rows = eval_rows_all[:num_eval]
+        elif num_eval > 0:
+            # Legacy datasets saved train+eval in a single HF dataset. Modern
+            # datasets save held-out rows under eval_dataset/.
+            if len(rows) < num_train + num_eval:
+                raise ValueError(
+                    "Requested "
+                    f"num_train_examples={num_train} and num_eval_examples={num_eval}, "
+                    f"but {dataset_path / 'dataset'} contains only {len(rows)} rows."
+                )
+            eval_rows = rows[num_train : num_train + num_eval]
+        else:
+            eval_rows = []
 
         dataset = Dataset.from_list(train_rows) if train_rows else None
         eval_dataset = Dataset.from_list(eval_rows) if eval_rows else None
@@ -242,6 +267,7 @@ class TextWorldEnv(vf.MultiTurnEnv):
         state["tw_score"] = 0
         state["tw_max_score"] = self._max_scores[game_idx]
         state["tw_done"] = False
+        state["tw_won"] = False
         state["tw_token_count"] = len(game_state.feedback) // 3
 
         # Merge the first user message (initial observation) into the system
@@ -289,17 +315,20 @@ class TextWorldEnv(vf.MultiTurnEnv):
             )
             game_state, score, done = result
             obs = game_state.feedback
+            won = bool(getattr(game_state, "won", False))
         except Exception as e:
             logger.warning(f"TextWorld step error: {e}")
             obs = "Something went wrong. Try a different action."
             score = state["tw_score"]
             done = False
+            won = bool(state.get("tw_won", False))
 
         # score from textworld.step() is cumulative
         if score != state["tw_score"]:
             logger.warning(f"SCORE CHANGE: {state['tw_score']} -> {score} (action={action_text!r})")
         state["tw_score"] = score
         state["tw_done"] = done
+        state["tw_won"] = won
 
         # Track token budget (approximate: 4 chars ≈ 1 token)
         state["tw_token_count"] += len(obs) // 3 + 100  # +100 for action+thinking tokens
@@ -357,8 +386,8 @@ def load_environment(
     max_episode_steps : int
         Hard cap on env_response calls per rollout (one per game turn).
     num_train_examples, num_eval_examples : Optional[int]
-        Slice the metadata into train/eval splits. If None, uses the
-        values baked into metadata.json at dataset generation time.
+        Select train/eval split sizes. Modern datasets load held-out eval rows
+        from eval_dataset/; legacy datasets fall back to slicing dataset/.
     seed : int
         Unused by the env itself (games are pre-generated with fixed
         seeds); kept for verifiers API compatibility.

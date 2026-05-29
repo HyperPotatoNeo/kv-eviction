@@ -6,6 +6,7 @@ experiments/eval/results/
 experiments/phase3_kl_test/results/
 experiments/phase3_preprod/results/
 /textworld_cooking_mix
+game_*.qzl
 # Training output directories (written by smoke runs, large, transient)
 outputs/
 *.json
@@ -41,3 +42,13 @@ README.cluster.md
 
 # Local debugging/testbed archives; intentionally not committed.
 .local_artifacts/
+
+# Local launch configs, generated grids, job notes, and debug scratch files.
+# Keep ad-hoc experiment material here so source control stays focused on
+# production-critical code changes.
+experiments/_local_jobs/
+
+# Generated experiment report artifacts. Keep the tracker/script tracked; cache,
+# plots, and rendered markdown are reproducible outputs.
+experiments/_reports/cache/
+experiments/_reports/reports/

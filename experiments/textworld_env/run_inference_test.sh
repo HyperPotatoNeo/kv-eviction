@@ -30,6 +30,7 @@ MODEL="Qwen/Qwen3-4B-Instruct-2507"
 NUM_EXAMPLES=${NUM_EXAMPLES:-100}
 MAX_EPISODE_STEPS=${MAX_EPISODE_STEPS:-50}
 MAX_CONCURRENT=${MAX_CONCURRENT:-32}
+EVAL_SET_JSON=${EVAL_SET_JSON:-$EXP_DIR/eval_sets/textworld_eval_100_seed42.json}
 PADDING_BLOCK_SIZE=16
 
 export HOME=$SCRATCH
@@ -76,6 +77,7 @@ NUM_EXAMPLES="$4"
 MAX_EPISODE_STEPS="$5"
 MAX_CONCURRENT="$6"
 PADDING_BLOCK_SIZE="$7"   # 16 for compaction, 0 for full_context baseline
+EVAL_SET_JSON="$8"
 
 export LD_PRELOAD=$(echo "${LD_PRELOAD:-}" | tr ':' '\n' | grep -v darshan | paste -sd ':')
 cd /pscratch/sd/s/siddart2/kv-eviction
@@ -128,6 +130,8 @@ python experiments/textworld_env/eval_textworld.py \
     --base-url http://localhost:8000/v1 \
     --model Qwen/Qwen3-4B-Instruct-2507 \
     --num-examples "$NUM_EXAMPLES" \
+    --eval-source eval \
+    --eval-set-json "$EVAL_SET_JSON" \
     --max-episode-steps "$MAX_EPISODE_STEPS" \
     --max-concurrent "$MAX_CONCURRENT" \
     --padding-block-size "$PADDING_BLOCK_SIZE" \
@@ -161,7 +165,7 @@ exec_in_container() {
     ssh -o StrictHostKeyChecking=no "$COMPUTE_NODE" \
         "export HOME=$SCRATCH && export PODMANHPC_PODMAN_BIN=$PODMANHPC_PODMAN_BIN && \
          podman-hpc exec $CONTAINER bash $RUNNER $mode $inf_toml $out_json \
-         $NUM_EXAMPLES $MAX_EPISODE_STEPS $MAX_CONCURRENT $padding"
+         $NUM_EXAMPLES $MAX_EPISODE_STEPS $MAX_CONCURRENT $padding $EVAL_SET_JSON"
 }
 
 teardown() {

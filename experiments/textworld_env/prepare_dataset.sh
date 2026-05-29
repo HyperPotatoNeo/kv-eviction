@@ -1,6 +1,7 @@
 #!/bin/bash
-# Generate the production hard-mixed TextWorld cooking dataset (5000 games,
-# 5 difficulty tiers) deterministically. ~20 min CPU on a single node.
+# Generate the production hard-mixed TextWorld cooking dataset
+# deterministically. The train split has 5000 games; the held-out eval split
+# has 100 games (20 per difficulty tier). ~20 min CPU on a single node.
 #
 # Output: ${KV_EVICTION_DATA_ROOT:-$PWD/data}/textworld_cooking_mix/
 #   - dataset/            HF dataset with per-game metadata rows
@@ -17,6 +18,7 @@ mkdir -p "$DATA_ROOT"
 python "$SCRIPT_DIR/generate_dataset.py" \
     --output "$OUT_DIR" \
     --mix "easy-nav:1250" "current:500" "hard:1500" "hard-12room:1000" "hard-drop:750" \
+    --eval-per-difficulty 20 \
     --seed 42
 
 echo "=== Dataset ready: $OUT_DIR ==="

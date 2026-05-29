@@ -18,8 +18,9 @@ leaves `import textworld_env` working in the venv.
 
 ## Dataset
 
-The production mix is 5000 cooking games across 5 difficulty tiers
-(easy-nav 1250, current 500, hard 1500, hard-12room 1000, hard-drop 750).
+The production mix is 5000 train cooking games across 5 difficulty tiers
+(easy-nav 1250, current 500, hard 1500, hard-12room 1000, hard-drop 750),
+plus 100 held-out eval games (20 per tier).
 Average reward with Qwen3-4B-Instruct-2507 base ≈ 0.24, average rollout
 length ≈ 12k tokens.
 
@@ -52,7 +53,29 @@ env = vf.load_environment(
 
 - `dataset_path` — directory containing `metadata.json`, `dataset/` (HF format), and `games/*.z8`.
 - `max_episode_steps` — hard cap on `env_response` calls per rollout.
-- `num_train_examples` / `num_eval_examples` — slice the 5000-row metadata into train/eval splits.
+- `num_train_examples` / `num_eval_examples` — select train/eval split sizes. Modern datasets load held-out eval rows from `eval_dataset/`.
+
+## 100-question eval
+
+The standalone evaluator uses the held-out `eval_dataset/` split by default.
+It reports:
+
+- `success_rate`: mean normalized TextWorld score over the eval set.
+- `hard_success_rate`: binary win rate, 1 iff the final score reaches max score.
+
+```bash
+python experiments/textworld_env/eval_textworld.py \
+  --dataset /path/to/textworld_cooking_mix \
+  --base-url http://localhost:8000/v1 \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --num-examples 100 \
+  --eval-source eval \
+  --eval-set-json experiments/textworld_env/eval_sets/textworld_eval_100_seed42.json \
+  --output-json experiments/textworld_env/results_full_context.json
+```
+
+The first run writes the eval-set manifest; later runs load the same 100 game
+ids so all configs are compared on identical questions.
 
 ## Why `vf.MultiTurnEnv` and not the mkv-rl variants
 
