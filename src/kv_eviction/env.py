@@ -1304,6 +1304,12 @@ def _install_message_padding_interceptor() -> None:
         # `prompt_token_ids` field.
         extra_body = dict(kwargs.pop("extra_body", None) or {})
         extra_body["prompt_token_ids"] = padded
+        if cfg.phase4_enabled:
+            # Phase4 reconstructs the next compact prompt from the
+            # server-authoritative kept prefix plus the just-sampled
+            # assistant token ids. Eval sampling does not request token ids
+            # by default, so force them here whenever Phase4 can consume them.
+            extra_body["return_token_ids"] = True
         if phase4_state is not None and phase4_trace_id:
             vllm_xargs = dict(extra_body.get("vllm_xargs") or {})
             vllm_xargs["kve_phase4_trace_id"] = phase4_trace_id
