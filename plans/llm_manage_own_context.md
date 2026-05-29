@@ -17,6 +17,73 @@ fruit test, the index entry should say something like "turn contains the user's
 favorite-fruit fact", not "favorite fruit is apple". Otherwise the model solves
 the task from text summary rather than restored KV.
 
+## Plain Description
+
+We are building an optional memory-recall layer on top of the current
+turn-based KV eviction system.
+
+The current system removes old raw turns from the active prompt/KV cache and
+keeps the model moving with summaries and recent turns. The new system should
+also keep addressable handles for those removed turns:
+
+```text
+old visible turn -> evicted from prompt -> archived as KV span T0001
+```
+
+The model sees only a short memory index:
+
+```text
+T0001: earlier turn containing a durable user preference.
+```
+
+If the model decides that old information is needed, it emits a strict control
+message:
+
+```json
+{"retrieve": ["T0001"]}
+```
+
+The orchestrator catches that control message, does not treat it as the final
+environment answer, and retries the same pending user turn with a vLLM
+extension:
+
+```python
+extra_body = {
+    "vllm_xargs": {
+        "kve_restore_span_ids": ["T0001"]
+    }
+}
+```
+
+vLLM then restores the selected archived KV span for that retry only, allowing
+the next generation to attend to old hidden context without putting the exact
+fact in the visible text summary.
+
+## MVP Boundary
+
+The first implementation is an inference-only diagnostic, not a training
+feature and not a general external-memory system.
+
+Build first:
+
+- GPU-pinned archive of evicted, block-aligned turn spans.
+- A model-visible memory index with non-leaking descriptions.
+- A two-pass JSON retrieval loop.
+- One-shot restore for the retry generation.
+- Fruit-recall tests that prove the answer changes only when the correct span
+  is restored.
+
+Do not build first:
+
+- Special retrieve tokens or decode-time interruption.
+- CPU offload for archived spans.
+- Sticky restored memory across future turns.
+- Trainer replay / RL parity.
+- Hidden memory that does not count against context/KV budget.
+
+Until `RestoreEventWire` exists and trainer replay understands restored KV,
+managed-context runs must be labeled inference diagnostics.
+
 ## Small Example Diagram
 
 Fruit-recall example: the model should know that an old span is relevant, ask
@@ -180,6 +247,176 @@ The codebase already has most of the scaffolding needed around this:
   behavioral test because the hidden fact starts in turn 1 and the final
   question is at turn 25.
 
+## Implementation Schema
+
+This section is the concrete integration map for a safe MVP.
+
+### Configuration And Gating
+
+All managed-context behavior must be disabled by default.
+
+Add config/env knobs equivalent to:
+
+```text
+managed_context_enabled = false
+recall_max_spans = 0
+recall_max_kv_blocks = null
+managed_context_archive_ttl_seconds = 1800
+managed_context_archive_max_blocks = null
+```
+
+For Phase 1, require all of:
+
+- turn-based compaction enabled
+- block-aligned padding enabled
+- Phase4 incremental prompt assembly enabled
+- prefix caching enabled
+- `managed_context_enabled = true`
+- `recall_max_spans > 0`
+
+If any requirement is missing, the system should silently run the existing
+compaction path without archiving or restoring spans.
+
+### File-Level Responsibilities
+
+`vllm/vllm/v1/core/sched/scheduler.py`
+
+- Own the scheduler-local span archive keyed by `(trace_id, span_id)`.
+- Capture evicted block refs and token IDs before physical compaction.
+- Validate restore requests from `sampling_params.extra_args`.
+- Attach restored blocks for one transient retry request.
+- Emit restore/archive metadata for diagnostics.
+- Release managed-context archive refs on TTL/cap/reset.
+
+`vllm/vllm/v1/core/compaction/manager.py`
+
+- Keep the existing default `compact_request()` behavior unchanged.
+- Add the smallest archive hook needed by the scheduler, either by returning
+  evicted block objects/indices before free or by accepting a callback.
+- Do not make the manager responsible for model-facing span IDs.
+
+`vllm/vllm/entrypoints/openai/chat_completion/protocol.py`
+and `vllm/vllm/entrypoints/openai/chat_completion/serving.py`
+
+- Continue using `vllm_xargs` for request-side controls.
+- Add response fields for archive/restore diagnostics.
+- Fix `CompactionEventPayload` to include `last_turn_evicted` and
+  `num_turns_evicted_after`; the scheduler emits these today, but the OpenAI
+  response conversion currently drops them.
+
+`src/kv_eviction/env.py`
+
+- Add the two-pass JSON retrieval loop.
+- Preserve the pre-retrieval Phase4 state before the control response.
+- Suppress the retrieval JSON from the environment trajectory.
+- Retry once with `extra_body["vllm_xargs"]["kve_restore_span_ids"]`.
+- Update Phase4 state only from the final answer response.
+
+`src/kv_eviction/summarization.py`
+
+- Keep pure turn partitioning helpers.
+- Add pure helpers for building memory-index text once the archive metadata is
+  available.
+- Do not put secret values directly in the span index.
+
+`prime-rl/src/prime_rl/transport/types.py`
+and `prime-rl/src/prime_rl/orchestrator/trajectories.py`
+
+- Do not train on restore-enabled rollouts in Phase 1.
+- Later, add `RestoreEventWire` and thread it through `CallWire`,
+  `TrainingSample`, packing, and replay before claiming trainer parity.
+
+`experiments/_local_jobs/debug/fruit_recall_env/fruit_recall_env.py`
+
+- Use this as the first behavioral test bed.
+- Assert the first-pass visible prompt/index does not contain the fruit.
+- Assert restore hit/miss behavior changes final recall only for the correct
+  span.
+
+### End-To-End Data Flow
+
+```text
+1. Normal generation creates a long multi-turn conversation.
+
+2. Turn compaction fires.
+   scheduler:
+     - computes evict_start / evict_end / last_turn_evicted
+     - creates span IDs for evicted complete turns or block-aligned event spans
+     - touches evicted blocks so the archive owns one ref
+     - lets current compact_request() remove those blocks from the active
+       request
+     - emits archive metadata
+
+3. env.py builds visible memory index text.
+   The model sees:
+     [system]
+     [summary]
+     [memory index with span IDs]
+     [recent preserved turns]
+
+4. Model emits retrieval control JSON.
+   env.py validates:
+     - exact JSON object
+     - key is retrieve
+     - span list is strings
+     - dedupe in order
+     - len(spans) <= recall_max_spans
+
+5. env.py retries the same pending user turn.
+   extra_body.vllm_xargs includes:
+     - kve_phase4_trace_id
+     - kve_phase4_call_idx
+     - kve_phase4_expected_cached_tokens
+     - kve_restore_span_ids
+
+6. vLLM restore validation runs.
+   scheduler checks:
+     - managed context is enabled
+     - request is Phase4 / trace-scoped
+     - every span belongs to the same trace
+     - span status is gpu_pinned
+     - block and span budgets pass
+     - total context budget passes
+
+7. vLLM generates final answer with restored KV available.
+   Restore is transient:
+     - no sticky memory by default
+     - no trainer parity claim
+     - no normal Phase4 publication for restored composite state until proven
+       safe
+```
+
+### Restore Semantics
+
+For MVP, restored KV is original-position memory, not ordinary newly inserted
+text. This matters because archived K/V was created with the original RoPE
+logical positions. If we want restored spans to behave like normal text
+inserted into a new compact prompt, we would need to recompute their K/V under
+the new positions.
+
+MVP rule:
+
+```text
+restore selected old K/V blocks in their original logical frame,
+then let the pending answer attend to them for one generation
+```
+
+That means the implementation must preserve `logical_start` and
+`position_offset` metadata and must fail closed if the scheduler cannot prove
+the restored blocks are safe to attach.
+
+### Current Behavior Preservation Rules
+
+- No behavior changes when `managed_context_enabled` is false.
+- No changes to existing `compaction_eviction_turn_stride` semantics.
+- No restore path without a valid Phase4 trace ID.
+- No restore path for malformed JSON, over-budget span requests, expired spans,
+  or wrong-trace spans.
+- No trainer samples from restore-enabled rollouts until `RestoreEventWire`
+  exists.
+- No CPU offload in Phase 1.
+- No special retrieve tokens in Phase 1.
+
 ## Recommended MVP
 
 Start with a two-pass retrieval protocol and GPU-pinned evicted spans. Do not
@@ -280,15 +517,18 @@ reattaches anything. If we also add `recall_max_kv_blocks`, vLLM should compute
 the physical block cost of the requested spans and reject or truncate requests
 that exceed the safety cap.
 
-MVP restore semantics should be logical concatenation:
+MVP restore semantics should look like logical concatenation to the model:
 
 ```text
 system/current compact prefix + restored span(s) + pending user fragment
 ```
 
-This is less magical than hidden external memory and fits the existing block
-table/paged-attention model. Hidden memory that does not count as context would
-require attention backend changes and should not be the first implementation.
+Internally, this is not ordinary text insertion. The restored K/V blocks were
+computed in their original RoPE/logical-position frame. The first implementation
+should therefore treat them as original-position memory made available for the
+retry generation, not as text that has been re-tokenized and recomputed inside a
+new compact prompt. Hidden memory that does not count as context would require
+attention backend changes and should not be the first implementation.
 
 The restore path must:
 
